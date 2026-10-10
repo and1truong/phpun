@@ -45,6 +45,8 @@ type ScalarGate = fn(&Value) -> bool;
 
 pub(crate) struct Compiled {
     ops: Vec<Op>,
+    /// Canonical expression operations retain AST semantics inside VM control flow.
+    hybrid: bool,
     /// Slot count — params occupy the first `decl.params.len()` slots.
     nslots: usize,
     /// Param name → slot index — the bound (typed/variadic/named-arg)
@@ -107,7 +109,7 @@ macro_rules! padd {
 }
 
 // Opt-in diagnostics: cache lookups are not calls or elapsed-time shares.
-const COVERAGE_NAMES: [&str; 18] = [
+const COVERAGE_NAMES: [&str; 20] = [
     "compiled-lookup",
     "executed-body",
     "reference-return",
@@ -126,9 +128,11 @@ const COVERAGE_NAMES: [&str; 18] = [
     "scope",
     "operator",
     "other",
+    "hybrid-lookup",
+    "hybrid-body",
 ];
-static COVERAGE: [std::sync::atomic::AtomicU64; 18] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static COVERAGE: [std::sync::atomic::AtomicU64; 20] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 
 fn coverage_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -147,6 +151,8 @@ fn coverage_hit(reason: &str) {
 
 enum Op {
     Const(Value),
+    /// Shared AST expression implementation; slots and frame vars alias.
+    Canonical(Box<Expr>),
     Load(u16),
     /// Store top-of-stack into a slot, KEEPING it on the stack
     /// (an assignment is an expression).
@@ -332,13 +338,16 @@ impl Compiled {
                 }
             })
             .collect();
+        let hybrid = c.ops.iter().any(|op| matches!(op, Op::Canonical(_)));
         Ok(Rc::new(Compiled {
+            hybrid,
             nslots: c.slots.len(),
             names: c.slots,
             ops: c.ops,
             defaults,
             bind_free,
-            needs_bind,
+            // Canonical expressions need the canonical frame lifetime/teardown.
+            needs_bind: needs_bind || hybrid,
             ret_fast,
             param_fast,
         }))
@@ -506,7 +515,8 @@ impl Compiler {
                         self.emit(Op::Const(Value::Null));
                     }
                 };
-                self.emit(Op::Sweep);
+                // Return temporaries stay live through the caller's statement,
+                // matching exec(Return); sweeping here loses returned objects.
                 self.emit(Op::Return);
             }
             Stmt::Block(b) => self.stmts(b)?,
@@ -648,10 +658,26 @@ impl Compiler {
             Expr::Str(s) => {
                 self.emit(Op::Const(Value::str(s.clone())));
             }
+            Expr::Interp(parts)
+                if parts
+                    .iter()
+                    .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))) =>
+            {
+                let bytes: Vec<u8> = parts
+                    .iter()
+                    .flat_map(|p| match p {
+                        crate::lexer::StringPart::Lit(bytes) => bytes.as_slice(),
+                        _ => unreachable!(),
+                    })
+                    .copied()
+                    .collect();
+                self.emit(Op::Const(Value::bytes(bytes)));
+            }
             Expr::Paren(i) => return self.expr(i),
             Expr::Var(n) => {
                 if n == "this" || !self.assigned.contains(n.as_str()) {
-                    return None;
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 }
                 let sl = self.slot(n);
                 self.emit(Op::Load(sl));
@@ -660,7 +686,8 @@ impl Compiler {
                 target, op, value, ..
             } => {
                 let Expr::Var(n) = &**target else {
-                    return None;
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 };
                 if n == "this" {
                     return None; // AST path emits the canonical fatal
@@ -793,10 +820,12 @@ impl Compiler {
                 // names, method/static calls and named/unpack args keep
                 // the AST call machinery.
                 let Expr::Str(raw) = &**name else {
-                    return None;
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 };
                 if raw.contains("::") || raw.starts_with('\\') {
-                    return None;
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 }
                 // Reads the caller's var table — VM frames keep vars
                 // in slots, not `f.vars` (compact_one's lookup_var
@@ -838,6 +867,30 @@ impl Compiler {
                     *at = call;
                 }
             }
+            Expr::ArrayLit(_)
+            | Expr::Index { .. }
+            | Expr::Prop { .. }
+            | Expr::StaticProp { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::StaticCallDyn { .. }
+            | Expr::ClassConst { .. }
+            | Expr::ClassConstDyn { .. }
+            | Expr::Closure(_)
+            | Expr::New { .. }
+            | Expr::Interp(_)
+            | Expr::Cast { .. }
+            | Expr::Const(_)
+            | Expr::MagicConst(_)
+            | Expr::Isset(_)
+            | Expr::Empty(_)
+            | Expr::Fcc(_)
+            | Expr::Clone(_)
+            | Expr::Instanceof { .. }
+            | Expr::Match { .. }
+            | Expr::Throw(_) => {
+                self.emit(Op::Canonical(Box::new(e.clone())));
+            }
             _ => return None,
         };
         Some(())
@@ -870,7 +923,14 @@ impl<'a> Interp<'a> {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let (compiled, reason) = match Compiled::compile(decl) {
-                    Ok(c) => (Some(c), "compiled-lookup"),
+                    Ok(c) => {
+                        let reason = if c.hybrid {
+                            "hybrid-lookup"
+                        } else {
+                            "compiled-lookup"
+                        };
+                        (Some(c), reason)
+                    }
                     Err(reason) => {
                         if coverage_on() {
                             eprintln!(
@@ -1118,6 +1178,9 @@ impl<'a> Interp<'a> {
         tmark: usize,
     ) -> Result<Flow, PhpError> {
         coverage_hit("executed-body");
+        if comp.hybrid {
+            coverage_hit("hybrid-body");
+        }
         // Value-stack/argv vecs come from a per-Interp pool — a call
         // costs no malloc here (cap bounds retention under deep
         // recursion; each live frame holds its own vec anyway).
@@ -1242,6 +1305,40 @@ impl<'a> Interp<'a> {
         })
     }
 
+    fn vm_cell_value(&mut self, c: &Cell, value: Value) -> Result<Value, PhpError> {
+        let ptr = Rc::as_ptr(c) as usize;
+        if self.typed_slots.contains_key(&ptr) || self.slot_owners.contains_key(&ptr) {
+            self.typed_slot_store_mode(c, value, false)
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn vm_materialize(&mut self, comp: &Compiled, slots: &mut [Slot]) {
+        let frame = self.cur();
+        for (name, index) in &comp.names {
+            let slot = &mut slots[*index as usize];
+            let c = match slot {
+                Slot::Uninit => continue,
+                Slot::C(c) => c.clone(),
+                Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
+            };
+            *slot = Slot::C(c.clone());
+            frame.vars.insert(name.clone(), c);
+        }
+    }
+
+    fn vm_refresh(&mut self, comp: &Compiled, slots: &mut [Slot]) {
+        for (name, index) in &comp.names {
+            slots[*index as usize] = self
+                .cur()
+                .vars
+                .get(name)
+                .map(|c| Slot::C(c.clone()))
+                .unwrap_or(Slot::Uninit);
+        }
+    }
+
     fn vm_slot_value(
         &mut self,
         comp: &Compiled,
@@ -1275,6 +1372,12 @@ impl<'a> Interp<'a> {
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
+                Op::Canonical(expr) => {
+                    self.vm_materialize(comp, slots);
+                    let result = self.eval(expr);
+                    self.vm_refresh(comp, slots);
+                    vs.push(result?);
+                }
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
                 Op::Store(s) => match &mut slots[*s as usize] {
                     Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
@@ -1286,9 +1389,9 @@ impl<'a> Interp<'a> {
                         // CV write: new zval lands, displaced decrefs —
                         // same ordering as cell_store.
                         let c = c.clone();
-                        let old =
-                            std::mem::replace(&mut *c.borrow_mut(), vs.last().unwrap().clone());
-                        self.destruct_dying_value(&old)?;
+                        let value = self.vm_cell_value(&c, vs.last().unwrap().clone())?;
+                        *vs.last_mut().unwrap() = value.clone();
+                        self.cell_store(&c, value)?;
                     }
                 },
                 Op::Pop => {
@@ -1358,8 +1461,8 @@ impl<'a> Interp<'a> {
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
                             let c = c.clone();
-                            let prev = std::mem::replace(&mut *c.borrow_mut(), new);
-                            self.destruct_dying_value(&prev)?;
+                            let value = self.vm_cell_value(&c, new)?;
+                            self.cell_store(&c, value)?;
                         }
                     }
                     vs.push(if *post {
@@ -1404,23 +1507,10 @@ impl<'a> Interp<'a> {
                         // Cold reference calls use the canonical SEND machinery.
                         // Cells shared with slots let argument expressions update
                         // caller locals and keep escaping references alive.
-                        let frame = self.cur();
-                        for (name, index) in &comp.names {
-                            let slot = &mut slots[*index as usize];
-                            let c = match slot {
-                                Slot::Uninit => continue,
-                                Slot::C(c) => c.clone(),
-                                Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
-                            };
-                            *slot = Slot::C(c.clone());
-                            frame.vars.insert(name.clone(), c);
-                        }
-                        let value = self.vm_ref_call(&target, lname, raw, args, *site)?;
-                        for (name, index) in &comp.names {
-                            if let Some(c) = self.cur().vars.get(name) {
-                                slots[*index as usize] = Slot::C(c.clone());
-                            }
-                        }
+                        self.vm_materialize(comp, slots);
+                        let result = self.vm_ref_call(&target, lname, raw, args, *site);
+                        self.vm_refresh(comp, slots);
+                        let value = result?;
                         vs.push(value);
                         pc = *at + 1; // skip compiled argument ops and Call
                         continue;
