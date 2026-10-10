@@ -439,3 +439,121 @@ assign_index_path3.59%; remaining writes still use canonical bridges.
 Malloc2.22%/cfree3.07%do not by themselves justify inline packed ownership
 rewrite on sieve. LLVM moved the main bucket into vm_exec_ops15.12%; this
 is not pure dispatch attribution or directly the old vm_exec symbol bucket.
+
+## CPU, requested allocations and observed copy bytes (#205 supplement)
+
+Complements merged `PROFILE92_205.md` (#211). Frozen **main at collection
+start ef633928471a36c7f180b30fa1ff52fc0a4dcb97**, force-clean release core,
+SHA2561f10ddd3487e93b74a91812e49b3d2b51c01021eae5253c4817028f5e98ab205.
+This is not the later main e847541 (which also merged #202–#212); do not
+relabel profiles or claim its performance from these measurements.
+
+Linux6.18.44 x86_64/glibc2.41; Rust1.99.0 release/LTO/codegen-units1;
+native PHP8.5.11 -n SHA25632fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f.
+CPU sampling `cpu-clock:u199Hz --call-graph dwarf,8192`, five byte-gated runs,
+all **zero lost samples**. gprofng heap collection uses **CPU sampling OFF**,
+no timer warning; copy interposer is a separate run, no speed claims from either.
+Every target exit/stdout/stderr compared to PHP; only known collector records
+removed. Original arrays20 heap run timed out without RESULT: excluded entirely.
+
+| Workload (heap/copy argv) | Heap requests | Requested heap bytes | Observed copy calls | Observed copy bytes |
+|---|---:|---:|---:|---:|
+| objects 1 5000 | 1,089,919 | 36,838,813 | 842,470 | 86,049,106 |
+| arrays 1 | 135,429 | 11,806,556 | 159,820 | 28,915,368 |
+| json 1 | 792,613 | 34,951,969 | 955,353 | 19,833,928 |
+| fib 20 | 46,273 | 4,857,550 | 194,240 | 29,066,596 |
+| sieve 1 5000 | 102,022 | 5,432,527 | 98,535 | 10,519,481 |
+
+CPU uses longer argv (manifest), while heap/copy includes cold startup/parse
+at bounded sizes. No extrapolation or claim that composition is invariant.
+Heap function rows are **inclusive, overlap and have truncated unwind**:
+objects store_prop3,160,000B, scope_private_prop1,400,140B and
+PropDecl::clone1,201,491B are useful attribution, not additive percentages.
+Global Rust alloc counter and gprofng totals differ by collector/bootstrap scope.
+`cell` site counts in ef63392 omit direct element Rc allocations; #211 separately
+wired those counters. No claim that ef's site counter counts every element Cell.
+
+| Workload | Exclusive CPU symbols (not pure decode) | Additive observed-copy callsite shares |
+|---|---|---|
+| objects (1752samples) | malloc5.48%,cfree6.62%,to_lowercase2.51%,is_a_str2.17%,PropDecl clone0.86% | scope_private_prop17.71%,store_prop13.12%,PropDecl clone10.87%,invoke_fn_run10.13%,Param to_vec8.20% |
+| arrays (724) | vm_run15.61%,vm_exec12.85%,sort comparator10.22%,call_value4.28%,malloc/cfree3.87%each | bounded1rep:call_value36.30%,trace_pop13.33%,call_site_frame13.32%,vm_run6.66% |
+| JSON (642) | json_value9.66%,json_enc7.48%,malloc8.26%,cfree9.03%,UTF8 chunks5.45% | Vec grow15.99%,eval10.46%,json_value9.49%,write_str9.11%,join_generic5.13% |
+| fib (931) | vm_exec44.68%,vm_run14.29%,call_site_frame9.13%,vm_binary3.22% | trace_pop24.10%,call_site_frame24.09%,vm_exec12.68%,vm_run12.65% |
+| sieve (1007) | global_var_cell15.79%,vm_exec12.02%,materialize6.55%,refresh6.36%,assign_inner5.16% | bounded5000:eval11.70%,dim_op_outlet11.69%; parser/AST startup substantial |
+
+Separately, arrays20 observed611,105,245B/3,265,348copies:
+call_value49.99%, trace_pop18.35%, call_site_frame18.35%, vm_run9.17%.
+Small arrays1 percentages differ, demonstrating why size-invariance is not assumed.
+Objects first three callsite buckets sum41.70% of **observed copy bytes**.
+These are **out-of-line libc memcpy/memmove lower bounds**, not all copies:
+LLVM inline copies, hidden libc implementations and realloc movement are unobserved.
+Byte shares are not CPU shares or allocation shares. LLVM inlining also mixes
+semantic operations into vm_exec; prior slot ASM work bounds decode instead.
+
+Decision: **R4 first** (callback/trace-shell movement and remaining canonical
+array-write bridges), **R2 next** (method-name normalization and avoid needless
+property/parameter metadata clones). R3 packed storage is conditional on a
+current-tip prototype plus accounting/ownership gates; this data does not prove
+rewriting storage or JIT is required. JSON shared sink/capacity improvements
+already merged after this baseline. #211's different-host malloc/CPU attribution
+supports the same ranking, but its counts and speed ratios stay separate.
+No runtime optimization in this supplement.
+
+Reproduce (Linux/gcc/nm, single-thread CLI only, no new dependency):
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -O2 -fPIC -shared -fno-builtin \
+  -o /tmp/copy-profile.so bench/data/92/parity/copy-profile.c -ldl
+gcc -std=c11 -Wall -Wextra -Werror -O2 -fno-builtin \
+  -o /tmp/copy-check bench/data/92/parity/copy-check.c
+python3 bench/data/92/parity/profile-copies.py --check \
+  --php /tmp/copy-check --binary /tmp/copy-check --library /tmp/copy-profile.so \
+  --save /tmp/copy-check.json --runtime self-check
+# Check asserts collector2calls384bytes, memcpy256 + overlapping memmove128.
+python3 bench/data/92/parity/profile-copies.py --php /path/php85 \
+  --binary /path/frozen-phpun --library /tmp/copy-profile.so \
+  --save /tmp/objects-copy.json --runtime EXACT_BUILD_COMMIT bench/40-objects.php 1 5000
+gprofng collect app -p off -S off -H on -O /tmp/objects.er \
+  /path/frozen-phpun bench/40-objects.php 1 5000
+gprofng display text -metrics i+heapallocbytes:i+heapalloccnt:name \
+  -sort i.heapallocbytes -functions /tmp/objects.er
+perf record -e cpu-clock:u -F 199 --call-graph dwarf,8192 -o /tmp/objects.data \
+  /path/frozen-phpun bench/40-objects.php 100 5000
+perf report --stdio --no-children --call-graph none -i /tmp/objects.data
+```
+
+Raw callsites/flat stacks/heap rows/counters compressed under
+`data/92/parity/attribution-*`; manifest contains exact argv/hash/limits.
+Interposer fixed8192table avoids allocator recursion, rejects overflow.
+Lazy resolver pointers are intentionally only safe for the single-thread CLI;
+server/parallel use requires synchronized initialization before reuse.
+
+## Fresh ef63392 → ca76c30 profiler-off comparison
+
+Separate from profiling and previous main3a→15f datasets. Seven rotating
+PHP/main/stack reps, all byte gates pass. ca76c30 is #210's pre-merge runtime;
+main e847541 additionally includes #212 changes, so **not current-tip timing**.
+Dirty-source flags are preserved: the runner/report files were untracked; binaries
+were frozen from clean core builds and their hashes identify exact runtime code.
+No multiplication of step gains or mixing with the different-host3.05× report.
+
+| Bench | Main / candidate median ms | Candidate/main | Candidate/PHP |
+|---|---:|---:|---:|
+| 00-startup | 5.243 / 6.102 | 1.164× | 1.44× |
+| 10-fib | 169.065 / 159.360 | 0.943× | 13.83× |
+| 11-sieve | 254.046 / 215.830 | 0.850× | 26.05× |
+| 20-strings | 223.109 / 168.477 | 0.755× | 12.24× |
+| 30-arrays | 203.661 / 201.654 | 0.990× | 11.26× |
+| 40-objects | 354.827 / 333.854 | 0.941× | 41.59× |
+| 50-regex | 41.114 / 43.254 | 1.052× | 5.93× |
+| 60-json | 980.606 / 585.310 | 0.597× | 3.54× |
+| 70-db | 122.683 / 124.735 | 1.017× | 4.17× |
+| cli | 40.108 / 40.298 | 1.005× | 7.78× |
+| run | 6.737 / 7.146 | 1.061× | 1.67× |
+
+Nine-bench geomean9.481→8.607×PHP; candidate/main0.908 (~9.2% less time).
+Objects still41.59×PHP on this host. Initial seven startup samples +16.4%;
+31fresh isolated alternating followup5.584→5.796ms (+3.8%),
+Composer7.625→8.021 (+5.2%), app44.622→42.154 (−5.5%).
+Ranges overlap but the cold startup/Composer cost remains visible; no universal
+application win or claimed explanation. Both sample sets retained verbatim.

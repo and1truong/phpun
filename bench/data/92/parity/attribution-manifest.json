@@ -1,0 +1,359 @@
+{
+  "runtime": "ef633928471a36c7f180b30fa1ff52fc0a4dcb97",
+  "binary_sha256": "1f10ddd3487e93b74a91812e49b3d2b51c01021eae5253c4817028f5e98ab205",
+  "host": "Linux6.18.44 x86_64 glibc2.41",
+  "cpu": "cpu-clock:u199Hz DWARF8192; zero lost on all five profiles",
+  "gate": "each CPU/heap/alloc stdout and exit verified against PHP8.5.11 -n; copy gate additionally removes known collector lines",
+  "excluded": "arrays20 heap collection timed out with no RESULT; not used, no extrapolation",
+  "cases": {
+    "objects": {
+      "heap_copy_alloc_argv": [
+        "bench/40-objects.php",
+        "1",
+        "5000"
+      ],
+      "observed_copy_bytes": 86049106,
+      "observed_copy_calls": 842470,
+      "heap_requested_bytes": 36838813,
+      "heap_requests": 1089919,
+      "alloc_counter_raw": "allocs: 1089818 bytes: 36815245\n  cell: 60018\n  vm_site: 15000\n  mem_track: 20008\n  trace_frame: 10000\n  vars_insert: 1\n  call_args: 10000\n",
+      "copy_top": [
+        {
+          "caller": "<phpun_core::interp::Interp>::scope_private_prop",
+          "calls": 80008,
+          "bytes": 15241524,
+          "percent_observed_bytes": 17.712588437583534
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::store_prop",
+          "calls": 40000,
+          "bytes": 11290000,
+          "percent_observed_bytes": 13.120415219653763
+        },
+        {
+          "caller": "<phpun_core::ast::PropDecl as core::clone::Clone>::clone",
+          "calls": 80231,
+          "bytes": 9354575,
+          "percent_observed_bytes": 10.871205332452844
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::invoke_fn_run",
+          "calls": 30000,
+          "bytes": 8720000,
+          "percent_observed_bytes": 10.133748513319825
+        },
+        {
+          "caller": "<phpun_core::ast::Param as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>",
+          "calls": 40509,
+          "bytes": 7052684,
+          "percent_observed_bytes": 8.196115366962674
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::trace_pop",
+          "calls": 25065,
+          "bytes": 4010400,
+          "percent_observed_bytes": 4.66059461442865
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::hooked_prop",
+          "calls": 10004,
+          "bytes": 3761504,
+          "percent_observed_bytes": 4.3713458220007535
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::call_site_frame",
+          "calls": 25000,
+          "bytes": 3225000,
+          "percent_observed_bytes": 3.747859971956013
+        }
+      ],
+      "cpu_profile": "objects100",
+      "cpu_samples": 1752
+    },
+    "arrays": {
+      "heap_copy_alloc_argv": [
+        "bench/30-arrays.php",
+        "1"
+      ],
+      "observed_copy_bytes": 28915368,
+      "observed_copy_calls": 159820,
+      "heap_requested_bytes": 11806556,
+      "heap_requests": 135429,
+      "alloc_counter_raw": "allocs: 135330 bytes: 11784414\n  cell: 2125\n  vm_site: 6\n  mem_track: 1013\n  trace_frame: 12038\n  vars_insert: 1\n  call_args: 2\n",
+      "copy_top": [
+        {
+          "caller": "<phpun_core::interp::Interp>::call_value",
+          "calls": 36114,
+          "bytes": 10497136,
+          "percent_observed_bytes": 36.302965260549335
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::trace_pop",
+          "calls": 24090,
+          "bytes": 3854400,
+          "percent_observed_bytes": 13.329935832046129
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::call_site_frame",
+          "calls": 24076,
+          "bytes": 3852160,
+          "percent_observed_bytes": 13.322189086440124
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::vm_run",
+          "calls": 12038,
+          "bytes": 1926080,
+          "percent_observed_bytes": 6.661094543220062
+        },
+        {
+          "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone",
+          "calls": 5478,
+          "bytes": 977173,
+          "percent_observed_bytes": 3.379424394667915
+        },
+        {
+          "caller": "<alloc::raw_vec::RawVecInner>::finish_grow",
+          "calls": 714,
+          "bytes": 608573,
+          "percent_observed_bytes": 2.1046697382512995
+        },
+        {
+          "caller": "<phpun_core::parser::Parser>::postfix",
+          "calls": 1828,
+          "bytes": 424096,
+          "percent_observed_bytes": 1.4666802788053743
+        },
+        {
+          "caller": "<phpun_core::parser::Parser>::unary",
+          "calls": 1368,
+          "bytes": 317376,
+          "percent_observed_bytes": 1.097603184576451
+        }
+      ],
+      "cpu_profile": "arrays",
+      "cpu_samples": 724
+    },
+    "json": {
+      "heap_copy_alloc_argv": [
+        "bench/60-json.php",
+        "1"
+      ],
+      "observed_copy_bytes": 19833928,
+      "observed_copy_calls": 955353,
+      "heap_requested_bytes": 34951969,
+      "heap_requests": 792613,
+      "alloc_counter_raw": "allocs: 792514 bytes: 34929835\n  cell: 3025\n  vm_site: 5\n  mem_track: 9011\n",
+      "copy_top": [
+        {
+          "caller": "<alloc::raw_vec::RawVecInner>::finish_grow",
+          "calls": 126649,
+          "bytes": 3170780,
+          "percent_observed_bytes": 15.986646719701715
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::eval",
+          "calls": 63011,
+          "bytes": 2074713,
+          "percent_observed_bytes": 10.460424178206152
+        },
+        {
+          "caller": "phpun_core::builtins::json::json_value",
+          "calls": 318781,
+          "bytes": 1881932,
+          "percent_observed_bytes": 9.488448279130589
+        },
+        {
+          "caller": "<alloc::string::String as core::fmt::Write>::write_str",
+          "calls": 163671,
+          "bytes": 1807306,
+          "percent_observed_bytes": 9.112194014216447
+        },
+        {
+          "caller": "alloc::str::join_generic_copy::<str, u8, alloc::string::String>",
+          "calls": 36173,
+          "bytes": 1018171,
+          "percent_observed_bytes": 5.133481375953366
+        },
+        {
+          "caller": "<phpun_core::value::PhpStr>::new",
+          "calls": 90157,
+          "bytes": 982723,
+          "percent_observed_bytes": 4.954757322906486
+        },
+        {
+          "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone",
+          "calls": 5459,
+          "bytes": 978122,
+          "percent_observed_bytes": 4.931559699117593
+        },
+        {
+          "caller": "<phpun_core::value::Value>::to_php_string",
+          "calls": 1,
+          "bytes": 460791,
+          "percent_observed_bytes": 2.3232463080434695
+        }
+      ],
+      "cpu_profile": "json",
+      "cpu_samples": 642
+    },
+    "fib": {
+      "heap_copy_alloc_argv": [
+        "bench/10-fib.php",
+        "20"
+      ],
+      "observed_copy_bytes": 29066596,
+      "observed_copy_calls": 194240,
+      "heap_requested_bytes": 4857550,
+      "heap_requests": 46273,
+      "alloc_counter_raw": "allocs: 46175 bytes: 4835451\n  cell: 13\n  vm_site: 21891\n  mem_track: 25\n  trace_frame: 21891\n  call_args: 1\n",
+      "copy_top": [
+        {
+          "caller": "<phpun_core::interp::Interp>::trace_pop",
+          "calls": 43784,
+          "bytes": 7005440,
+          "percent_observed_bytes": 24.101342998677932
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::call_site_frame",
+          "calls": 43763,
+          "bytes": 7002080,
+          "percent_observed_bytes": 24.089783337546645
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::vm_exec",
+          "calls": 21909,
+          "bytes": 3684208,
+          "percent_observed_bytes": 12.675058338444584
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::vm_run",
+          "calls": 43782,
+          "bytes": 3677688,
+          "percent_observed_bytes": 12.65262709124935
+        },
+        {
+          "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone",
+          "calls": 5385,
+          "bytes": 958618,
+          "percent_observed_bytes": 3.29800572450933
+        },
+        {
+          "caller": "<alloc::raw_vec::RawVecInner>::finish_grow",
+          "calls": 649,
+          "bytes": 430208,
+          "percent_observed_bytes": 1.4800769928477349
+        },
+        {
+          "caller": "<phpun_core::parser::Parser>::postfix",
+          "calls": 1776,
+          "bytes": 412032,
+          "percent_observed_bytes": 1.4175447307280151
+        },
+        {
+          "caller": "<phpun_core::parser::Parser>::args",
+          "calls": 951,
+          "bytes": 302480,
+          "percent_observed_bytes": 1.0406447318426968
+        }
+      ],
+      "cpu_profile": "fib",
+      "cpu_samples": 931
+    },
+    "sieve": {
+      "heap_copy_alloc_argv": [
+        "bench/11-sieve.php",
+        "1",
+        "5000"
+      ],
+      "observed_copy_bytes": 10519481,
+      "observed_copy_calls": 98535,
+      "heap_requested_bytes": 5432527,
+      "heap_requests": 102022,
+      "alloc_counter_raw": "allocs: 101922 bytes: 5410361\n  cell: 24\n  vm_site: 1\n  mem_track: 7\n",
+      "copy_top": [
+        {
+          "caller": "<phpun_core::interp::Interp>::eval",
+          "calls": 8097,
+          "bytes": 1230299,
+          "percent_observed_bytes": 11.695434404035712
+        },
+        {
+          "caller": "<phpun_core::interp::Interp>::dim_op_outlet::<phpun_core::value::Value>",
+          "calls": 8089,
+          "bytes": 1229528,
+          "percent_observed_bytes": 11.688105145111246
+        },
+        {
+          "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone",
+          "calls": 5351,
+          "bytes": 951439,
+          "percent_observed_bytes": 9.044543167101114
+        },
+        {
+          "caller": "<alloc::raw_vec::RawVecInner>::finish_grow",
+          "calls": 632,
+          "bytes": 449104,
+          "percent_observed_bytes": 4.269260051897998
+        },
+        {
+          "caller": "<phpun_core::parser::Parser>::postfix",
+          "calls": 1841,
+          "bytes": 427112,
+          "percent_observed_bytes": 4.06020030836122
+        },
+        {
+          "caller": "<phpun_core::parser::Parser>::unary",
+          "calls": 1378,
+          "bytes": 319696,
+          "percent_observed_bytes": 3.039085293276351
+        },
+        {
+          "caller": "<phpun_core::parser::Parser>::args",
+          "calls": 949,
+          "bytes": 300624,
+          "percent_observed_bytes": 2.8577835731629726
+        },
+        {
+          "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone",
+          "calls": 1034,
+          "bytes": 271732,
+          "percent_observed_bytes": 2.5831312400298074
+        }
+      ],
+      "cpu_profile": "sieve",
+      "cpu_samples": 1007
+    }
+  },
+  "cpu_argv": {
+    "objects": [
+      "bench/40-objects.php",
+      "100",
+      "5000"
+    ],
+    "arrays": [
+      "bench/30-arrays.php",
+      "300"
+    ],
+    "json": [
+      "bench/60-json.php",
+      "150"
+    ],
+    "fib": [
+      "bench/10-fib.php",
+      "33"
+    ],
+    "sieve": [
+      "bench/11-sieve.php",
+      "10",
+      "200000"
+    ]
+  },
+  "limits": [
+    "CPU symbol buckets include inlined semantic work, not pure opcode decode",
+    "heap inclusive rows overlap; incomplete unwind, do not sum source percentages",
+    "observed memcpy/memmove bytes are additive callsite lower bounds, not all inline copies or allocation bytes",
+    "PHPUN_ALLOC cell site counter misses direct element Rc allocations in ef63392; use separate #211 updated-site evidence",
+    "different CPU and heap argv; no composition-invariance or full-size extrapolation claim",
+    "profiles are attribution only; all speed samples profilers off"
+  ]
+}
