@@ -2,8 +2,8 @@
 //! inside the supported subset compiles once to a flat `Vec<Op>` and
 //! runs on a value stack with locals in slots — no per-arg Cell, no
 //! binds vec, no vars-map insert per call. Any construct outside the
-//! subset bails the WHOLE body to the AST path, so semantics can't
-//! drift: a compiled body by construction never leaves the subset.
+//! subset bails the WHOLE body to the AST path. Oracle probes and
+//! regression checks are still required for every supported construct.
 //!
 //! ponytail: the subset is deliberately narrow (scalars, arith/compare,
 //! if/while/for, direct named calls, return). The known ceiling: frame
@@ -33,6 +33,9 @@ pub(in crate::interp) enum Slot {
     V(Value),
     C(Cell),
 }
+
+pub(in crate::interp) type CompileCacheEntry =
+    (Rc<FunctionDecl>, Option<Rc<Compiled>>, &'static str);
 
 /// One compiled function body — op vector + slot layout.
 /// Single-scalar pass-proof (`?T`/union-null handled) — see
@@ -100,6 +103,45 @@ macro_rules! padd {
             );
         }
     };
+}
+
+// Opt-in diagnostics: cache lookups are not calls or elapsed-time shares.
+const COVERAGE_NAMES: [&str; 18] = [
+    "compiled-lookup",
+    "executed-body",
+    "reference-return",
+    "variable",
+    "assignment",
+    "call",
+    "array",
+    "property",
+    "closure",
+    "interpolation",
+    "foreach",
+    "switch",
+    "match",
+    "exception",
+    "static",
+    "scope",
+    "operator",
+    "other",
+];
+static COVERAGE: [std::sync::atomic::AtomicU64; 18] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+
+fn coverage_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PHPUN_VMPROF").is_some())
+}
+
+fn coverage_hit(reason: &str) {
+    if coverage_on() {
+        let i = COVERAGE_NAMES
+            .iter()
+            .position(|n| *n == reason)
+            .unwrap_or(17);
+        COVERAGE[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 enum Op {
@@ -193,6 +235,7 @@ struct Compiler {
     /// (plus params) can hit undefined-variable diagnostics the slot
     /// model can't reproduce, so it bails.
     assigned: std::collections::HashSet<String>,
+    fallback: &'static str,
 }
 
 impl Compiled {
@@ -227,13 +270,13 @@ impl Compiled {
         })
     }
 
-    pub(crate) fn compile(decl: &FunctionDecl) -> Option<Rc<Compiled>> {
+    pub(crate) fn compile(decl: &FunctionDecl) -> Result<Rc<Compiled>, &'static str> {
         // A by-ref return needs cell plumbing on Flow::Return — AST
         // keeps it. Everything else still compiles: typed/variadic/
         // promoted params, declared returns and expr defaults get
         // bound + checked by bind_and_run and only the body runs here.
         if decl.by_ref {
-            return None;
+            return Err("reference-return");
         }
         let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
         let mut bind_free = !needs_bind
@@ -264,11 +307,12 @@ impl Compiled {
             slots: FxMap::default(),
             loops: Vec::new(),
             assigned,
+            fallback: "other",
         };
         for (i, p) in decl.params.iter().enumerate() {
             c.slots.insert(p.name.clone(), i as u16);
         }
-        c.stmts(&decl.body)?;
+        c.stmts(&decl.body).ok_or(c.fallback)?;
         // No trailing Const+Return: pc exhausting the stream is
         // Flow::Normal — the bound path's `Flow::Return` arm treats
         // an explicit `return` differently from fall-off-the-end.
@@ -287,7 +331,7 @@ impl Compiled {
                 }
             })
             .collect();
-        Some(Rc::new(Compiled {
+        Ok(Rc::new(Compiled {
             nslots: c.slots.len(),
             names: c.slots,
             ops: c.ops,
@@ -423,6 +467,14 @@ impl Compiler {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Bail {
+        self.fallback = match s {
+            Stmt::Foreach { .. } => "foreach",
+            Stmt::Switch { .. } => "switch",
+            Stmt::Try { .. } => "exception",
+            Stmt::Static { .. } => "static",
+            Stmt::Global(_) | Stmt::Unset(_) => "scope",
+            _ => "other",
+        };
         match s {
             Stmt::Line(l) => {
                 self.emit(Op::Line(*l));
@@ -566,6 +618,19 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Bail {
         let e = Interp::unmark_rhs(e);
+        self.fallback = match e {
+            Expr::Var(_) | Expr::VarVar(..) => "variable",
+            Expr::Assign { .. } => "assignment",
+            Expr::Call { .. } => "call",
+            Expr::ArrayLit(_) | Expr::Index { .. } => "array",
+            Expr::Prop { .. } | Expr::StaticProp { .. } => "property",
+            Expr::Closure(_) => "closure",
+            Expr::Interp(_) => "interpolation",
+            Expr::Match { .. } => "match",
+            Expr::Throw(_) => "exception",
+            Expr::Binary { .. } | Expr::Unary { .. } => "operator",
+            _ => "other",
+        };
         match e {
             Expr::Null => {
                 self.emit(Op::Const(Value::Null));
@@ -779,6 +844,18 @@ impl Compiler {
 }
 
 impl<'a> Interp<'a> {
+    /// CLI-only diagnostic report; profiling changes runtime overhead.
+    pub fn dump_vm_coverage() {
+        if coverage_on() {
+            for (name, counter) in COVERAGE_NAMES.iter().zip(&COVERAGE) {
+                eprintln!(
+                    "vm-coverage: {name}={}",
+                    counter.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
     /// Compile-cache: keyed by the decl's Rc pointer, with the Rc kept
     /// alive by the entry itself so a dropped decl can never collide.
     /// `None` entries memoize "doesn't compile" so uncompiled bodies
@@ -788,14 +865,26 @@ impl<'a> Interp<'a> {
         decl: &Rc<FunctionDecl>,
     ) -> Option<Rc<Compiled>> {
         use std::collections::hash_map::Entry;
-        match self.compiled_fns.entry(Rc::as_ptr(decl) as usize) {
-            Entry::Occupied(e) => e.get().1.clone(),
+        let entry = match self.compiled_fns.entry(Rc::as_ptr(decl) as usize) {
+            Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let c = Compiled::compile(decl);
-                e.insert((decl.clone(), c.clone()));
-                c
+                let (compiled, reason) = match Compiled::compile(decl) {
+                    Ok(c) => (Some(c), "compiled-lookup"),
+                    Err(reason) => {
+                        if coverage_on() {
+                            eprintln!(
+                                "vm-fallback: {}:{} {} reason={reason}",
+                                decl.file, decl.line, decl.name
+                            );
+                        }
+                        (None, reason)
+                    }
+                };
+                e.insert((decl.clone(), compiled, reason))
             }
-        }
+        };
+        coverage_hit(entry.2);
+        entry.1.clone()
     }
 
     /// The bind_and_run shell for a compiled body: identical
@@ -1027,6 +1116,7 @@ impl<'a> Interp<'a> {
         slots: &mut [Slot],
         tmark: usize,
     ) -> Result<Flow, PhpError> {
+        coverage_hit("executed-body");
         // Value-stack/argv vecs come from a per-Interp pool — a call
         // costs no malloc here (cap bounds retention under deep
         // recursion; each live frame holds its own vec anyway).

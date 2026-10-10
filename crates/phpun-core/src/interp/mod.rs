@@ -368,7 +368,7 @@ pub struct Interp<'a> {
     pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
     /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
     /// the stored Rc keeps the decl alive so the pointer can't recycle.
-    compiled_fns: crate::value::FxMap<usize, (Rc<FunctionDecl>, Option<Rc<vm::Compiled>>)>,
+    compiled_fns: crate::value::FxMap<usize, vm::CompileCacheEntry>,
     /// Recycled value vecs for VM frames (exec stacks + call argv) —
     /// a call mallocs zero vecs once warm. Bounded by vm_exec's cap.
     vm_val_pool: Vec<Vec<Value>>,

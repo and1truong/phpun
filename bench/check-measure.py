@@ -42,4 +42,8 @@ if mode == 'nondeterministic': print(n)
         if mode != 'ok':
             assert '| n/a | n/a | n/a | INVALID |' in run.stdout, run.stdout
             assert 'geometric mean' not in run.stdout, run.stdout
+    for flag in ('PHPUN_CALLPROF', 'PHPUN_ALLOC', 'PHPUN_VMPROF'):
+        run = subprocess.run(['python3', 'bench/measure.py', '--bench', str(script)],
+                             env=dict(os.environ, **{flag: '1'}), capture_output=True)
+        assert run.returncode != 0 and b'disable PHPUN_' in run.stderr, flag
     print('benchmark gates: ok')

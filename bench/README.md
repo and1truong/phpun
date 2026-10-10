@@ -24,7 +24,16 @@ python3 bench/check-measure.py # failure/timeout/output gate self-check
 Set `PHPUN_BUILD_INFO` to the binary's exact source commit, dirty state,
 Rust version and build flags. Reports record the current checkout separately
 from binary hashes; a checkout commit alone does not prove where an existing
-binary was built. Disable `PHPUN_CALLPROF` and `PHPUN_ALLOC` for speed timings.
+binary was built. Disable `PHPUN_CALLPROF`, `PHPUN_ALLOC` and `PHPUN_VMPROF` for speed timings.
+
+For coverage diagnostics, run `PHPUN_VMPROF=1 phpun script.php`. Stderr
+reports the first compiler rejection per declaration (file, line, function
+and construct), compile-cache lookup counts grouped by rejection reason,
+and actual VM body entries, including direct cached calls. Lookup counts
+are not call counts or elapsed-time shares: direct VM cache hits bypass
+compiler lookup, and a bound call can consult the cache more than once.
+The first rejected construct can hide later unsupported constructs. Profiling
+adds overhead; compare speed only with profiling disabled.
 
 ### HTTP (concurrent server load)
 

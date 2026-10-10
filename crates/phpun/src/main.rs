@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         phpun_core::set_alloc_counting();
     }
     let rc = dispatch(args);
+    Interp::dump_vm_coverage();
     if ALLOC_ON.load(std::sync::atomic::Ordering::Relaxed) != 0 {
         eprintln!(
             "allocs: {} bytes: {}",

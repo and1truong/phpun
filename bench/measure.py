@@ -49,8 +49,8 @@ def main():
     args = parser.parse_args()
     if args.reps < 2 or args.timeout <= 0:
         parser.error("use at least two repetitions and a positive timeout")
-    if os.environ.get("PHPUN_CALLPROF") is not None or os.environ.get("PHPUN_ALLOC") is not None:
-        parser.error("disable PHPUN_CALLPROF and PHPUN_ALLOC when measuring speed")
+    if os.environ.get("PHPUN_CALLPROF") is not None or os.environ.get("PHPUN_ALLOC") is not None or os.environ.get("PHPUN_VMPROF") is not None:
+        parser.error("disable PHPUN_CALLPROF, PHPUN_ALLOC and PHPUN_VMPROF when measuring speed")
     php = [binary_path(os.environ.get("PHP", "php")), *args.php_arg]
     phpun = [binary_path(os.environ.get("PHPUN", "./target/release/phpun"))]
     scripts = args.bench if args.bench is not None else sorted(Path("bench").glob("[0-9]*.php"))
