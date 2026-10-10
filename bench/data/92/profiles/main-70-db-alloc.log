@@ -1,0 +1,6 @@
+allocs: 1231635 bytes: 40468009
+  cell: 20625
+  vm_site: 20588
+  mem_track: 39456
+  vars_insert: 1
+  call_args: 20584
