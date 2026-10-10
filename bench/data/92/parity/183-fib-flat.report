@@ -1,0 +1,87 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 8195978875
+#
+# Overhead  Symbol                                                                                                                                                    IPC   [IPC Coverage]
+# ........  ........................................................................................................................................................  ....................
+#
+    37.22%  [.] <phpun_core::interp::Interp>::vm_exec                                                                                                                 -      -            
+    10.79%  [.] <phpun_core::interp::Interp>::vm_run                                                                                                                  -      -            
+     9.38%  [.] 0x000000000017bacf                                                                                                                                    -      -            
+     6.50%  [.] 0x000000000017bbcd                                                                                                                                    -      -            
+     2.58%  [.] <phpun_core::interp::Interp>::vm_site                                                                                                                 -      -            
+     2.51%  [.] <phpun_core::interp::Interp>::call_site_frame                                                                                                         -      -            
+     2.27%  [.] <&str as core::str::pattern::Pattern>::is_contained_in                                                                                                -      -            
+     2.08%  [.] <phpun_core::interp::Interp>::vm_binary                                                                                                               -      -            
+     2.08%  [.] <phpun_core::interp::Interp>::vm_frame_free                                                                                                           -      -            
+     2.02%  [.] core::ptr::drop_glue::<phpun_core::value::Value>                                                                                                      -      -            
+     1.47%  [.] <phpun_core::interp::Interp>::vm_slot_value                                                                                                           -      -            
+     1.35%  [.] core::ptr::drop_glue::<alloc::vec::Vec<alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>>>                                                 -      -            
+     1.35%  [.] 0x000000000017bac0                                                                                                                                    -      -            
+     0.98%  [.] cfree                                                                                                                                                 -      -            
+     0.98%  [.] 0x000000000017bac3                                                                                                                                    -      -            
+     0.92%  [.] 0x000000000017bb7b                                                                                                                                    -      -            
+     0.86%  [.] <phpun_core::interp::Interp>::trace_pop                                                                                                               -      -            
+     0.80%  [.] 0x000000000017bc0a                                                                                                                                    -      -            
+     0.74%  [.] core::ptr::drop_glue::<phpun_core::interp::CallArgs>                                                                                                  -      -            
+     0.67%  [.] 0x000000000017bbdd                                                                                                                                    -      -            
+     0.61%  [.] <phpun_core::interp::Interp>::call_site                                                                                                               -      -            
+     0.61%  [.] 0x000000000017bc18                                                                                                                                    -      -            
+     0.55%  [.] <alloc::raw_vec::RawVecInner>::finish_grow                                                                                                            -      -            
+     0.49%  [.] malloc                                                                                                                                                -      -            
+     0.49%  [.] 0x000000000017bbe4                                                                                                                                    -      -            
+     0.49%  [.] 0x000000000017bc04                                                                                                                                    -      -            
+     0.43%  [.] <phpun_core::interp::Interp>::destruct_frame_objs                                                                                                     -      -            
+     0.43%  [.] core::ptr::drop_glue::<alloc::vec::Vec<phpun_core::interp::vm::Slot>>                                                                                 -      -            
+     0.43%  [.] core::ptr::drop_glue::<alloc::vec::drain::Drain<alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>>>                                        -      -            
+     0.43%  [.] 0x000000000017bb98                                                                                                                                    -      -            
+     0.43%  [.] 0x000000000017bba0                                                                                                                                    -      -            
+     0.43%  [.] 0x000000000017bc11                                                                                                                                    -      -            
+     0.37%  [.] 0x000000000017bb90                                                                                                                                    -      -            
+     0.37%  [.] 0x000000000017bc3f                                                                                                                                    -      -            
+     0.31%  [.] <hashbrown::raw::RawTable<(alloc::string::String, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>)>>::clear                              -      -            
+     0.31%  [.] <phpun_core::interp::Interp>::destruct_cells                                                                                                          -      -            
+     0.31%  [.] <phpun_core::interp::Interp>::vm_call_reserve                                                                                                         -      -            
+     0.31%  [.] core::ptr::drop_glue::<alloc::vec::into_iter::IntoIter<(alloc::string::String, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>, bool)>>  -      -            
+     0.31%  [.] 0x000000000017bb83                                                                                                                                    -      -            
+     0.31%  [.] 0x000000000017bc27                                                                                                                                    -      -            
+     0.25%  [.] <alloc::string::String as core::clone::Clone>::clone                                                                                                  -      -            
+     0.25%  [.] core::ptr::drop_glue::<alloc::vec::Vec<(alloc::string::String, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>)>>                        -      -            
+     0.25%  [.] 0x00000000001724f7                                                                                                                                    -      -            
+     0.25%  [.] 0x000000000017bbd4                                                                                                                                    -      -            
+     0.25%  [.] 0x000000000017bbec                                                                                                                                    -      -            
+     0.25%  [.] 0x000000000017bbf4                                                                                                                                    -      -            
+     0.25%  [.] 0x000000000017bc37                                                                                                                                    -      -            
+     0.18%  [.] <alloc::raw_vec::RawVec<alloc::rc::Rc<core::cell::RefCell<phpun_core::value::PhpResource>>>>::grow_one                                                -      -            
+     0.18%  [.] <phpun_core::interp::Interp>::sweep_expr_temps                                                                                                        -      -            
+     0.18%  [.] 0x000000000017bbfc                                                                                                                                    -      -            
+     0.12%  [.] <alloc::vec::Vec<phpun_core::interp::vm::Slot>>::truncate                                                                                             -      -            
+     0.12%  [.] core::ptr::drop_glue::<alloc::vec::drain::Drain<phpun_core::value::Value>>                                                                            -      -            
+     0.12%  [.] core::ptr::drop_glue::<phpun_core::interp::vm::CachedFn>                                                                                              -      -            
+     0.12%  [.] 0x00000000001724c4                                                                                                                                    -      -            
+     0.12%  [.] 0x00000000001724e7                                                                                                                                    -      -            
+     0.12%  [.] 0x000000000017bb6d                                                                                                                                    -      -            
+     0.12%  [.] 0x000000000017bc1f                                                                                                                                    -      -            
+     0.12%  [.] 0x000000000017bc2f                                                                                                                                    -      -            
+     0.06%  [.] <<phpun_core::interp::vm::Compiled>::scalar_ty_gate::{closure#3} as core::ops::function::FnOnce<(&phpun_core::value::Value,)>>::call_once             -      -            
+     0.06%  [.] <phpun_core::ast::Expr as core::clone::Clone>::clone                                                                                                  -      -            
+     0.06%  [.] <phpun_core::interp::Interp>::vm_backedge                                                                                                             -      -            
+     0.06%  [.] 0x0000000000001f97                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000000a05e1                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000000a0613                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000000a062d                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000000a1398                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000001724c0                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000001724da                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000001724fb                                                                                                                                    -      -            
+     0.06%  [.] 0x00000000001724fd                                                                                                                                    -      -            
+     0.06%  [.] 0x000000000017bb89                                                                                                                                    -      -            
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

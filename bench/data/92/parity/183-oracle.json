@@ -1,0 +1,26 @@
+{
+  "fixtures": [
+    "crates/phpun-core/tests/fixtures/vm_canonical_control_flow.php",
+    "crates/phpun-core/tests/fixtures/vm_ref_send.php",
+    "crates/phpun-core/tests/fixtures/vm_lazy_trace.php",
+    "crates/phpun-core/tests/fixtures/vm_extract_scope.php",
+    "crates/phpun-core/tests/fixtures/vm_top_level.php",
+    "crates/phpun-core/tests/fixtures/vm_closure_dispatch.php",
+    "crates/phpun-core/tests/fixtures/vm_canonical_lifetimes.php",
+    "crates/phpun-core/tests/fixtures/vm_arrow_imports.php",
+    "crates/phpun-core/tests/fixtures/vm_namespace_precedence.php",
+    "crates/phpun-core/tests/fixtures/vm_frame_lifetime.php",
+    "crates/phpun-core/tests/fixtures/vm_foreach_bodies.php",
+    "crates/phpun-core/tests/fixtures/vm_method_properties.php",
+    "crates/phpun-core/tests/fixtures/vm_canonical_expressions.php",
+    "crates/phpun-core/tests/fixtures/vm_array_insert_bound.php",
+    "crates/phpun-core/tests/fixtures/vm_call_namespace_snapshot.php",
+    "crates/phpun-core/tests/fixtures/vm_canonical_unset.php",
+    "crates/phpun-core/tests/fixtures/vm_top_global_unset.php",
+    "crates/phpun-core/tests/fixtures/vm_call_order.php",
+    "crates/phpun-core/tests/fixtures/vm_cell_pool_alias.php",
+    "crates/phpun-core/tests/fixtures/vm_store_destruct.php",
+    "crates/phpun-core/tests/fixtures/vm_uninitialized_locals.php"
+  ],
+  "gate": "exit/stdout/stderr == PHP 8.5.11 -n"
+}

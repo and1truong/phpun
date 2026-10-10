@@ -1,0 +1,26 @@
+{
+  "runtime": "2077344",
+  "checks": [
+    "workspace tests",
+    "fmt",
+    "clippy",
+    "release",
+    "union preference/by-reference/promotion/introspection/conversion regression",
+    "27 VM/standalone oracle probes"
+  ],
+  "phpt": {
+    "total": 709,
+    "passed": 636,
+    "failed": 62,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 2,
+    "unsupported": 9,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 698,
+    "compatibility_pct": 91.12
+  },
+  "status_changes": []
+}

@@ -11,7 +11,7 @@ use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, Param, Stmt};
 use crate::builtins;
 use crate::error::PhpError;
-use crate::value::{compare, identical, Cell, FxMap, PhpArray, Value};
+use crate::value::{compare, identical, Cell, FxMap, PhpArray, PhpClass, Value};
 
 use super::{Flow, Interp};
 
@@ -23,6 +23,8 @@ pub(in crate::interp) enum Slot {
     Uninit,
     V(Value),
     C(Cell),
+    /// Read-only parameter in the live frame value vector.
+    Arg(u16),
 }
 
 pub(in crate::interp) type CompileCacheEntry =
@@ -56,9 +58,8 @@ pub(crate) struct Compiled {
     pub(in crate::interp) bind_free: bool,
     /// What the slot path genuinely can't bind: by-ref params (must
     /// alias the caller's cell — argv carries owned Values) and
-    /// ctor-promoted params (`$this` writes). Those decls still
-    /// compile — they flow through bind_and_run, which runs the body
-    /// via vm_bound_exec.
+    /// unsupported promotion binds. Those decls still compile and run
+    /// their bodies via vm_bound_exec after the canonical binder.
     pub(in crate::interp) needs_bind: bool,
     /// Cheap pass-proof for single-scalar return types: `Some(f)`
     /// means `f(returned)` proving the type check satisfied lets the
@@ -69,6 +70,7 @@ pub(crate) struct Compiled {
     /// Same proof per param (variadic params get `None` — their
     /// extras take the full gate each).
     param_fast: Vec<Option<ScalarGate>>,
+    value_abi: bool,
 }
 
 pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
@@ -143,6 +145,16 @@ fn coverage_hit(reason: &str) {
     }
 }
 
+/// Cache metadata only; never pin a receiver or a mutable property cell.
+/// ponytail: monomorphic resolved-key cache retains HashMap lookup; slot offsets
+/// need a measured layout change with storage-generation guards.
+struct CachedProp {
+    class: Rc<PhpClass>,
+    scope: Option<Rc<PhpClass>>,
+    key: String,
+    private_candidate: Option<String>,
+}
+
 enum Op {
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
@@ -150,6 +162,7 @@ enum Op {
     ThisProp {
         name: Rc<str>,
         site: usize,
+        cache: std::cell::RefCell<Option<CachedProp>>,
         fallback: Box<Expr>,
     },
     Foreach {
@@ -262,7 +275,7 @@ struct Compiler {
 
 impl Compiled {
     /// Single-scalar type gate the ok-path proves with one `matches!`
-    /// (`?T`/union-null handled; `float` excluded — an Int arg widens,
+    /// (`?T`/union-null handled; an Int for `float` widens,
     /// which is the full path's job). `Some(f)` only proves pass —
     /// every miss still runs the canonical check.
     fn scalar_ty_gate(ty: &[String]) -> Option<ScalarGate> {
@@ -280,6 +293,9 @@ impl Compiled {
         Some(match (core[0].to_ascii_lowercase().as_str(), nullable) {
             ("int", false) => |v: &Value| matches!(v, Value::Int(_)),
             ("int", true) => |v: &Value| matches!(v, Value::Int(_) | Value::Null),
+            // Only already-float values prove pass; int widening keeps the binder.
+            ("float", false) => |v: &Value| matches!(v, Value::Float(_)),
+            ("float", true) => |v: &Value| matches!(v, Value::Float(_) | Value::Null),
             ("string", false) => |v: &Value| matches!(v, Value::Str(_)),
             ("string", true) => |v: &Value| matches!(v, Value::Str(_) | Value::Null),
             ("bool", false) => |v: &Value| matches!(v, Value::Bool(_)),
@@ -307,8 +323,22 @@ impl Compiled {
         if Interp::decl_contains_yield(body) {
             return Err("generator");
         }
-        let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
+        // ponytail: fixed by-value constructors reuse the slot binder and
+        // canonical promoted stores. Named/variadic/reference/default-expr
+        // calls keep bind_and_run; no alternative property-write semantics.
+        let promoted_slots = decl.name.eq_ignore_ascii_case("__construct")
+            && decl.params.iter().all(|p| {
+                !p.by_ref
+                    && !p.variadic
+                    && p.default.as_ref().is_none_or(|d| const_val(d).is_some())
+            });
+        let has_promoted = decl.params.iter().any(|p| p.promoted);
+        let needs_bind = decl
+            .params
+            .iter()
+            .any(|p| p.by_ref || (p.promoted && !promoted_slots));
         let mut bind_free = !needs_bind
+            && !has_promoted
             && decl.ret.is_none()
             && decl.params.iter().all(|p| p.ty.is_none() && !p.variadic);
         let mut defaults: Vec<Option<Value>> = Vec::new();
@@ -368,6 +398,15 @@ impl Compiled {
             )
         });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
+        // ponytail: scalar, read-only params only. Writable/by-ref/hybrid
+        // bodies keep cells until lazy promotion supports their full lifetime.
+        let value_abi = !hybrid
+            && !needs_bind
+            && !decl.params.iter().any(|p| p.variadic || p.promoted)
+            && !c.ops.iter().any(|op| match op {
+                Op::Store(i) | Op::IncDec { slot: i, .. } => (*i as usize) < decl.params.len(),
+                _ => false,
+            });
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -383,6 +422,7 @@ impl Compiled {
                 || decl.name.eq_ignore_ascii_case("__toString"),
             ret_fast,
             param_fast,
+            value_abi,
         }))
     }
 
@@ -423,6 +463,7 @@ impl Compiled {
             needs_bind: true,
             ret_fast: None,
             param_fast: Vec::new(),
+            value_abi: false,
         }))
     }
 }
@@ -1082,6 +1123,7 @@ impl Compiler {
                 self.emit(Op::ThisProp {
                     name: Rc::from(name.as_str()),
                     site: *site,
+                    cache: std::cell::RefCell::new(None),
                     fallback: Box::new(e.clone()),
                 });
             }
@@ -1231,12 +1273,15 @@ impl<'a> Interp<'a> {
         };
         // Only defer when every provided param is check-free or proven to
         // pass. Rebinding/coercion errors retain eager send-time arguments.
-        let defer_args = args.named.is_empty()
-            && args.cells.len() >= decl.params.len()
-            && decl.params.iter().enumerate().all(|(i, p)| {
-                p.ty.is_none()
-                    || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
-            });
+        let value_abi = !self.cur().value_args.is_empty();
+        let defer_args = value_abi
+            || !decl.params.iter().any(|p| p.promoted)
+                && args.named.is_empty()
+                && args.cells.len() >= decl.params.len()
+                && decl.params.iter().enumerate().all(|(i, p)| {
+                    p.ty.is_none()
+                        || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
+                });
         let fr = self.call_site_frame(decl, &args, defer_args);
         self.call_trace.push(fr);
         padd!(2, __p);
@@ -1255,7 +1300,9 @@ impl<'a> Interp<'a> {
             .vm_slot_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
-        if comp.bind_free {
+        if value_abi {
+            slots.extend((0..decl.params.len()).map(|i| Slot::Arg(i as u16)));
+        } else if comp.bind_free {
             for (i, _) in decl.params.iter().enumerate() {
                 let c = match fa.get(i) {
                     Some(c) => c.clone(),
@@ -1364,7 +1411,21 @@ impl<'a> Interp<'a> {
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
         padd!(3, __p);
         let __p = pnow!();
-        let r = self.vm_exec(comp, &mut slots, temps_base);
+        let r = (|| {
+            if decl.params.iter().any(|p| p.promoted) {
+                // Publish arguments before stores: a set hook can inspect this
+                // constructor's live args/locals or raise an exception.
+                self.vm_materialize(comp, &mut slots);
+                if let Some(obj) = self.cur().this_obj.clone() {
+                    for p in decl.params.iter().filter(|p| p.promoted) {
+                        let value = self.cur().vars[&p.name].borrow().clone();
+                        self.store_prop(Value::Object(obj.clone()), &p.name, value)?;
+                    }
+                }
+                self.vm_refresh(comp, &mut slots);
+            }
+            self.vm_exec(comp, &mut slots, temps_base)
+        })();
         self.loop_depth = saved_depth;
         padd!(4, __p);
         let __p = pnow!();
@@ -1413,6 +1474,7 @@ impl<'a> Interp<'a> {
             // clear+pool it like the slots vec so the next call's arg
             // materialization costs no malloc.
             let mut fa = std::mem::take(&mut f.args);
+            f.value_args.clear();
             slots.clear();
             // Pooled frames retain capacity, not PHP owners. Methods and
             // closures also use vm_run, so release their receiver/captures
@@ -1564,10 +1626,7 @@ impl<'a> Interp<'a> {
                 "||" => Value::Bool(rv.is_truthy()),
                 "." => {
                     let grow = matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
-                    let mut ls = self.conv_bytes(&lv)?;
-                    let rs = self.conv_bytes(&rv)?;
-                    ls.extend_from_slice(&rs);
-                    let nv = Value::bytes(ls);
+                    let nv = self.concat_bytes(&lv, &rv)?;
                     if let Value::Str(s) = &nv {
                         match &lv {
                             Value::Str(os) if grow => {
@@ -1633,6 +1692,9 @@ impl<'a> Interp<'a> {
 
     fn vm_materialize(&mut self, comp: &Compiled, slots: &mut [Slot]) {
         let frame = self.cur();
+        if !frame.value_args.is_empty() {
+            frame.args.extend(frame.value_args.drain(..).map(cell));
+        }
         for (name, index) in &comp.names {
             let slot = &mut slots[*index as usize];
             // Move the handle out: it must not look like a PHP alias while
@@ -1640,6 +1702,7 @@ impl<'a> Interp<'a> {
             let c = match std::mem::replace(slot, Slot::Uninit) {
                 Slot::Uninit => continue,
                 Slot::C(c) => c,
+                Slot::Arg(i) => frame.args[i as usize].clone(),
                 Slot::V(v) => cell(v),
             };
             if frame
@@ -1673,6 +1736,7 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         Ok(match &slots[index as usize] {
             Slot::V(v) => v.clone(),
+            Slot::Arg(i) => self.stack.last().unwrap().value_args[*i as usize].clone(),
             Slot::C(c) => c.borrow().clone(),
             Slot::Uninit => {
                 let name = comp
@@ -1728,12 +1792,57 @@ impl<'a> Interp<'a> {
                 Op::ThisProp {
                     name,
                     site,
+                    cache,
                     fallback,
                 } => {
                     self.cur_line = *site;
                     self.send_line = Some(*site);
                     let receiver = self.stack.last().and_then(|f| f.this_obj.clone());
-                    let plain = receiver.and_then(|o| self.prop_read_plain(&o, name));
+                    let plain = receiver.and_then(|o| {
+                        let frame = self.stack.last().unwrap();
+                        let scope = frame
+                            .decl_class
+                            .as_ref()
+                            .or(frame.scope_class.as_ref())
+                            .cloned();
+                        let can_cache = frame.hook_prop.is_none();
+                        if can_cache {
+                            let ob = o.borrow();
+                            if let Some(hit) = cache.borrow().as_ref() {
+                                let same_scope = match (&hit.scope, &scope) {
+                                    (None, None) => true,
+                                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                                    _ => false,
+                                };
+                                // A public fallback key cannot shadow a private
+                                // scope slot that exists in a different instance.
+                                let same_resolution =
+                                    hit.private_candidate.as_ref().is_none_or(|private| {
+                                        private == &hit.key || !ob.props.contains_key(private)
+                                    });
+                                if Rc::ptr_eq(&hit.class, &ob.class)
+                                    && same_scope
+                                    && same_resolution
+                                {
+                                    if let Some(c) = ob.props.get(&hit.key) {
+                                        return Some(c.borrow().clone());
+                                    }
+                                }
+                            }
+                        }
+                        let (value, key) = self.prop_read_plain_key(&o, name)?;
+                        if can_cache {
+                            let private_candidate =
+                                scope.as_ref().map(|c| format!("\0{}\0{}", c.name(), name));
+                            *cache.borrow_mut() = Some(CachedProp {
+                                class: o.borrow().class.clone(),
+                                scope,
+                                key,
+                                private_candidate,
+                            });
+                        }
+                        Some(value)
+                    });
                     if let Some(value) = plain {
                         vs.push(value);
                     } else {
@@ -1781,6 +1890,7 @@ impl<'a> Interp<'a> {
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
                 Op::Store(s) => {
                     match &mut slots[*s as usize] {
+                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
                         Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
                         Slot::V(v) => {
                             let old = std::mem::replace(v, vs.last().unwrap().clone());
@@ -1860,6 +1970,7 @@ impl<'a> Interp<'a> {
                     let old = self.vm_slot_value(comp, slots, *slot)?;
                     let new = self.incdec_value(&old, *delta)?;
                     match &mut slots[*slot as usize] {
+                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
                         Slot::Uninit => slots[*slot as usize] = Slot::V(new),
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
@@ -2312,6 +2423,7 @@ impl<'a> Interp<'a> {
         frame.statics_unit = None;
         frame.vars.clear();
         frame.args.clear();
+        frame.value_args.clear();
         frame.vm_sites.clear();
         let pending_caps = std::mem::take(&mut self.pending_gen_captures);
         for (n, c, by_ref) in pending_caps {
@@ -2322,6 +2434,25 @@ impl<'a> Interp<'a> {
         padd!(0, __p);
         let __p = pnow!();
         let mut args = super::CallArgs::empty();
+        let value_abi = comp.value_abi
+            && !argv.is_empty()
+            && argv.len() == decl.params.len()
+            && argv.iter().all(|v| {
+                matches!(
+                    v,
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                )
+            })
+            && decl.params.iter().enumerate().all(|(i, p)| {
+                p.ty.is_none() || comp.param_fast[i].is_some_and(|gate| gate(&argv[i]))
+            });
+        if value_abi {
+            let n = argv.len() as u64;
+            std::mem::swap(&mut self.cur().value_args, argv);
+            self.vm_call_reserve(&mut args, n);
+            padd!(1, __p);
+            return self.vm_run(decl, comp, args);
+        }
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(|value| {
             if matches!(

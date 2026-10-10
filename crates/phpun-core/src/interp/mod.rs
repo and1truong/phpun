@@ -173,6 +173,8 @@ pub struct Frame {
     vars: crate::value::FxMap<String, Cell>,
     /// Actual call args for func_get_args().
     args: Vec<Cell>,
+    /// Read-only scalar direct-call args, promoted only when cells are observed.
+    value_args: Vec<Value>,
     /// Enclosing function name (for `static`/`__FUNCTION__`).
     fn_name: Rc<str>,
     /// `$this` in method calls.
@@ -236,6 +238,7 @@ impl Frame {
         Self {
             vars: crate::value::FxMap::default(),
             args: Vec::new(),
+            value_args: Vec::new(),
             fn_name: fn_name.into(),
             this_obj: None,
             scope_class: None,
@@ -7430,6 +7433,185 @@ impl<'a> Interp<'a> {
         r
     }
 
+    fn check_builtin_types(&mut self, name: &str, cells: &[Cell]) -> Result<(), PhpError> {
+        if let Some(sig) = builtins::strict_sig(name) {
+            let zf = matches!(
+                name,
+                "strlen"
+                    | "count"
+                    | "sizeof"
+                    | "array_key_exists"
+                    | "call_user_func"
+                    | "call_user_func_array"
+            );
+            let strict = self.caller_file_strict();
+            // Zend verifies arity before per-arg types — an
+            // under-arity call reports "expects exactly/at least N
+            // arguments", never a null-param TypeError.
+            let min = builtins::builtin_params(name)
+                .map(|ps| {
+                    ps.iter()
+                        .take_while(|(_, d)| {
+                            matches!(*d, builtins::BDef::Req | builtins::BDef::OptReq)
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let arg_checks = cells.len() >= min;
+            if !arg_checks
+                || builtins::builtin_params(name).is_some_and(|ps| {
+                    !ps.iter().any(|(_, d)| matches!(d, builtins::BDef::Var))
+                        && cells.len() > ps.len()
+                })
+            {
+                return Ok(()); // Canonical arity errors precede every ZPP type check.
+            }
+            for (i, (pname, pty)) in sig.iter().enumerate() {
+                if i >= cells.len() {
+                    break;
+                }
+                // Probe errors belong to THIS param's check only.
+                self.callable_probe_err = None;
+                let v = cells[i].borrow().clone();
+                let has_cb = pty
+                    .trim_start_matches('?')
+                    .split('|')
+                    .any(|t| t == "callable");
+                if has_cb {
+                    // A union member wins on its own type: '0'
+                    // satisfies `string` in `string|array|callable`
+                    // even though it is not callable
+                    // (closure_047/048).
+                    let ok = (pty.starts_with('?') && matches!(v, Value::Null))
+                        || self.is_callable_value(&v)
+                        || pty
+                            .trim_start_matches('?')
+                            .split('|')
+                            .filter(|t| *t != "callable")
+                            .any(|t| self.param_type_match(t, &v));
+                    if !ok {
+                        // A throwing autoloader propagates through
+                        // the probe (usort/array_map/... — zend
+                        // re-raises it rather than TypeError-ing).
+                        if let Some(pe) = self.take_callable_probe_err() {
+                            return self.fail(pe);
+                        }
+                        let null = if pty.starts_with('?') { " or null" } else { "" };
+                        let msg = format!(
+                            "{}(): Argument #{} (${}) must be a valid callback{}, {}",
+                            name,
+                            i + 1,
+                            pname,
+                            null,
+                            self.zpp_callback_detail(&v),
+                        );
+                        self.exc_frameless = zf;
+                        let e = self.exception("TypeError", &msg);
+                        let te = self.throw(e);
+                        let r = self.fail(te);
+                        return r;
+                    }
+                } else if matches!(v, Value::Null)
+                    && arg_checks
+                    && !pty.starts_with('?')
+                    && !pty.split('|').any(|t| matches!(t, "null" | "mixed"))
+                    && !strict
+                {
+                    // Weak-mode null on a non-nullable arginfo
+                    // param: scalar (or scalar-membered union)
+                    // params coerce with a Deprecated notice; the
+                    // rest are a catchable TypeError
+                    // (deprecations_nullable).
+                    let scal = pty
+                        .split('|')
+                        .any(|t| matches!(t, "string" | "int" | "float" | "bool"));
+                    // Functions with their own null-specialised
+                    // notice (array_key_exists says "use an empty
+                    // string instead") emit only that one.
+                    let special = matches!(name, "array_key_exists" | "key_exists");
+                    if scal {
+                        if !special {
+                            let d = self.deprecated(&format!(
+                                    "{name}(): Passing null to parameter #{} (${pname}) of type {pty} is deprecated",
+                                    i + 1
+                                ));
+                            if let Err(e) = d {
+                                return self.fail(e);
+                            }
+                        }
+                    } else {
+                        // Zend omits the name for variadic args.
+                        let variadic = builtins::builtin_params(name)
+                            .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
+                            .unwrap_or(false);
+                        let pname_txt = if variadic {
+                            String::new()
+                        } else {
+                            format!(" (${pname})")
+                        };
+                        self.exc_frameless = zf;
+                        let e = self.exception(
+                                "TypeError",
+                                &format!(
+                                    "{name}(): Argument #{}{pname_txt} must be of type {pty}, null given",
+                                    i + 1
+                                ),
+                            );
+                        let te = self.throw(e);
+                        let r = self.fail(te);
+                        return r;
+                    }
+                } else if !strict
+                    && !matches!(v, Value::Null)
+                    && arg_checks
+                    && !pty.trim_start_matches('?').split('|').any(|t| {
+                        t == "resource" && matches!(v, Value::Resource(_))
+                            || t != "resource" && self.param_type_match(t, &v)
+                    })
+                {
+                    // Weak mode coerces scalars, but non-coercible
+                    // arg types still TypeError (strlen([1]);
+                    // sort("x") — the by-ref arm errors earlier).
+                    let variadic = builtins::builtin_params(name)
+                        .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
+                        .unwrap_or(false);
+                    let pname_txt = if variadic {
+                        String::new()
+                    } else {
+                        format!(" (${pname})")
+                    };
+                    let msg = format!(
+                        "{}(): Argument #{}{pname_txt} must be of type {}, {} given",
+                        name,
+                        i + 1,
+                        pty,
+                        self.zval_type_name(&v),
+                    );
+                    self.exc_frameless = zf;
+                    let e = self.exception("TypeError", &msg);
+                    let te = self.throw(e);
+                    let r = self.fail(te);
+                    return r;
+                } else if strict && !self.zpp_strict_ok(pty, &v) {
+                    let msg = format!(
+                        "{}(): Argument #{} (${}) must be of type {}, {} given",
+                        name,
+                        i + 1,
+                        pname,
+                        pty,
+                        self.zval_type_name(&v),
+                    );
+                    self.exc_frameless = zf;
+                    let e = self.exception("TypeError", &msg);
+                    let te = self.throw(e);
+                    let r = self.fail(te);
+                    return r;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn call_builtin_inner(
         &mut self,
         name: &str,
@@ -7478,6 +7660,52 @@ impl<'a> Interp<'a> {
             gen_resume: false,
             gen_body: false,
         });
+        // Dynamic sends carry non-reference flags; normalize before ZPP so
+        // its warnings precede type errors and writes cannot reach the caller.
+        let mut detached;
+        let args = if let Some(flags) = calls::builtin_byref(name) {
+            let params = builtins::builtin_params(name).unwrap_or_default();
+            let mut copies = Vec::new();
+            for (i, by_ref) in flags.iter().enumerate().filter(|(_, b)| **b) {
+                let _ = by_ref;
+                if let Some(c) = args.cells.get(i) {
+                    if args.nonref_cells.contains(&i) {
+                        copies.push((i, None, c.clone()));
+                    }
+                } else if let Some((j, (_, c, refable, _))) = args
+                    .named
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (n, ..))| params.get(i).is_some_and(|(pn, _)| *pn == n))
+                {
+                    if !refable {
+                        copies.push((i, Some(j), c.clone()));
+                    }
+                }
+            }
+            if copies.is_empty() {
+                args
+            } else {
+                detached = args.clone();
+                for (i, named, c) in copies {
+                    let pname = params.get(i).map(|(n, _)| *n).unwrap_or("");
+                    if let Err(e) = self.warn(&format!(
+                        "{name}(): Argument #{} (${pname}) must be passed by reference, value given", i + 1)) {
+                        self.trace_pop();
+                        return Err(e);
+                    }
+                    let copy = cell(c.borrow().clone());
+                    if let Some(j) = named {
+                        detached.named[j].1 = copy;
+                    } else {
+                        detached.cells[i] = copy;
+                    }
+                }
+                &detached
+            }
+        } else {
+            args
+        };
         if name == "assert" {
             // AssertionError message = `assert(<args>)` as written.
             let mut parts: Vec<String> = Vec::new();
@@ -7631,178 +7859,9 @@ impl<'a> Interp<'a> {
         // `callable` params are validated eagerly even in weak mode
         // (Zend's `f` ZPP flag) with the callback-specific messages.
         if args.named.is_empty() {
-            if let Some(sig) = builtins::strict_sig(name) {
-                let zf = matches!(
-                    name,
-                    "strlen"
-                        | "count"
-                        | "sizeof"
-                        | "array_key_exists"
-                        | "call_user_func"
-                        | "call_user_func_array"
-                );
-                let strict = self.caller_file_strict();
-                // Zend verifies arity before per-arg types — an
-                // under-arity call reports "expects exactly/at least N
-                // arguments", never a null-param TypeError.
-                let min = builtins::builtin_params(name)
-                    .map(|ps| {
-                        ps.iter()
-                            .take_while(|(_, d)| {
-                                matches!(*d, builtins::BDef::Req | builtins::BDef::OptReq)
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0);
-                let arg_checks = args.cells.len() >= min;
-                for (i, (pname, pty)) in sig.iter().enumerate() {
-                    if i >= args.cells.len() {
-                        break;
-                    }
-                    // Probe errors belong to THIS param's check only.
-                    self.callable_probe_err = None;
-                    let v = args.cells[i].borrow().clone();
-                    let has_cb = pty
-                        .trim_start_matches('?')
-                        .split('|')
-                        .any(|t| t == "callable");
-                    if has_cb {
-                        // A union member wins on its own type: '0'
-                        // satisfies `string` in `string|array|callable`
-                        // even though it is not callable
-                        // (closure_047/048).
-                        let ok = (pty.starts_with('?') && matches!(v, Value::Null))
-                            || self.is_callable_value(&v)
-                            || pty
-                                .trim_start_matches('?')
-                                .split('|')
-                                .filter(|t| *t != "callable")
-                                .any(|t| self.param_type_match(t, &v));
-                        if !ok {
-                            // A throwing autoloader propagates through
-                            // the probe (usort/array_map/... — zend
-                            // re-raises it rather than TypeError-ing).
-                            if let Some(pe) = self.take_callable_probe_err() {
-                                self.trace_pop();
-                                return self.fail(pe);
-                            }
-                            let null = if pty.starts_with('?') { " or null" } else { "" };
-                            let msg = format!(
-                                "{}(): Argument #{} (${}) must be a valid callback{}, {}",
-                                name,
-                                i + 1,
-                                pname,
-                                null,
-                                self.zpp_callback_detail(&v),
-                            );
-                            self.exc_frameless = zf;
-                            let e = self.exception("TypeError", &msg);
-                            let te = self.throw(e);
-                            let r = self.fail(te);
-                            self.trace_pop();
-                            return r;
-                        }
-                    } else if matches!(v, Value::Null)
-                        && arg_checks
-                        && !pty.starts_with('?')
-                        && !pty.split('|').any(|t| matches!(t, "null" | "mixed"))
-                        && !strict
-                    {
-                        // Weak-mode null on a non-nullable arginfo
-                        // param: scalar (or scalar-membered union)
-                        // params coerce with a Deprecated notice; the
-                        // rest are a catchable TypeError
-                        // (deprecations_nullable).
-                        let scal = pty
-                            .split('|')
-                            .any(|t| matches!(t, "string" | "int" | "float" | "bool"));
-                        // Functions with their own null-specialised
-                        // notice (array_key_exists says "use an empty
-                        // string instead") emit only that one.
-                        let special = matches!(name, "array_key_exists" | "key_exists");
-                        if scal {
-                            if !special {
-                                let d = self.deprecated(&format!(
-                                    "{name}(): Passing null to parameter #{} (${pname}) of type {pty} is deprecated",
-                                    i + 1
-                                ));
-                                if let Err(e) = d {
-                                    self.trace_pop();
-                                    return self.fail(e);
-                                }
-                            }
-                        } else {
-                            // Zend omits the name for variadic args.
-                            let variadic = builtins::builtin_params(name)
-                                .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
-                                .unwrap_or(false);
-                            let pname_txt = if variadic {
-                                String::new()
-                            } else {
-                                format!(" (${pname})")
-                            };
-                            self.exc_frameless = zf;
-                            let e = self.exception(
-                                "TypeError",
-                                &format!(
-                                    "{name}(): Argument #{}{pname_txt} must be of type {pty}, null given",
-                                    i + 1
-                                ),
-                            );
-                            let te = self.throw(e);
-                            let r = self.fail(te);
-                            self.trace_pop();
-                            return r;
-                        }
-                    } else if !strict
-                        && !matches!(v, Value::Null)
-                        && arg_checks
-                        && !pty.trim_start_matches('?').split('|').any(|t| {
-                            t == "resource" && matches!(v, Value::Resource(_))
-                                || t != "resource" && self.param_type_match(t, &v)
-                        })
-                    {
-                        // Weak mode coerces scalars, but non-coercible
-                        // arg types still TypeError (strlen([1]);
-                        // sort("x") — the by-ref arm errors earlier).
-                        let variadic = builtins::builtin_params(name)
-                            .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
-                            .unwrap_or(false);
-                        let pname_txt = if variadic {
-                            String::new()
-                        } else {
-                            format!(" (${pname})")
-                        };
-                        let msg = format!(
-                            "{}(): Argument #{}{pname_txt} must be of type {}, {} given",
-                            name,
-                            i + 1,
-                            pty,
-                            self.zval_type_name(&v),
-                        );
-                        self.exc_frameless = zf;
-                        let e = self.exception("TypeError", &msg);
-                        let te = self.throw(e);
-                        let r = self.fail(te);
-                        self.trace_pop();
-                        return r;
-                    } else if strict && !self.zpp_strict_ok(pty, &v) {
-                        let msg = format!(
-                            "{}(): Argument #{} (${}) must be of type {}, {} given",
-                            name,
-                            i + 1,
-                            pname,
-                            pty,
-                            self.zval_type_name(&v),
-                        );
-                        self.exc_frameless = zf;
-                        let e = self.exception("TypeError", &msg);
-                        let te = self.throw(e);
-                        let r = self.fail(te);
-                        self.trace_pop();
-                        return r;
-                    }
-                }
+            if let Err(e) = self.check_builtin_types(name, &args.cells) {
+                self.trace_pop();
+                return Err(e);
             }
         }
         match builtins::builtin_params(name) {
@@ -7823,7 +7882,16 @@ impl<'a> Interp<'a> {
                     self.send_line = Some(args.end_line);
                 }
                 let r = match self.resolve_named_builtin(name, params, args) {
-                    Ok(cells) => builtins::call(self, name, &cells),
+                    Ok(cells) => {
+                        // ponytail: extend named ZPP coverage incrementally; other
+                        // builtins retain their existing handler validation.
+                        if !args.named.is_empty() && matches!(name, "parse_str" | "getopt") {
+                            self.check_builtin_types(name, &cells)
+                                .and_then(|()| builtins::call(self, name, &cells))
+                        } else {
+                            builtins::call(self, name, &cells)
+                        }
+                    }
                     Err(e) => Err(e),
                 };
                 if visible {

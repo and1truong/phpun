@@ -1,0 +1,2 @@
+[ perf record: Woken up 21 times to write data ]
+[ perf record: Captured and wrote 5.181 MB /workspace/parity92/183-strings.data (639 samples) ]

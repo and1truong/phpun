@@ -1751,6 +1751,30 @@ impl<'a> Interp<'a> {
         Ok(self.conv_str(v)?.into_bytes())
     }
 
+    /// Borrow existing bytes and allocate only the combined output. Keep
+    /// non-string conversions left-to-right through the canonical helper.
+    /// ponytail: Rc<[u8]> still copies growing prefixes; capacity append needs
+    /// a measured unique-owner/storage change, not just accounting "grow".
+    pub(in crate::interp) fn concat_bytes(
+        &mut self,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Value, PhpError> {
+        use std::borrow::Cow;
+        let left = match left {
+            Value::Str(s) => Cow::Borrowed(&s[..]),
+            v => Cow::Owned(self.conv_bytes(v)?),
+        };
+        let right = match right {
+            Value::Str(s) => Cow::Borrowed(&s[..]),
+            v => Cow::Owned(self.conv_bytes(v)?),
+        };
+        let mut bytes = Vec::with_capacity(left.len() + right.len());
+        bytes.extend_from_slice(&left);
+        bytes.extend_from_slice(&right);
+        Ok(Value::bytes(bytes))
+    }
+
     /// Object→string with __toString, plus array warning.
     pub(crate) fn conv_str(&mut self, v: &Value) -> Result<String, PhpError> {
         match v {
@@ -3174,10 +3198,7 @@ impl<'a> Interp<'a> {
                 if self.dim_throw.is_some() && matches!(&rhs, Value::Object(_)) {
                     return self.dim_raise(Value::Null);
                 }
-                let mut l = self.conv_bytes(&cur)?;
-                let mut r = self.conv_bytes(&rhs)?;
-                l.append(&mut r);
-                let nv = Value::bytes(l);
+                let nv = self.concat_bytes(&cur, &rhs)?;
                 // zend emallocs the new zend_string buffer — tracked
                 // so the freed old buffer credits back on overwrite.
                 if let Value::Str(s) = &nv {
@@ -9947,10 +9968,7 @@ impl<'a> Interp<'a> {
                 // (concat_function's refcount==1 fast path) — model
                 // as a grow, not a fresh emalloc (cat3's oracle).
                 let grow = matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
-                let mut ls = self.conv_bytes(&lv)?;
-                let rs = self.conv_bytes(&rv)?;
-                ls.extend_from_slice(&rs);
-                let nv = Value::bytes(ls);
+                let nv = self.concat_bytes(&lv, &rv)?;
                 // zend emallocs the concat result zend_string.
                 if let Value::Str(s) = &nv {
                     match &lv {

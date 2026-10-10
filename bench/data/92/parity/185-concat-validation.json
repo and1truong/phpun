@@ -1,0 +1,71 @@
+{
+  "runtime": "a5dc13f",
+  "checks": [
+    "workspace tests",
+    "fmt",
+    "clippy",
+    "release",
+    "binary bytes/aliases/LHS-RHS mutation/conversion/throw order regression",
+    "29 VM/standalone oracle probes",
+    "19 workload oracle checks"
+  ],
+  "phpt": {
+    "total": 1557,
+    "passed": 1390,
+    "failed": 136,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 15,
+    "unsupported": 15,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 1,
+    "applicable": 1527,
+    "compatibility_pct": 91.03
+  },
+  "status_changes": [],
+  "existing_timeouts": [
+    "/workspace/phpun/vendor/php-tests/Zend/tests/concat/concat_003.phpt"
+  ],
+  "php_config_followup": {
+    "binary_sha256": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f",
+    "args": [
+      "-n"
+    ],
+    "settings": {
+      "version": "8.5.11",
+      "debug": false,
+      "zts": false,
+      "ini": false,
+      "opcache_loaded": true,
+      "enable_cli": "0",
+      "jit": "disable",
+      "jit_buffer_size": "64M",
+      "extensions": [
+        "Core",
+        "date",
+        "pcre",
+        "sqlite3",
+        "hash",
+        "json",
+        "lexbor",
+        "Zend OPcache",
+        "uri",
+        "SPL",
+        "PDO",
+        "pdo_sqlite",
+        "random",
+        "Reflection",
+        "tokenizer",
+        "standard"
+      ]
+    },
+    "note": "Config follow-up on the same frozen oracle binary; seven-rep timing samples are unchanged."
+  },
+  "benchmark_gate_review": {
+    "fix": "8fd2764",
+    "checks": "8 temporary-runtime controls: normal Python and -O both reject mismatched stdout, failed runtime, failed oracle and active profiler flags; no successful report written",
+    "runnable_control": "python -O bench/data/92/parity/compare-php-main-stack.py --php <php85> --main <frozen-main> --stack /usr/bin/false --main-runtime probe --stack-runtime probe --save /tmp/rejected.json",
+    "expected": "nonzero exit with gate failed, runtime=2, exit=1; rejected.json not created"
+  }
+}

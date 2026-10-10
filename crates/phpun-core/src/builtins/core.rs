@@ -80,7 +80,7 @@ pub(crate) fn dispatch(
                 }
                 _ => {
                     let mut a = PhpArray::new();
-                    for c in fa {
+                    for c in fa.iter() {
                         a.push(c.borrow().clone());
                     }
                     Value::Array(Rc::new(RefCell::new(a)))
@@ -163,12 +163,12 @@ pub(crate) fn dispatch(
                         }
                     }
                 }
-                // call_user_func* never forwards by reference — mark
-                // every arg nonref so `&$p` params warn "value given".
+                // Array elements already marked references remain reference sends.
+                // Plain elements warn on by-ref params and bind a local copy.
                 let n = ca.cells.len();
-                ca.nonref_cells = (0..n).collect();
+                ca.nonref_cells = (0..n).filter(|&i| !it.is_ref_cell(&ca.cells[i])).collect();
                 for t in ca.named.iter_mut() {
-                    t.2 = false;
+                    t.2 = it.is_ref_cell(&t.1);
                 }
                 // The array send is verbatim — element cells stay
                 // shared into by-value packs (__call's $a, bug50394).

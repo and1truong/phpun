@@ -1,0 +1,35 @@
+{
+  "samples": 1626,
+  "total_period": 8170853250,
+  "inclusive_percent": {
+    "call_site_frame": 10.947109471094711,
+    "vm_exec": 99.93849938499385,
+    "vm_run": 99.93849938499385,
+    "vm_site": 4.120541205412054,
+    "vm_frame_free": 1.7220172201722017
+  },
+  "exclusive_percent": {
+    "vm_exec": 36.96,
+    "vm_run": 11.01,
+    "call_site_frame": 2.95
+  },
+  "lost_samples": 0,
+  "event": "cpu-clock:u",
+  "frequency_hz": 199,
+  "dwarf_stack_bytes": 8192,
+  "workload": [
+    "bench/profile/fib.php",
+    "typed",
+    "29",
+    "10"
+  ],
+  "binary": "185-concat",
+  "runtime": "a5dc13f",
+  "timing_use": "CPU sampling only; no wall timing claim",
+  "limits": [
+    "Function symbols include bookkeeping, not pure opcode dispatch",
+    "Inclusive percentages overlap",
+    "Unresolved libc addresses",
+    "DWARF stack depth limit8192"
+  ]
+}
