@@ -2,8 +2,8 @@
 //! inside the supported subset compiles once to a flat `Vec<Op>` and
 //! runs on a value stack with locals in slots — no per-arg Cell, no
 //! binds vec, no vars-map insert per call. Any construct outside the
-//! subset bails the WHOLE body to the AST path, so semantics can't
-//! drift: a compiled body by construction never leaves the subset.
+//! subset bails the WHOLE body to the AST path. Oracle probes and
+//! regression checks are still required for every supported construct.
 //!
 //! ponytail: the subset is deliberately narrow (scalars, arith/compare,
 //! if/while/for, direct named calls, return). The known ceiling: frame
@@ -30,9 +30,13 @@ use super::{Flow, Interp};
 /// func_get_arg()/func_get_args() report — Zend's CV *is* the arg
 /// slot, not a copy.
 pub(in crate::interp) enum Slot {
+    Uninit,
     V(Value),
     C(Cell),
 }
+
+pub(in crate::interp) type CompileCacheEntry =
+    (Rc<FunctionDecl>, Option<Rc<Compiled>>, &'static str);
 
 /// One compiled function body — op vector + slot layout.
 /// Single-scalar pass-proof (`?T`/union-null handled) — see
@@ -102,6 +106,45 @@ macro_rules! padd {
     };
 }
 
+// Opt-in diagnostics: cache lookups are not calls or elapsed-time shares.
+const COVERAGE_NAMES: [&str; 18] = [
+    "compiled-lookup",
+    "executed-body",
+    "reference-return",
+    "variable",
+    "assignment",
+    "call",
+    "array",
+    "property",
+    "closure",
+    "interpolation",
+    "foreach",
+    "switch",
+    "match",
+    "exception",
+    "static",
+    "scope",
+    "operator",
+    "other",
+];
+static COVERAGE: [std::sync::atomic::AtomicU64; 18] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+
+fn coverage_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PHPUN_VMPROF").is_some())
+}
+
+fn coverage_hit(reason: &str) {
+    if coverage_on() {
+        let i = COVERAGE_NAMES
+            .iter()
+            .position(|n| *n == reason)
+            .unwrap_or(17);
+        COVERAGE[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 enum Op {
     Const(Value),
     Load(u16),
@@ -126,23 +169,20 @@ enum Op {
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
-    /// Direct literal name call. `lname` is the lowercase,
-    /// `\u{1}`-stripped lookup name; `raw` is the spelling for
-    /// diagnostics and `ns\name` fallback candidates. `cache` is the
-    /// inline cache: a resolution that can never change is pinned —
-    /// a userland decl (functions can't be redeclared) or a builtin
-    /// in an empty caller ns (no `ns\name` can appear later to win
-    /// the fallback). Late-definable resolutions stay uncached and
-    /// re-resolve each call.
+    /// Direct literal-name call with Zend's persistent call-site cache.
+    /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
+    /// for diagnostics. InitCall pins the target before args run.
+    // Resolve and pin the target before any argument op executes.
+    InitCall {
+        call: usize,
+        args: Box<[Expr]>,
+    },
     Call {
         lname: Rc<str>,
         raw: Rc<str>,
         argc: u16,
         site: usize,
         callee: usize,
-        /// Per-arg caller-CV slot (`u16::MAX` = not a plain CV) — the
-        /// only channel a by-ref callee param has back to the caller.
-        arg_slots: Box<[u16]>,
         cache: std::cell::RefCell<Option<CachedFn>>,
     },
     /// Statement boundary: decref the temps this statement left in
@@ -163,7 +203,7 @@ enum Op {
 /// Per-call-site resolution (zend's INIT_FCALL cache slot). `Direct`
 /// skips not just the name lookup but the whole `invoke_fn` preamble
 /// — the compiled callee is run straight from the op.
-enum CachedFn {
+pub(in crate::interp) enum CachedFn {
     Direct(Rc<FunctionDecl>, Rc<Compiled>),
     Decl(Rc<FunctionDecl>),
     Builtin,
@@ -196,6 +236,7 @@ struct Compiler {
     /// (plus params) can hit undefined-variable diagnostics the slot
     /// model can't reproduce, so it bails.
     assigned: std::collections::HashSet<String>,
+    fallback: &'static str,
 }
 
 impl Compiled {
@@ -230,13 +271,13 @@ impl Compiled {
         })
     }
 
-    pub(crate) fn compile(decl: &FunctionDecl) -> Option<Rc<Compiled>> {
+    pub(crate) fn compile(decl: &FunctionDecl) -> Result<Rc<Compiled>, &'static str> {
         // A by-ref return needs cell plumbing on Flow::Return — AST
         // keeps it. Everything else still compiles: typed/variadic/
         // promoted params, declared returns and expr defaults get
         // bound + checked by bind_and_run and only the body runs here.
         if decl.by_ref {
-            return None;
+            return Err("reference-return");
         }
         let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
         let mut bind_free = !needs_bind
@@ -267,11 +308,12 @@ impl Compiled {
             slots: FxMap::default(),
             loops: Vec::new(),
             assigned,
+            fallback: "other",
         };
         for (i, p) in decl.params.iter().enumerate() {
             c.slots.insert(p.name.clone(), i as u16);
         }
-        c.stmts(&decl.body)?;
+        c.stmts(&decl.body).ok_or(c.fallback)?;
         // No trailing Const+Return: pc exhausting the stream is
         // Flow::Normal — the bound path's `Flow::Return` arm treats
         // an explicit `return` differently from fall-off-the-end.
@@ -290,7 +332,7 @@ impl Compiled {
                 }
             })
             .collect();
-        Some(Rc::new(Compiled {
+        Ok(Rc::new(Compiled {
             nslots: c.slots.len(),
             names: c.slots,
             ops: c.ops,
@@ -426,6 +468,14 @@ impl Compiler {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Bail {
+        self.fallback = match s {
+            Stmt::Foreach { .. } => "foreach",
+            Stmt::Switch { .. } => "switch",
+            Stmt::Try { .. } => "exception",
+            Stmt::Static { .. } => "static",
+            Stmt::Global(_) | Stmt::Unset(_) => "scope",
+            _ => "other",
+        };
         match s {
             Stmt::Line(l) => {
                 self.emit(Op::Line(*l));
@@ -569,6 +619,19 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Bail {
         let e = Interp::unmark_rhs(e);
+        self.fallback = match e {
+            Expr::Var(_) | Expr::VarVar(..) => "variable",
+            Expr::Assign { .. } => "assignment",
+            Expr::Call { .. } => "call",
+            Expr::ArrayLit(_) | Expr::Index { .. } => "array",
+            Expr::Prop { .. } | Expr::StaticProp { .. } => "property",
+            Expr::Closure(_) => "closure",
+            Expr::Interp(_) => "interpolation",
+            Expr::Match { .. } => "match",
+            Expr::Throw(_) => "exception",
+            Expr::Binary { .. } | Expr::Unary { .. } => "operator",
+            _ => "other",
+        };
         match e {
             Expr::Null => {
                 self.emit(Op::Const(Value::Null));
@@ -742,10 +805,18 @@ impl Compiler {
                     .trim_start_matches('\u{1}')
                     .rsplit('\\')
                     .next()
-                    .is_some_and(|seg| seg.eq_ignore_ascii_case("compact"))
+                    .is_some_and(|seg| {
+                        ["compact", "extract", "get_defined_vars"]
+                            .iter()
+                            .any(|name| seg.eq_ignore_ascii_case(name))
+                    })
                 {
                     return None;
                 }
+                let init = self.emit(Op::InitCall {
+                    call: usize::MAX,
+                    args: args.clone().into_boxed_slice(),
+                });
                 for a in args {
                     match Interp::unmark_arg(a) {
                         Expr::Unpack(_) => return None,
@@ -755,22 +826,17 @@ impl Compiler {
                     self.expr(Interp::unmark_arg(a))?;
                 }
                 let lname: Rc<str> = Rc::from(raw.trim_start_matches('\u{1}').to_lowercase());
-                let arg_slots: Vec<u16> = args
-                    .iter()
-                    .map(|a| match Interp::unmark_arg(a) {
-                        Expr::Var(n) => self.slots.get(n.as_str()).copied().unwrap_or(u16::MAX),
-                        _ => u16::MAX,
-                    })
-                    .collect();
-                self.emit(Op::Call {
+                let call = self.emit(Op::Call {
                     lname,
                     raw: Rc::from(raw.trim_start_matches('\u{1}')),
                     argc: args.len() as u16,
                     site: *site,
                     callee: *callee,
-                    arg_slots: arg_slots.into_boxed_slice(),
                     cache: std::cell::RefCell::new(None),
                 });
+                if let Op::InitCall { call: at, .. } = &mut self.ops[init] {
+                    *at = call;
+                }
             }
             _ => return None,
         };
@@ -779,6 +845,18 @@ impl Compiler {
 }
 
 impl<'a> Interp<'a> {
+    /// CLI-only diagnostic report; profiling changes runtime overhead.
+    pub fn dump_vm_coverage() {
+        if coverage_on() {
+            for (name, counter) in COVERAGE_NAMES.iter().zip(&COVERAGE) {
+                eprintln!(
+                    "vm-coverage: {name}={}",
+                    counter.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
     /// Compile-cache: keyed by the decl's Rc pointer, with the Rc kept
     /// alive by the entry itself so a dropped decl can never collide.
     /// `None` entries memoize "doesn't compile" so uncompiled bodies
@@ -788,14 +866,26 @@ impl<'a> Interp<'a> {
         decl: &Rc<FunctionDecl>,
     ) -> Option<Rc<Compiled>> {
         use std::collections::hash_map::Entry;
-        match self.compiled_fns.entry(Rc::as_ptr(decl) as usize) {
-            Entry::Occupied(e) => e.get().1.clone(),
+        let entry = match self.compiled_fns.entry(Rc::as_ptr(decl) as usize) {
+            Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let c = Compiled::compile(decl);
-                e.insert((decl.clone(), c.clone()));
-                c
+                let (compiled, reason) = match Compiled::compile(decl) {
+                    Ok(c) => (Some(c), "compiled-lookup"),
+                    Err(reason) => {
+                        if coverage_on() {
+                            eprintln!(
+                                "vm-fallback: {}:{} {} reason={reason}",
+                                decl.file, decl.line, decl.name
+                            );
+                        }
+                        (None, reason)
+                    }
+                };
+                e.insert((decl.clone(), compiled, reason))
             }
-        }
+        };
+        coverage_hit(entry.2);
+        entry.1.clone()
     }
 
     /// The bind_and_run shell for a compiled body: identical
@@ -809,8 +899,10 @@ impl<'a> Interp<'a> {
         comp: &Compiled,
         mut args: super::CallArgs,
     ) -> Result<Value, PhpError> {
-        PROF[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let __p = pnow!();
+        if __p.is_some() {
+            PROF[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let saved = VmSaved {
             line: self.cur_line,
             prop_ov: self.last_prop_ov.take(),
@@ -934,7 +1026,7 @@ impl<'a> Interp<'a> {
                 slots.push(Slot::C(c));
             }
         }
-        slots.resize_with(comp.nslots, || Slot::V(Value::Null));
+        slots.resize_with(comp.nslots, || Slot::Uninit);
         if let Some(f) = self.stack.last_mut() {
             f.vm_sites.append(&mut args.vm_sites);
             f.args = fa;
@@ -1025,6 +1117,7 @@ impl<'a> Interp<'a> {
         slots: &mut [Slot],
         tmark: usize,
     ) -> Result<Flow, PhpError> {
+        coverage_hit("executed-body");
         // Value-stack/argv vecs come from a per-Interp pool — a call
         // costs no malloc here (cap bounds retention under deep
         // recursion; each live frame holds its own vec anyway).
@@ -1032,7 +1125,12 @@ impl<'a> Interp<'a> {
             .vm_val_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(16));
-        let r = self.vm_exec_ops(comp, slots, tmark, &mut vs);
+        let mut targets = self.vm_target_pool.pop().unwrap_or_default();
+        let r = self.vm_exec_ops(comp, slots, tmark, &mut vs, &mut targets);
+        targets.clear();
+        if self.vm_target_pool.len() < 64 {
+            self.vm_target_pool.push(targets);
+        }
         vs.clear();
         if self.vm_val_pool.len() < 64 {
             self.vm_val_pool.push(vs);
@@ -1144,23 +1242,46 @@ impl<'a> Interp<'a> {
         })
     }
 
+    fn vm_slot_value(
+        &mut self,
+        comp: &Compiled,
+        slots: &[Slot],
+        index: u16,
+    ) -> Result<Value, PhpError> {
+        Ok(match &slots[index as usize] {
+            Slot::V(v) => v.clone(),
+            Slot::C(c) => c.borrow().clone(),
+            Slot::Uninit => {
+                let name = comp
+                    .names
+                    .iter()
+                    .find_map(|(name, i)| (*i == index).then_some(name))
+                    .unwrap();
+                self.warn(&format!("Undefined variable ${name}"))?;
+                Value::Null
+            }
+        })
+    }
+
     fn vm_exec_ops(
         &mut self,
         comp: &Compiled,
         slots: &mut [Slot],
         mut tmark: usize,
         vs: &mut Vec<Value>,
+        targets: &mut Vec<CachedFn>,
     ) -> Result<Flow, PhpError> {
         let mut pc = 0usize;
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
-                Op::Load(s) => vs.push(match &slots[*s as usize] {
-                    Slot::V(v) => v.clone(),
-                    Slot::C(c) => c.borrow().clone(),
-                }),
-                Op::Store(s) => match &slots[*s as usize] {
-                    Slot::V(_) => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
+                Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
+                Op::Store(s) => match &mut slots[*s as usize] {
+                    Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
+                    Slot::V(v) => {
+                        let old = std::mem::replace(v, vs.last().unwrap().clone());
+                        self.destruct_dying_value(&old)?;
+                    }
                     Slot::C(c) => {
                         // CV write: new zval lands, displaced decrefs —
                         // same ordering as cell_store.
@@ -1194,10 +1315,7 @@ impl<'a> Interp<'a> {
                     let rv = vs.pop().unwrap();
                     // The left CV binds here — zend fetches it at the
                     // binary op, after the rhs ran.
-                    let lv = match &slots[*sl as usize] {
-                        Slot::V(v) => v.clone(),
-                        Slot::C(c) => c.borrow().clone(),
-                    };
+                    let lv = self.vm_slot_value(comp, slots, *sl)?;
                     let v = self.vm_binary(op, lv, rv)?;
                     vs.push(v);
                 }
@@ -1233,12 +1351,10 @@ impl<'a> Interp<'a> {
                     tmark = self.expr_temps.len();
                 }
                 Op::IncDec { slot, delta, post } => {
-                    let old = match &slots[*slot as usize] {
-                        Slot::V(v) => v.clone(),
-                        Slot::C(c) => c.borrow().clone(),
-                    };
+                    let old = self.vm_slot_value(comp, slots, *slot)?;
                     let new = self.incdec_value(&old, *delta)?;
                     match &mut slots[*slot as usize] {
+                        Slot::Uninit => slots[*slot as usize] = Slot::V(new),
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
                             let c = c.clone();
@@ -1249,10 +1365,7 @@ impl<'a> Interp<'a> {
                     vs.push(if *post {
                         old
                     } else {
-                        match &slots[*slot as usize] {
-                            Slot::V(v) => v.clone(),
-                            Slot::C(c) => c.borrow().clone(),
-                        }
+                        self.vm_slot_value(comp, slots, *slot)?
                     });
                 }
                 Op::Echo => {
@@ -1267,14 +1380,59 @@ impl<'a> Interp<'a> {
                     self.send_line = None;
                 }
                 Op::Return => return Ok(Flow::Return(vs.pop().unwrap_or(Value::Null))),
+                Op::InitCall { call: at, args } => {
+                    let Op::Call {
+                        lname,
+                        raw,
+                        callee,
+                        site,
+                        cache,
+                        ..
+                    } = &comp.ops[*at]
+                    else {
+                        unreachable!("InitCall always points to its Call");
+                    };
+                    let target = self.vm_resolve(lname, raw, *callee, cache)?;
+                    let needs_refs = match &target {
+                        CachedFn::Decl(d) => d.params.iter().any(|p| p.by_ref),
+                        CachedFn::Builtin => {
+                            builtin_byref(lname).is_some_and(|flags| flags.iter().any(|flag| *flag))
+                        }
+                        CachedFn::Direct(..) => false,
+                    };
+                    if needs_refs {
+                        // Cold reference calls use the canonical SEND machinery.
+                        // Cells shared with slots let argument expressions update
+                        // caller locals and keep escaping references alive.
+                        let frame = self.cur();
+                        for (name, index) in &comp.names {
+                            let slot = &mut slots[*index as usize];
+                            let c = match slot {
+                                Slot::Uninit => continue,
+                                Slot::C(c) => c.clone(),
+                                Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
+                            };
+                            *slot = Slot::C(c.clone());
+                            frame.vars.insert(name.clone(), c);
+                        }
+                        let value = self.vm_ref_call(&target, lname, raw, args, *site)?;
+                        for (name, index) in &comp.names {
+                            if let Some(c) = self.cur().vars.get(name) {
+                                slots[*index as usize] = Slot::C(c.clone());
+                            }
+                        }
+                        vs.push(value);
+                        pc = *at + 1; // skip compiled argument ops and Call
+                        continue;
+                    }
+                    targets.push(target);
+                }
                 Op::Call {
                     lname,
                     raw,
                     argc,
                     site,
-                    callee,
-                    arg_slots,
-                    cache,
+                    ..
                 } => {
                     let n = *argc as usize;
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
@@ -1285,19 +1443,12 @@ impl<'a> Interp<'a> {
                     // for the callee's trace-frame line (review
                     // finding: skipped it attributed callee traces to
                     // the previous call's site).
-                    let hit = cache.borrow().clone();
-                    let v = if let Some(CachedFn::Direct(d, c)) = &hit {
+                    let target = targets.pop().expect("InitCall resolved this call");
+                    let v = if let CachedFn::Direct(d, c) = &target {
                         self.send_line = Some(*site);
                         self.vm_run_direct(d, c, &mut argv)?
                     } else {
-                        self.vm_call(
-                            lname,
-                            raw,
-                            &mut argv,
-                            (*site, *callee),
-                            (slots, arg_slots),
-                            cache,
-                        )?
+                        self.vm_call(lname, raw, &mut argv, *site, &target)?
                     };
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -1321,7 +1472,7 @@ impl<'a> Interp<'a> {
             .vm_slot_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
-        slots.resize_with(comp.nslots, || Slot::V(Value::Null));
+        slots.resize_with(comp.nslots, || Slot::Uninit);
         if let Some(f) = self.stack.last() {
             for (name, idx) in &comp.names {
                 if let Some(c) = f.vars.get(name) {
@@ -1439,7 +1590,7 @@ impl<'a> Interp<'a> {
         match flow {
             Flow::Return(v) => {
                 if let Some(ty) = &resolved_ret {
-                    let ret_strict = self.strict_files.contains(&decl.file);
+                    let ret_strict = self.strict_files.contains(decl.file.as_ref());
                     let ok = ty
                         .iter()
                         .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
@@ -1559,7 +1710,8 @@ impl<'a> Interp<'a> {
 
     /// ponytail: dev-only phase profiler — PHPUN_CALLPROF=1 accumulates
     /// ns per call phase; printed at process exit (registered once).
-    /// Instant::now skews absolute numbers; proportions stay valid.
+    /// Clock reads skew timings; exec includes nested calls. Report totals,
+    /// then normalize by calls; benchmark speed with profiling disabled.
     fn callprof_on() -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
         static ON: AtomicBool = AtomicBool::new(false);
@@ -1572,7 +1724,7 @@ impl<'a> Interp<'a> {
             extern "C" fn dump() {
                 use std::sync::atomic::Ordering;
                 eprintln!(
-                    "callprof: pre={}ns cells={}ns site={}ns bind={}ns exec={}ns post={}ns calls={}",
+                    "callprof: pre={}ns cells={}ns site={}ns bind={}ns exec={}ns post={}ns calls={}; unit=total_ns exec=inclusive",
                     PROF[0].load(Ordering::Relaxed),
                     PROF[1].load(Ordering::Relaxed),
                     PROF[2].load(Ordering::Relaxed),
@@ -1664,21 +1816,15 @@ impl<'a> Interp<'a> {
         self.vm_run(decl, comp, args)
     }
 
-    /// VM-path callee dispatch: userland decls re-enter `invoke_fn`
-    /// (which lands back on `vm_run` when the callee compiles),
-    /// builtins take `call_builtin`, anything else is the same
-    /// undefined-function fatal `call_named` raises. Arg cells are
-    /// still materialized — the callee frame's dtor pass needs them.
-    fn vm_call(
+    /// Resolve and cache at INIT, before args can declare overrides.
+    fn vm_resolve(
         &mut self,
         lname: &str,
         raw: &str,
-        argv: &mut Vec<Value>,
-        (site, callee): (usize, usize),
-        (slots, arg_slots): (&mut [Slot], &[u16]),
+        callee: usize,
         cache: &std::cell::RefCell<Option<CachedFn>>,
-    ) -> Result<Value, PhpError> {
-        self.send_line = Some(site);
+    ) -> Result<CachedFn, PhpError> {
+        self.send_line = Some(callee);
         if lname == "__halt_compiler" {
             return Err(PhpError {
                 trace: None,
@@ -1689,138 +1835,103 @@ impl<'a> Interp<'a> {
                 line: 0,
             });
         }
-        let hit = cache.borrow().clone();
-        let mut decl: Option<Rc<FunctionDecl>> = match &hit {
-            Some(CachedFn::Decl(d)) => Some(d.clone()),
-            Some(CachedFn::Builtin) => None,
-            _ => None,
-        };
-        let resolved = hit.is_some();
-        let mut miss_name: Option<String> = None;
-        if !resolved {
-            let direct = self.functions.get(lname).cloned();
-            decl = direct.clone();
-            if decl.is_none() {
-                let ns = self.caller_ns();
-                if !ns.is_empty() {
-                    let cand = format!("{}\\{}", ns.to_lowercase(), lname);
-                    decl = self.functions.get(&cand).cloned();
-                    if decl.is_none() {
-                        miss_name = Some(format!("{}\\{}", ns, raw));
-                    }
-                }
-            }
-            // Resolution happens at INIT — an unresolvable name aborts
-            // before the (already-evaluated) args would matter.
-            if decl.is_none()
-                && !builtins::is_builtin(lname)
-                && builtins::builtin_params(lname).is_none()
-                && builtin_byref(lname).is_none()
-            {
-                self.send_line = Some(callee);
-                return self.fail(PhpError::uncaught(
-                    "Error",
-                    format!(
-                        "Call to undefined function {}()",
-                        miss_name.as_deref().unwrap_or(raw)
-                    ),
-                    0,
-                ));
-            }
-            // Pin only resolutions that can't change: a direct-hit
-            // userland decl (no redeclares — and when it also compiles,
-            // Direct skips invoke_fn next time), or a builtin reached
-            // with an empty caller ns (no ns\name can appear later).
-            // ns-fallback decls and namespaced builtin hits re-resolve.
-            let stable = if let Some(d) = direct {
-                match self.vm_compiled(&d) {
-                    Some(c) if !c.needs_bind => Some(CachedFn::Direct(d, c)),
-                    _ => Some(CachedFn::Decl(d)),
-                }
-            } else if decl.is_none() && self.caller_ns().is_empty() {
-                Some(CachedFn::Builtin)
-            } else {
-                None
-            };
-            if stable.is_some() {
-                *cache.borrow_mut() = stable;
-            }
+        if let Some(hit) = cache.borrow().clone() {
+            return Ok(hit);
         }
+        let (decl, _) = self.resolve_user_fn(lname, true);
+        let miss_name = if decl.is_none() && !self.caller_ns().is_empty() {
+            Some(format!("{}\\{}", self.caller_ns(), raw))
+        } else {
+            None
+        };
+        // INIT_FCALL fails before argument evaluation can have effects.
+        if decl.is_none()
+            && !builtins::is_builtin(lname)
+            && builtins::builtin_params(lname).is_none()
+            && builtin_byref(lname).is_none()
+        {
+            self.send_line = Some(callee);
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Call to undefined function {}()",
+                    miss_name.as_deref().unwrap_or(raw)
+                ),
+                0,
+            ));
+        }
+        // Zend's literal call-site cache retains the first successful
+        // resolution, including a global/builtin namespace fallback.
+        // An override declared by an argument affects other unresolved
+        // sites, but not this call or later calls from the same site.
+        let target = match decl {
+            Some(d) => match self.vm_compiled(&d) {
+                Some(c) if !c.needs_bind => CachedFn::Direct(d, c),
+                _ => CachedFn::Decl(d),
+            },
+            None => CachedFn::Builtin,
+        };
+        *cache.borrow_mut() = Some(target.clone());
+        Ok(target)
+    }
+
+    /// Reuse AST argument binding for the cold reference path; resolving
+    /// before this helper keeps the same pinned literal-call target.
+    fn vm_ref_call(
+        &mut self,
+        target: &CachedFn,
+        lname: &str,
+        raw: &str,
+        exprs: &[Expr],
+        site: usize,
+    ) -> Result<Value, PhpError> {
+        let decl = match target {
+            CachedFn::Decl(d) | CachedFn::Direct(d, _) => Some(d),
+            CachedFn::Builtin => None,
+        };
+        let builtin_params = if decl.is_none() {
+            super::calls::builtin_ref_params(lname)
+        } else {
+            Vec::new()
+        };
+        self.send_line = Some(site);
+        let args = self.arg_cells(
+            exprs,
+            decl.map(|d| d.params.as_slice()).unwrap_or(&builtin_params),
+            raw,
+            decl.is_none(),
+            Some(site),
+            false,
+        )?;
+        if let Some(d) = decl {
+            return self.invoke_fn(d, args, None, None);
+        }
+        if let Some(value) = self.call_builtin(lname, &args, true)? {
+            return Ok(value);
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!("Call to undefined function {}()", raw),
+            0,
+        ))
+    }
+
+    /// Execute the target chosen before argument evaluation.
+    fn vm_call(
+        &mut self,
+        lname: &str,
+        raw: &str,
+        argv: &mut Vec<Value>,
+        site: usize,
+        target: &CachedFn,
+    ) -> Result<Value, PhpError> {
+        self.send_line = Some(site);
+        let decl = match target {
+            CachedFn::Direct(d, _) | CachedFn::Decl(d) => Some(d.clone()),
+            CachedFn::Builtin => None,
+        };
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(cell));
-        // By-ref callee params bind the caller's own zval — a plain-CV
-        // arg must hand over its slot cell (a Slot::V local upgrades to
-        // Slot::C, zend's separate-into-reference), or the callee's
-        // writes die on a throwaway cell.
-        let link = |slots: &mut [Slot], cells: &mut Vec<Cell>, i: usize| {
-            let Some(&sl) = arg_slots.get(i) else { return };
-            if sl == u16::MAX || i >= cells.len() {
-                return;
-            }
-            let sl = sl as usize;
-            match &mut slots[sl] {
-                Slot::C(c) => cells[i] = c.clone(),
-                Slot::V(v) => {
-                    let c = cell(std::mem::replace(v, Value::Null));
-                    slots[sl] = Slot::C(c.clone());
-                    cells[i] = c;
-                }
-            }
-        };
-        if let Some(d) = &decl {
-            for (i, p) in d.params.iter().enumerate() {
-                if p.variadic {
-                    // `&...$v` — every extra arg binds by-ref too.
-                    if p.by_ref {
-                        for j in i..cells.len() {
-                            link(slots, &mut cells, j);
-                        }
-                    }
-                    break;
-                }
-                if !p.by_ref || i >= cells.len() {
-                    continue;
-                }
-                if arg_slots.get(i).copied().unwrap_or(u16::MAX) == u16::MAX {
-                    // Non-lvalue into a by-ref slot is a zend Error,
-                    // not a silent fresh cell.
-                    return self.fail(PhpError::uncaught(
-                        "Error",
-                        format!(
-                            "{}(): Argument #{} (${}) could not be passed by reference",
-                            self.decl_fname(d),
-                            i + 1,
-                            p.name
-                        ),
-                        0,
-                    ));
-                }
-                link(slots, &mut cells, i);
-            }
-        } else if let Some(bp) = super::calls::builtin_byref(lname) {
-            for (i, &br) in bp.iter().enumerate() {
-                if !br || i >= cells.len() {
-                    continue;
-                }
-                if arg_slots.get(i).copied().unwrap_or(u16::MAX) == u16::MAX {
-                    let pname = builtins::builtin_params(lname)
-                        .and_then(|ps| ps.get(i))
-                        .map(|p| format!(" (${})", p.0))
-                        .unwrap_or_default();
-                    return self.fail(PhpError::uncaught(
-                        "Error",
-                        format!(
-                            "{}(): Argument #{}{} could not be passed by reference",
-                            lname,
-                            i + 1,
-                            pname
-                        ),
-                        0,
-                    ));
-                }
-                link(slots, &mut cells, i);
-            }
-        }
         let mut args = super::CallArgs::empty();
         args.cells = cells;
         let n = args.cells.len() as u64;
@@ -1831,10 +1942,7 @@ impl<'a> Interp<'a> {
             }
             return self.fail(PhpError::uncaught(
                 "Error",
-                format!(
-                    "Call to undefined function {}()",
-                    miss_name.as_deref().unwrap_or(raw)
-                ),
+                format!("Call to undefined function {}()", raw),
                 0,
             ));
         }

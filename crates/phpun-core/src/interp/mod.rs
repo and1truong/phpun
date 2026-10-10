@@ -174,7 +174,7 @@ pub struct Frame {
     /// Actual call args for func_get_args().
     args: Vec<Cell>,
     /// Enclosing function name (for `static`/`__FUNCTION__`).
-    fn_name: String,
+    fn_name: Rc<str>,
     /// `$this` in method calls.
     this_obj: Option<Rc<RefCell<PhpObject>>>,
     /// Class context for self::/parent:: (the method's declaring class).
@@ -189,7 +189,7 @@ pub struct Frame {
     /// `{closure:FILE:LINE}` (typed_properties_055).
     fn_line: usize,
     /// File this frame's code was declared in (include resolution base).
-    file: String,
+    file: Rc<str>,
     /// Namespace the running code was declared in — unqualified
     /// function/const lookups try `ns\name` before the global name.
     ns: String,
@@ -232,17 +232,17 @@ pub struct Frame {
 }
 
 impl Frame {
-    fn new(fn_name: String) -> Self {
+    fn new(fn_name: impl Into<Rc<str>>) -> Self {
         Self {
             vars: crate::value::FxMap::default(),
             args: Vec::new(),
-            fn_name,
+            fn_name: fn_name.into(),
             this_obj: None,
             scope_class: None,
             called_class: None,
             decl_class: None,
             fn_line: 0,
-            file: String::new(),
+            file: Rc::from(""),
             ns: String::new(),
             ret_by_ref: false,
             hook_prop: None,
@@ -368,10 +368,14 @@ pub struct Interp<'a> {
     pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
     /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
     /// the stored Rc keeps the decl alive so the pointer can't recycle.
-    compiled_fns: crate::value::FxMap<usize, (Rc<FunctionDecl>, Option<Rc<vm::Compiled>>)>,
+    compiled_fns: crate::value::FxMap<usize, vm::CompileCacheEntry>,
+    /// One function declaration per method identity, shared by every dispatch path.
+    /// Retain the method metadata so its address cannot recycle into another entry.
+    method_functions: crate::value::FxMap<usize, (Rc<MethodDecl>, Rc<FunctionDecl>)>,
     /// Recycled value vecs for VM frames (exec stacks + call argv) —
     /// a call mallocs zero vecs once warm. Bounded by vm_exec's cap.
     vm_val_pool: Vec<Vec<Value>>,
+    vm_target_pool: Vec<Vec<vm::CachedFn>>,
     /// Recycled slot frames + arg-cell vecs for the same reason.
     vm_slot_pool: Vec<Vec<crate::interp::vm::Slot>>,
     vm_cell_pool: Vec<Vec<Cell>>,
@@ -849,10 +853,9 @@ pub struct Interp<'a> {
     /// Called-scope (LSB) for the next invoke_fn frame — set by
     /// invoke_method/static_invoke, consumed like pending_decl_class.
     pending_called_class: Option<Rc<PhpClass>>,
-    /// Origin anchor for the next invoke_fn frame — set by method
-    /// dispatch sites that pass `Rc::new(m.decl.clone())` (whose
-    /// cloned bodies would otherwise get fresh `vars.as_ptr()` sites
-    /// per call). Consumed like pending_decl_class.
+    /// Method-origin anchor for the next invoke_fn frame. Keeps static
+    /// declaration identity tied to the method across dispatch paths.
+    /// Consumed like pending_decl_class.
     pending_decl_site: Option<usize>,
     /// (object id, prop, is_get, owner) whose hook is about to run —
     /// consumed by invoke_fn to fill Frame::hook_prop.
@@ -908,7 +911,7 @@ pub struct Interp<'a> {
     spawn_seq: u64,
     /// Per-callsite unqualified fn resolution cache — Zend resolves
     /// `ns\f -> f` once per call site (constexpr/namespace_004).
-    fcc_fn_cache: HashMap<(String, String, String), Option<String>>,
+    fcc_fn_cache: HashMap<(Rc<str>, String, String), Option<String>>,
     /// Objects whose __destruct already ran (shutdown pass). Weak
     /// handles don't inflate strong_count (an Rc pin kept every
     /// destructed object alive forever) and go stale with the object
@@ -956,7 +959,7 @@ pub struct Interp<'a> {
     pub autoload_fns: Vec<Value>,
     /// File currently executing — include resolution uses its directory
     /// (PHP checks include_path, then the calling file's dir, then cwd).
-    cur_file: String,
+    cur_file: Rc<str>,
     /// Files that ran `declare(strict_types=1)` — scalar arg/prop/return
     /// coercion is off for code executing inside them.
     strict_files: crate::value::FxSet<String>,
@@ -1737,7 +1740,9 @@ impl<'a> Interp<'a> {
             stack: Vec::new(),
             functions: crate::value::FxMap::default(),
             compiled_fns: crate::value::FxMap::default(),
+            method_functions: crate::value::FxMap::default(),
             vm_val_pool: Vec::new(),
+            vm_target_pool: Vec::new(),
             vm_slot_pool: Vec::new(),
             vm_cell_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
@@ -1905,7 +1910,7 @@ impl<'a> Interp<'a> {
             last_popped_frame: None,
             dump_stack: std::collections::HashSet::new(),
             internal_cb: 0,
-            cur_file: file.to_string(),
+            cur_file: Rc::from(file),
             strict_files: crate::value::FxSet::default(),
             typed_slots: std::collections::HashMap::new(),
             slot_owners: std::collections::HashMap::new(),
@@ -2020,7 +2025,7 @@ impl<'a> Interp<'a> {
             );
             it.globals.vars.insert("argc".into(), cell(Value::Int(1)));
         }
-        it.globals.file = file.to_string();
+        it.globals.file = Rc::from(file);
         it.register_builtin_classes();
         // SPL iterator wrappers in plain PHP — the delegation layer
         // (OuterIterator, IteratorIterator, FilterIterator,
@@ -3867,7 +3872,7 @@ impl<'a> Interp<'a> {
                 // declaring class's table (language013).
                 match &f.decl_class {
                     Some(c) => format!("{}\u{0}{}", c.name(), f.fn_name),
-                    None => f.fn_name.clone(),
+                    None => f.fn_name.to_string(),
                 }
             })
             .unwrap_or_else(|| "\u{0}global".into())
@@ -7075,7 +7080,7 @@ impl<'a> Interp<'a> {
                     *file = if fin.file.is_empty() {
                         self.diag_file()
                     } else {
-                        fin.file.clone()
+                        fin.file.to_string()
                     };
                     *line = *yline as u32;
                     *thrown = *yline as u32;
@@ -7195,8 +7200,8 @@ impl<'a> Interp<'a> {
                         .class
                         .as_ref()
                         .map(|c| format!("{}{}{}", c, fr.ty, fr.function))
-                        .unwrap_or_else(|| fr.function.clone());
-                    let dup = if fr.file == "[internal function]" {
+                        .unwrap_or_else(|| fr.function.to_string());
+                    let dup = if fr.file.as_ref() == "[internal function]" {
                         // Engine-resumed frames (gen bodies, builtin
                         // callbacks) have no call site of their own —
                         // match by callee name against either render
@@ -7204,12 +7209,12 @@ impl<'a> Interp<'a> {
                         internal_names
                             .iter()
                             .chain(site_names.iter())
-                            .any(|n| *n == fr.function || *n == callee)
+                            .any(|n| n.as_str() == fr.function.as_ref() || *n == callee)
                     } else {
                         let site = format!("{}({})", fr.file, fr.line);
-                        site_keys
-                            .iter()
-                            .any(|(n, s)| (*n == fr.function || *n == callee) && *s == site)
+                        site_keys.iter().any(|(n, s)| {
+                            (n.as_str() == fr.function.as_ref() || *n == callee) && *s == site
+                        })
                     };
                     if dup {
                         continue;
@@ -7400,7 +7405,7 @@ impl<'a> Interp<'a> {
         // reports `[internal function]` — Zend emits no file/line for a
         // frame whose caller is internal. call_user_func* trampolines
         // are transparent to the walk (trace_frame_hidden).
-        let (site_file, site_line) = self.call_site(false, self.diag_file(), self.cur_line);
+        let (site_file, site_line) = self.call_site(false, self.diag_file_shared(), self.cur_line);
         // Trace frame args mirror Zend's bound param array: named args
         // that resolve to a declared fixed param merge into that
         // positional slot (interior unbound slots materialize as NULL);
@@ -7418,7 +7423,7 @@ impl<'a> Interp<'a> {
             ),
         };
         self.call_trace.push(TraceFrame {
-            function: name.to_string(),
+            function: name.to_string().into(),
             class: None,
             ty: String::new(),
             file: site_file,
@@ -8256,10 +8261,10 @@ impl<'a> Interp<'a> {
             let const_frame = self.class_const_ctx > 0;
             if const_frame {
                 self.call_trace.push(TraceFrame {
-                    function: "[constant expression]".to_string(),
+                    function: "[constant expression]".to_string().into(),
                     class: None,
                     ty: String::new(),
-                    file: self.diag_file(),
+                    file: self.diag_file_shared(),
                     line: self.const_init_site.unwrap_or(self.cur_line) as u32,
                     args: Vec::new(),
                     named_args: Vec::new(),

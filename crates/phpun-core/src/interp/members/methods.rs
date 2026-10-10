@@ -8,6 +8,17 @@ use super::*;
 type AoUnserData = (i64, Value, Rc<RefCell<PhpArray>>);
 
 impl<'a> Interp<'a> {
+    pub(in crate::interp) fn method_function(
+        &mut self,
+        method: &Rc<MethodDecl>,
+    ) -> Rc<FunctionDecl> {
+        self.method_functions
+            .entry(Rc::as_ptr(method) as usize)
+            .or_insert_with(|| (method.clone(), Rc::new(method.decl.clone())))
+            .1
+            .clone()
+    }
+
     /// Native bodies for the ArrayIterator/ArrayObject stubs.
     /// Iteration state lives in the `ArrayIter` object internal;
     /// unknown methods return None so the generic dispatch can report
@@ -22,9 +33,9 @@ impl<'a> Interp<'a> {
         // `ArrayObject->unserialize('O:11:"ArrayObje...')` in uncaught
         // traces (arg repr truncates at 15 chars via trace_arg).
         self.call_trace.push(TraceFrame {
-            file: self.diag_file(),
+            file: self.diag_file_shared(),
             line: self.send_line.unwrap_or(self.cur_line) as u32,
-            function: name.to_string(),
+            function: name.to_string().into(),
             class: Some(obj.borrow().class.name().to_string()),
             ty: "->".into(),
             args: args.cells.clone(),
@@ -707,7 +718,7 @@ impl<'a> Interp<'a> {
                     vec![cell(Value::Array(arr.clone())), cell(Value::Int(flag))]
                 };
                 self.call_trace.push(crate::value::TraceFrame {
-                    function: lname.clone(),
+                    function: lname.clone().into(),
                     class: None,
                     ty: String::new(),
                     file: "[internal function]".into(),
@@ -776,7 +787,7 @@ impl<'a> Interp<'a> {
                 Self::ao_set_sorting(obj, true);
                 let src = arr.borrow().entries.clone();
                 self.call_trace.push(crate::value::TraceFrame {
-                    function: lname.clone(),
+                    function: lname.clone().into(),
                     class: None,
                     ty: String::new(),
                     file: "[internal function]".into(),
@@ -1971,10 +1982,11 @@ impl<'a> Interp<'a> {
         self.pending_decl_class = Some(dc.clone());
         self.pending_called_class = Some(called);
         self.pending_decl_site = Some(Rc::as_ptr(m) as usize);
+        let decl = self.method_function(m);
         let r = if m.is_static {
-            self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(dc))
+            self.invoke_fn(&decl, args, None, Some(dc))
         } else {
-            self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(obj), Some(dc))
+            self.invoke_fn(&decl, args, Some(obj), Some(dc))
         };
         self.pending_decl_class = None;
         self.pending_called_class = None;
@@ -2073,7 +2085,8 @@ impl<'a> Interp<'a> {
             self.pending_decl_class = Some(sc.clone());
             self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
             self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
-            let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(sc));
+            let decl = self.method_function(&m);
+            let r = self.invoke_fn(&decl, args, this_obj, Some(sc));
             self.pending_decl_class = None;
             self.pending_called_class = None;
             return r;
@@ -2104,8 +2117,9 @@ impl<'a> Interp<'a> {
                     self.pending_decl_class = Some(cdc.clone());
                     self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
                     self.pending_decl_site = Some(Rc::as_ptr(&cm) as usize);
+                    let decl = self.method_function(&cm);
                     let r = self.invoke_fn(
-                        &Rc::new(cm.decl.clone()),
+                        &decl,
                         CallArgs::positional(vec![
                             cell(Value::str(name)),
                             cell(Value::Array(Rc::new(RefCell::new(arr)))),
@@ -2370,9 +2384,9 @@ impl<'a> Interp<'a> {
                 // Native Reflection calls leave a `Cls->m()` frame in
                 // uncaught traces (named_params/attributes_named_flags).
                 self.call_trace.push(TraceFrame {
-                    file: self.diag_file(),
+                    file: self.diag_file_shared(),
                     line: self.send_line.unwrap_or(self.cur_line) as u32,
-                    function: name.to_string(),
+                    function: name.to_string().into(),
                     class: Some(cls.name().to_string()),
                     ty: "->".into(),
                     args: Vec::new(),
@@ -2510,9 +2524,9 @@ impl<'a> Interp<'a> {
             let dt_malformed = |it: &mut Interp, s: &str| -> Result<Value, PhpError> {
                 let first = s.chars().next().unwrap_or(' ');
                 it.call_trace.push(TraceFrame {
-                    file: it.diag_file(),
+                    file: it.diag_file_shared(),
                     line: it.send_line.unwrap_or(it.cur_line) as u32,
-                    function: name.to_string(),
+                    function: name.to_string().into(),
                     class: Some(cls.name().to_string()),
                     ty: "->".into(),
                     args: args.cells.clone(),
@@ -2758,9 +2772,9 @@ impl<'a> Interp<'a> {
                 }
                 None => {
                     self.call_trace.push(TraceFrame {
-                        file: self.diag_file(),
+                        file: self.diag_file_shared(),
                         line: self.send_line.unwrap_or(self.cur_line) as u32,
-                        function: name.to_string(),
+                        function: name.to_string().into(),
                         class: Some(cls.name().to_string()),
                         ty: "->".into(),
                         args: args.cells.clone(),
@@ -2902,7 +2916,7 @@ impl<'a> Interp<'a> {
         // arity error. Pop it again only when the bind succeeds; the
         // bind's errors snapshot call_trace inside fail().
         self.call_trace.push(TraceFrame {
-            file: self.diag_file(),
+            file: self.diag_file_shared(),
             line: self.send_line.unwrap_or(self.cur_line) as u32,
             function: m.decl.name.clone(),
             class: Some(dc.name().to_string()),
@@ -3146,9 +3160,9 @@ impl<'a> Interp<'a> {
         let mut fargs = args.cells.clone();
         fargs.extend(args.named.iter().map(|(_, c, ..)| c.clone()));
         self.call_trace.push(TraceFrame {
-            file: self.diag_file(),
+            file: self.diag_file_shared(),
             line: self.cur_line as u32,
-            function: name.to_string(),
+            function: name.to_string().into(),
             class: Some(obj.borrow().class.name().to_string()),
             ty: "->".into(),
             args: fargs,
@@ -3272,13 +3286,13 @@ impl<'a> Interp<'a> {
                         continue;
                     }
                     let mut f = PhpArray::new();
-                    if fr.file != "[internal function]" {
-                        f.set(ArrKey::Str("file".into()), Value::str(fr.file.clone()));
+                    if fr.file.as_ref() != "[internal function]" {
+                        f.set(ArrKey::Str("file".into()), Value::str(fr.file.as_ref()));
                         f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
                     }
                     f.set(
                         ArrKey::Str("function".into()),
-                        Value::str(fr.function.clone()),
+                        Value::str(fr.function.as_ref()),
                     );
                     if let Some(c) = &fr.class {
                         f.set(ArrKey::Str("class".into()), Value::str(c.clone()));

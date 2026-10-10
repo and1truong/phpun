@@ -104,9 +104,9 @@ impl<'a> Interp<'a> {
         d: &FunctionDecl,
     ) -> Result<(), PhpError> {
         let dep_file = if d.file.is_empty() {
-            self.cur_file.clone()
+            self.cur_file.to_string()
         } else {
-            d.file.clone()
+            d.file.to_string()
         };
         // The last param carrying no default — required params for the
         // optional-before-required check exclude variadics.
@@ -602,7 +602,7 @@ impl<'a> Interp<'a> {
                 // function/method name, a wrapped `{closure:...}` when
                 // nested, or the unit file at top level.
                 let enc = if sc.enclosing.is_empty() {
-                    self.cur_file.clone()
+                    self.cur_file.to_string()
                 } else {
                     sc.enclosing.clone()
                 };

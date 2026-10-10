@@ -1637,14 +1637,14 @@ impl<'a> Parser<'a> {
         Ok(MethodDecl {
             decl: FunctionDecl {
                 ret,
-                name,
+                name: name.into(),
                 params,
                 body,
                 attrs: vec![],
                 by_ref,
                 line,
                 end_line,
-                file: String::new(),
+                file: String::new().into(),
                 ns: self.cur_ns.clone(),
                 decl_in: None,
             },
@@ -2225,7 +2225,7 @@ impl<'a> Parser<'a> {
         self.in_closure = saved_closure;
         self.in_named_fn = saved_named;
         Ok(Stmt::Function(FunctionDecl {
-            name,
+            name: name.into(),
             params,
             ret,
             body,
@@ -2233,7 +2233,7 @@ impl<'a> Parser<'a> {
             by_ref,
             line,
             end_line,
-            file: String::new(),
+            file: String::new().into(),
             ns: self.cur_ns.clone(),
             decl_in: None,
         }))

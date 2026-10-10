@@ -27,6 +27,37 @@ pub(in crate::interp) enum SiteErr {
     Thrown(PhpError),
 }
 
+/// Canonical synthetic params for the builtin by-reference send path.
+pub(in crate::interp) fn builtin_ref_params(name: &str) -> Vec<Param> {
+    let sig = crate::builtins::builtin_sig(name).unwrap_or_default();
+    let bparams = crate::builtins::builtin_params(name);
+    builtin_byref(name)
+        .map(|flags| {
+            flags
+                .iter()
+                .enumerate()
+                .map(|(i, by_ref)| Param {
+                    name: sig
+                        .get(i)
+                        .map(|(n, _)| n.clone())
+                        .or_else(|| bparams.and_then(|p| p.get(i).map(|(n, _)| n.to_string())))
+                        .unwrap_or_default(),
+                    default: None,
+                    by_ref: *by_ref,
+                    variadic: false,
+                    ty: None,
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl<'a> Interp<'a> {
     // ----- calls -----
 
@@ -211,9 +242,9 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn call_site(
         &self,
         no_frame_internal: bool,
-        file: String,
+        file: Rc<str>,
         fallback_line: usize,
-    ) -> (String, u32) {
+    ) -> (Rc<str>, u32) {
         // An SPL-prelude frame stands in for zend's C-level SPL
         // delegation: calls it makes (gen resumes, inner-iterator
         // hops, user callbacks) all site `[internal function]` —
@@ -239,7 +270,7 @@ impl<'a> Interp<'a> {
                     .map(|f| f.internal)
                     .unwrap_or(no_frame_internal));
         if from_builtin {
-            ("[internal function]".to_string(), 0)
+            (Rc::from("[internal function]"), 0)
         } else {
             (
                 file,
@@ -938,25 +969,12 @@ impl<'a> Interp<'a> {
                 self.cur_line,
             ));
         }
-        let mut decl = self.functions.get(lname.as_ref()).cloned();
-        // A namespaced user function outranks the global/builtin one for
-        // unqualified calls (namespaces/ns_013).
-        let mut ns_resolved = false;
-        // When the ns\name fallback misses too, the undefined-function
-        // error names the ns-qualified candidate (bugs/77376). Lazy:
-        // only built on the error path — None means "use raw_name".
-        let mut miss_name: Option<String> = None;
-        if decl.is_none() && unqualified {
-            let ns = self.caller_ns();
-            if !ns.is_empty() {
-                let cand = format!("{}\\{}", ns.to_lowercase(), lname.as_ref());
-                decl = self.functions.get(&cand).cloned();
-                ns_resolved = decl.is_some();
-                if !ns_resolved {
-                    miss_name = Some(format!("{}\\{}", ns, fname.trim_start_matches('\u{1}')));
-                }
-            }
-        }
+        let (decl, ns_resolved) = self.resolve_user_fn(lname.as_ref(), unqualified);
+        let miss_name = if unqualified && decl.is_none() && !self.caller_ns().is_empty() {
+            Some(format!("{}\\{}", self.caller_ns(), raw_name))
+        } else {
+            None
+        };
         // Zend resolves the callee at INIT — before any arg op — so an
         // unresolvable name aborts the call before args ever evaluate.
         if decl.is_none()
@@ -979,36 +997,8 @@ impl<'a> Interp<'a> {
         // Synthetic params carrying builtin by-ref flags so call results in
         // by-ref slots emit "Only variables should be passed by reference"
         // (passByReference_012, array_shift(array_shift($a))).
-        let builtin_params: Vec<Param> = if decl.is_none() {
-            let sig = crate::builtins::builtin_sig(lname.as_ref()).unwrap_or_default();
-            let bparams = crate::builtins::builtin_params(lname.as_ref());
-            builtin_byref(lname.as_ref())
-                .map(|flags| {
-                    flags
-                        .iter()
-                        .enumerate()
-                        .map(|(i, by_ref)| Param {
-                            name: sig
-                                .get(i)
-                                .map(|(n, _)| n.clone())
-                                .or_else(|| {
-                                    bparams.and_then(|p| p.get(i).map(|(n, _)| n.to_string()))
-                                })
-                                .unwrap_or_default(),
-                            default: None,
-                            by_ref: *by_ref,
-                            variadic: false,
-                            ty: None,
-                            promoted: false,
-                            vis: None,
-                            readonly: false,
-                            is_final: false,
-                            set_vis: None,
-                            hooks: None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+        let builtin_params = if decl.is_none() {
+            builtin_ref_params(lname.as_ref())
         } else {
             Vec::new()
         };
@@ -1105,6 +1095,22 @@ impl<'a> Interp<'a> {
             }
         };
         self.invoke_fn(&decl, argvals, None, None)
+    }
+
+    /// Literal unqualified calls try the declaring namespace before global
+    /// user functions. Dynamic/fully-qualified names use the supplied name.
+    pub(in crate::interp) fn resolve_user_fn(
+        &self,
+        lname: &str,
+        unqualified: bool,
+    ) -> (Option<Rc<FunctionDecl>>, bool) {
+        if unqualified && !self.caller_ns().is_empty() {
+            let candidate = format!("{}\\{}", self.caller_ns().to_lowercase(), lname);
+            if let Some(decl) = self.functions.get(&candidate) {
+                return (Some(decl.clone()), true);
+            }
+        }
+        (self.functions.get(lname).cloned(), false)
     }
 
     /// Call any callable-ish Value: Callable, string name, [obj,'m'], obj
@@ -1388,7 +1394,7 @@ impl<'a> Interp<'a> {
     pub fn callable_ctx_name(&mut self, v: &Value) -> String {
         match v {
             Value::Callable(c) => match &c.kind {
-                CallableKind::Closure(d) => d.name.clone(),
+                CallableKind::Closure(d) => d.name.to_string(),
                 CallableKind::Named(n) => n.trim_start_matches('\\').to_string(),
                 CallableKind::Method { obj, class, name } => {
                     let cn = obj
@@ -1482,7 +1488,7 @@ impl<'a> Interp<'a> {
             .stack
             .last()
             .map(|f| f.fn_name.clone())
-            .unwrap_or_else(|| "{main}".to_string());
+            .unwrap_or_else(|| Rc::from("{main}"));
         let cache_key = if unqualified {
             Some((caller, self.caller_ns().to_lowercase(), lname.clone()))
         } else {
@@ -1528,17 +1534,22 @@ impl<'a> Interp<'a> {
             // Function names resolve case-insensitively but display in
             // declared case (ReflectionFunction::getNamespaceName,
             // closure_068).
-            Some(r) => Ok(Value::Callable(self.new_callable(PhpCallable {
-                id: std::cell::Cell::new(0),
-                kind: CallableKind::Named(
-                    self.functions.get(&r).map(|d| d.name.clone()).unwrap_or(r),
-                ),
-                captures: Vec::new(),
-                this_obj: None,
-                scope_class: None,
-                called_class: None,
-                is_static: false,
-            }))),
+            Some(r) => Ok(Value::Callable(
+                self.new_callable(PhpCallable {
+                    id: std::cell::Cell::new(0),
+                    kind: CallableKind::Named(
+                        self.functions
+                            .get(&r)
+                            .map(|d| d.name.to_string())
+                            .unwrap_or(r),
+                    ),
+                    captures: Vec::new(),
+                    this_obj: None,
+                    scope_class: None,
+                    called_class: None,
+                    is_static: false,
+                }),
+            )),
             None => self.fail(PhpError::uncaught(
                 "Error",
                 format!("Call to undefined function {}()", miss),
@@ -2727,13 +2738,13 @@ impl<'a> Interp<'a> {
                 // iterator_*) the body frame instead shows the
                 // consumer's resume site (`FILE(line): fn(args)`).
                 file: if f.gen_body && self.iter_calls == 0 && self.gen_internal_resume == 0 {
-                    "[internal function]".to_string()
+                    Rc::from("[internal function]")
                 } else {
                     site_file.clone()
                 },
                 line: site_line,
-                args: targs.clone(),
-                named_args: targs_named.clone(),
+                args: Vec::new(),
+                named_args: Vec::new(),
                 internal: false,
                 visible: true,
                 named_dispatch: false,
@@ -2746,14 +2757,16 @@ impl<'a> Interp<'a> {
                 ty: String::new(),
                 file: site_file,
                 line: site_line,
-                args: targs,
-                named_args: targs_named,
+                args: Vec::new(),
+                named_args: Vec::new(),
                 internal: false,
                 visible: true,
                 named_dispatch: false,
                 gen_resume: false,
                 gen_body: false,
             });
+        fr.args = targs;
+        fr.named_args = targs_named;
         // Zend runs FilterIterator's accept loop in internal C — its
         // `fetch` frame never reaches a PHP trace.
         if fr.function.eq_ignore_ascii_case("fetch")
@@ -3467,8 +3480,8 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn exec_file_strict(&self) -> bool {
         self.stack
             .last()
-            .map(|f| self.strict_files.contains(&f.file))
-            .unwrap_or_else(|| self.strict_files.contains(&self.cur_file))
+            .map(|f| self.strict_files.contains(f.file.as_ref()))
+            .unwrap_or_else(|| self.strict_files.contains(self.cur_file.as_ref()))
     }
 
     /// Strictness for argument checks is determined by the file holding
@@ -3478,10 +3491,10 @@ impl<'a> Interp<'a> {
             // Top-level call site: `self.globals` lives off `self.stack`,
             // so the caller is the top-level file currently executing
             // (`cur_file` swaps for includes mid-eval).
-            return self.strict_files.contains(&self.cur_file);
+            return self.strict_files.contains(self.cur_file.as_ref());
         }
         self.strict_files
-            .contains(&self.stack[self.stack.len() - 2].file)
+            .contains(self.stack[self.stack.len() - 2].file.as_ref())
     }
 
     /// `callable` accepts an actual callable: a Closure/FCC value, a
@@ -3496,7 +3509,7 @@ impl<'a> Interp<'a> {
             Value::Callable(c) => Some(match &c.kind {
                 // A Closure's name is always its Zend name, syntax
                 // flag or not (closure_016).
-                CallableKind::Closure(d) => d.name.clone(),
+                CallableKind::Closure(d) => d.name.to_string(),
                 CallableKind::Named(n) => n.trim_start_matches('\\').to_string(),
                 CallableKind::Method { obj, class, name } => {
                     let cn = obj
@@ -3814,7 +3827,8 @@ impl<'a> Interp<'a> {
                     self.pending_decl_class = Some(dc.clone());
                     self.pending_called_class = Some(o.borrow().class.clone());
                     self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
-                    let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(o), Some(dc));
+                    let decl = self.method_function(&m);
+                    let r = self.invoke_fn(&decl, args, Some(o), Some(dc));
                     self.pending_decl_class = None;
                     self.pending_called_class = None;
                     r
@@ -4163,7 +4177,7 @@ impl<'a> Interp<'a> {
         let base = if decl.name.is_empty() {
             format!("{{closure:{}:{}}}", decl.file, decl.line)
         } else {
-            decl.name.clone()
+            decl.name.to_string()
         };
         self.stack
             .last()
@@ -4407,7 +4421,7 @@ impl<'a> Interp<'a> {
                 let internal_site = self
                     .call_trace
                     .last()
-                    .map(|f| f.file == "[internal function]")
+                    .map(|f| f.file.as_ref() == "[internal function]")
                     .unwrap_or(false);
                 let msg = if call_alias.is_some() || internal_site {
                     format!(
@@ -4490,10 +4504,10 @@ impl<'a> Interp<'a> {
                     if let Some(crate::value::ObjectInternal::Exception { file, .. }) =
                         &mut o.borrow_mut().internal
                     {
-                        *file = decl.file.clone();
+                        *file = decl.file.to_string();
                     }
                 }
-                self.last_err_file = decl.file.clone();
+                self.last_err_file = decl.file.to_string();
                 return r;
             }
         }
@@ -4804,7 +4818,7 @@ impl<'a> Interp<'a> {
                     return Ok(v);
                 }
                 if let Some(ty) = &resolved_ret {
-                    let ret_strict = self.strict_files.contains(&decl.file);
+                    let ret_strict = self.strict_files.contains(decl.file.as_ref());
                     let ok = ty
                         .iter()
                         .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
@@ -4901,7 +4915,7 @@ impl<'a> Interp<'a> {
                 e.trace = Some(self.compile_err_frames());
                 let r = self.fail(e);
                 if let Some(f) = &popped_file {
-                    self.last_err_file = f.clone();
+                    self.last_err_file = f.to_string();
                 }
                 r
             }
@@ -4913,7 +4927,7 @@ impl<'a> Interp<'a> {
                 e.trace = Some(self.compile_err_frames());
                 let r = self.fail(e);
                 if let Some(f) = &popped_file {
-                    self.last_err_file = f.clone();
+                    self.last_err_file = f.to_string();
                 }
                 r
             }
@@ -4925,7 +4939,7 @@ impl<'a> Interp<'a> {
                 e.trace = Some(self.compile_err_frames());
                 let r = self.fail(e);
                 if let Some(f) = &popped_file {
-                    self.last_err_file = f.clone();
+                    self.last_err_file = f.to_string();
                 }
                 r
             }

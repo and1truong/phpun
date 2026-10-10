@@ -311,7 +311,7 @@ pub struct AttrDecl {
 
 #[derive(Debug, Clone)]
 pub struct FunctionDecl {
-    pub name: String,
+    pub name: Rc<str>,
     pub params: Vec<Param>,
     /// Return type members (source order); None = no declaration.
     pub ret: Option<Vec<String>>,
@@ -328,7 +328,7 @@ pub struct FunctionDecl {
     pub end_line: usize,
     /// File the decl was registered from — PHP resolves includes relative
     /// to the file containing the call site (include_variation2).
-    pub file: String,
+    pub file: Rc<str>,
     /// Declaring namespace (`test\ns1` or "" for global) — unqualified
     /// calls/consts inside this function try the namespaced name first,
     /// then fall back to global (Zend/tests/namespaces).

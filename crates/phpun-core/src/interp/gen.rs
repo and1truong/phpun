@@ -1160,10 +1160,10 @@ impl<'a> Interp<'a> {
         let userland = self.iter_calls == 0 && self.gen_internal_resume == 0 && !caller_is_spl_stub;
         if userland {
             self.call_trace.push(TraceFrame {
-                function: name.to_string(),
+                function: name.to_string().into(),
                 class: Some("Generator".into()),
                 ty: "->".into(),
-                file: self.diag_file(),
+                file: self.diag_file_shared(),
                 line: self.cur_line as u32,
                 args: args.cells.clone(),
                 named_args: args

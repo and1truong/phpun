@@ -280,7 +280,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                             decl, decl_class, ..
                         } => match decl_class {
                             Some(c) => format!("{}::{}", c.decl.name, decl.name),
-                            None => decl.name.clone(),
+                            None => decl.name.to_string(),
                         },
                     };
                     vec![("\"function\"".to_string(), Value::str(&fname))]
@@ -468,7 +468,7 @@ fn closure_debug_props(it: &mut Interp, c: &crate::value::PhpCallable) -> Vec<(S
                     .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
                     .collect();
                 static_var_names(&d.body, &mut body_statics);
-                statics_key = Some(d.name.clone());
+                statics_key = Some(d.name.to_string());
             } else if let Some(sig) = builtin_sig(&n.to_lowercase()) {
                 params = sig;
             }
@@ -509,10 +509,10 @@ fn closure_debug_props(it: &mut Interp, c: &crate::value::PhpCallable) -> Vec<(S
                 Value::str(if d.name.is_empty() {
                     format!("{{closure:{}:{}}}", d.file, d.line)
                 } else {
-                    d.name.clone()
+                    d.name.to_string()
                 }),
             ));
-            props.push(("file".into(), Value::str(d.file.clone())));
+            props.push(("file".into(), Value::str(d.file.as_ref())));
             props.push(("line".into(), Value::Int(d.line as i64)));
             params = d
                 .params

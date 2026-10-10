@@ -1154,7 +1154,7 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 let mut m2 = (*m).clone();
-                m2.decl.name = a.clone();
+                m2.decl.name = a.clone().into();
                 if let Some(v) = vis {
                     m2.visibility = *v;
                 }
@@ -1162,7 +1162,7 @@ impl<'a> Interp<'a> {
                     m2.is_final = true;
                 }
                 m2.decl.decl_in = Some(origin.clone());
-                m2.trait_alias_of = Some(m.decl.name.clone());
+                m2.trait_alias_of = Some(m.decl.name.to_string());
                 taken.insert(alname, (src_trait, origin));
                 d.methods.push(Rc::new(m2));
             } else if vis.is_some() || *is_final {
@@ -1575,8 +1575,8 @@ impl<'a> Interp<'a> {
                 impl_m.decl.line,
             );
             e.line = impl_m.decl.line;
-            if impl_m.decl.file != self.diag_file() {
-                self.last_err_file = impl_m.decl.file.clone();
+            if impl_m.decl.file != self.diag_file_shared() {
+                self.last_err_file = impl_m.decl.file.to_string();
             }
             return Some(e);
         }
@@ -1595,8 +1595,8 @@ impl<'a> Interp<'a> {
             impl_m.decl.line,
         );
         e.line = impl_m.decl.line;
-        if impl_m.decl.file != self.diag_file() {
-            self.last_err_file = impl_m.decl.file.clone();
+        if impl_m.decl.file != self.diag_file_shared() {
+            self.last_err_file = impl_m.decl.file.to_string();
         }
         Some(e)
     }
@@ -3448,10 +3448,10 @@ impl<'a> Interp<'a> {
             .or_else(|| {
                 self.stack
                     .last()
-                    .map(|f| f.file.clone())
+                    .map(|f| f.file.to_string())
                     .filter(|s| !s.is_empty())
             })
-            .unwrap_or_else(|| self.cur_file.clone());
+            .unwrap_or_else(|| self.cur_file.to_string());
         let n = format!("{}\0{}:{}${}", base, file, decl.line, self.anon_class_seq);
         self.anon_class_seq += 1;
         let mut d = (**decl).clone();
@@ -3545,7 +3545,7 @@ impl<'a> Interp<'a> {
         // Only closures own per-instance statics tables — the decl name
         // lets push_handle GC a dead closure's table on slot reuse.
         let name = match &c.kind {
-            CallableKind::Closure(d) => Some(d.name.clone()),
+            CallableKind::Closure(d) => Some(d.name.to_string()),
             _ => None,
         };
         self.push_handle(ObjHandle::Callable(Rc::downgrade(c), name))
@@ -3918,7 +3918,7 @@ impl<'a> Interp<'a> {
             let exec_file = self
                 .stack
                 .last()
-                .map(|f| f.file.clone())
+                .map(|f| f.file.to_string())
                 .filter(|f| !f.is_empty())
                 .unwrap_or_else(|| self.diag_file());
             Some(ObjectInternal::Exception {

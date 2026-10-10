@@ -594,7 +594,7 @@ impl<'a> Interp<'a> {
                 let n = String::from_utf8_lossy(s).to_string();
                 let key = n.trim_start_matches('\\').to_lowercase();
                 if let Some(d) = self.functions.get(&key) {
-                    fn_name = Some(d.name.clone());
+                    fn_name = Some(d.name.to_string());
                     Some(d.clone())
                 } else if let Some(p) = crate::builtins::builtin_params(&key) {
                     fn_name = Some(key.clone());
@@ -616,7 +616,7 @@ impl<'a> Interp<'a> {
             }
             Value::Callable(_) => {
                 let d = self.callable_decl(&subj);
-                fn_name = d.as_ref().map(|d| d.name.clone());
+                fn_name = d.as_ref().map(|d| d.name.to_string());
                 d
             }
             Value::Array(a) => {
@@ -655,9 +655,9 @@ impl<'a> Interp<'a> {
                 match self.find_method_in(&c, &mn) {
                     Some((m, sc)) => {
                         cls_name = Some(c.decl.name.clone());
-                        fn_name = Some(m.decl.name.clone());
+                        fn_name = Some(m.decl.name.to_string());
                         scope_cls = Some(sc);
-                        Some(Rc::new(m.decl.clone()))
+                        Some(self.method_function(&m))
                     }
                     None => {
                         return self.fail(PhpError::uncaught(
@@ -790,7 +790,7 @@ impl<'a> Interp<'a> {
                     if let Some(s) = sname {
                         let key = s.trim_start_matches('\\').to_lowercase();
                         let canon = if let Some(d) = self.functions.get(&key) {
-                            d.name.clone()
+                            d.name.to_string()
                         } else if crate::builtins::is_builtin(&key)
                             || crate::builtins::builtin_params(&key).is_some()
                         {
@@ -889,7 +889,7 @@ impl<'a> Interp<'a> {
                         // `{closure:enclosing():L}` (closure_065).
                         let nm = match &cls {
                             Value::Callable(c) => match &c.kind {
-                                CallableKind::Closure(d) => Value::str(&d.name),
+                                CallableKind::Closure(d) => Value::str(d.name.as_ref()),
                                 CallableKind::Named(n) => Value::str(n),
                                 CallableKind::Method { name, .. } => Value::str(name),
                             },
@@ -1465,7 +1465,7 @@ impl<'a> Interp<'a> {
                         match c {
                             Some(c) => self.find_method_in(&c, &mn).map(|(m, sc)| {
                                 scope_cls = Some(sc);
-                                Rc::new(m.decl.clone())
+                                self.method_function(&m)
                             }),
                             None => None,
                         }
@@ -1504,7 +1504,7 @@ impl<'a> Interp<'a> {
                     };
                 let fn_name = decl
                     .as_ref()
-                    .map(|d| d.name.clone())
+                    .map(|d| d.name.to_string())
                     .or_else(|| bp.as_ref().map(|(n, _)| n.clone()));
                 let cls_name = scope_cls.as_ref().map(|c| c.decl.name.clone());
                 let prs = self.collect_rparams(decl, scope_cls, bp)?;
@@ -1922,7 +1922,7 @@ impl<'a> Interp<'a> {
                             .or_else(|| {
                                 self.interfaces
                                     .get(&n.to_lowercase())
-                                    .map(|d| d.name.clone())
+                                    .map(|d| d.name.to_string())
                             })
                     })
                 });
@@ -2562,7 +2562,7 @@ impl<'a> Interp<'a> {
                         .get(&cn.to_lowercase())
                         .cloned()
                         .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m))
-                        .map(|m| m.decl.file.clone())
+                        .map(|m| m.decl.file.to_string())
                         .unwrap_or_default()
                 } else {
                     self.classes
@@ -2721,10 +2721,12 @@ impl<'a> Interp<'a> {
                                 "\0rc\0class".into(),
                                 cell(Value::str(c.decl.name.clone())),
                             );
+                            ob.props.insert(
+                                "\0rc\0prop".into(),
+                                cell(Value::str(m.decl.name.as_ref())),
+                            );
                             ob.props
-                                .insert("\0rc\0prop".into(), cell(Value::str(m.decl.name.clone())));
-                            ob.props
-                                .insert("name".into(), cell(Value::str(m.decl.name.clone())));
+                                .insert("name".into(), cell(Value::str(m.decl.name.as_ref())));
                             ob.props
                                 .insert("class".into(), cell(Value::str(c.decl.name.clone())));
                         }
@@ -2763,10 +2765,12 @@ impl<'a> Interp<'a> {
                                 "\0rc\0class".into(),
                                 cell(Value::str(dcls.decl.name.clone())),
                             );
+                            ob.props.insert(
+                                "\0rc\0prop".into(),
+                                cell(Value::str(m.decl.name.as_ref())),
+                            );
                             ob.props
-                                .insert("\0rc\0prop".into(), cell(Value::str(m.decl.name.clone())));
-                            ob.props
-                                .insert("name".into(), cell(Value::str(m.decl.name.clone())));
+                                .insert("name".into(), cell(Value::str(m.decl.name.as_ref())));
                             ob.props
                                 .insert("class".into(), cell(Value::str(dcls.decl.name.clone())));
                         }
@@ -2882,7 +2886,7 @@ impl<'a> Interp<'a> {
                         if let Some(orig) = &m.trait_alias_of {
                             let v =
                                 format!("{}::{}", m.decl.decl_in.clone().unwrap_or_default(), orig);
-                            arr.set(ArrKey::Str(m.decl.name.as_str().into()), Value::str(v));
+                            arr.set(ArrKey::Str(m.decl.name.as_ref().into()), Value::str(v));
                         }
                     }
                 }
@@ -3107,8 +3111,10 @@ impl<'a> Interp<'a> {
         let mut out = Vec::new();
         for n in &self.decl_order {
             let name = match kind {
-                crate::ast::ClassKind::Trait => self.traits.get(n).map(|d| d.name.clone()),
-                crate::ast::ClassKind::Interface => self.interfaces.get(n).map(|d| d.name.clone()),
+                crate::ast::ClassKind::Trait => self.traits.get(n).map(|d| d.name.to_string()),
+                crate::ast::ClassKind::Interface => {
+                    self.interfaces.get(n).map(|d| d.name.to_string())
+                }
                 _ => self
                     .classes
                     .get(n)
@@ -3212,7 +3218,9 @@ impl<'a> Interp<'a> {
             .call_trace
             .iter()
             .rev()
-            .skip_while(|f| f.internal && !crate::value::include_frame(f) && f.function != "eval")
+            .skip_while(|f| {
+                f.internal && !crate::value::include_frame(f) && f.function.as_ref() != "eval"
+            })
             .cloned()
             .collect();
         format_backtrace_frames(&frames)
@@ -3223,7 +3231,9 @@ impl<'a> Interp<'a> {
         self.call_trace
             .iter()
             .rev()
-            .skip_while(|f| f.internal && !crate::value::include_frame(f) && f.function != "eval")
+            .skip_while(|f| {
+                f.internal && !crate::value::include_frame(f) && f.function.as_ref() != "eval"
+            })
             .filter(|f| !crate::value::trace_frame_hidden(f))
             .cloned()
             .collect()
@@ -3354,7 +3364,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             for m in &c.decl.methods {
                 if seen.insert(m.decl.name.to_lowercase()) {
-                    out.push(m.decl.name.clone());
+                    out.push(m.decl.name.to_string());
                 }
             }
             cur = c

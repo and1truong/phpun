@@ -103,7 +103,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     end_line: 0,
-                    file: String::new(),
+                    file: String::new().into(),
                     ns: String::new(),
                     decl_in: None,
                 },
@@ -146,14 +146,14 @@ impl<'a> Interp<'a> {
                     Rc::new(MethodDecl {
                         decl: FunctionDecl {
                             ret: None,
-                            name: m.to_string(),
+                            name: m.to_string().into(),
                             params: vec![],
                             body: vec![],
                             attrs: vec![],
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -192,7 +192,7 @@ impl<'a> Interp<'a> {
         // interface-sig check compares against it).
         let mut sd = iface("Serializable", &[], &["serialize", "unserialize"]);
         for m in sd.methods.iter_mut() {
-            if m.decl.name == "unserialize" {
+            if m.decl.name.as_ref() == "unserialize" {
                 let mut m2 = (**m).clone();
                 m2.decl.params = vec![Param {
                     name: "data".into(),
@@ -282,7 +282,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     end_line: 0,
-                    file: String::new(),
+                    file: String::new().into(),
                     ns: String::new(),
                     decl_in: None,
                 },
@@ -1047,7 +1047,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1107,7 +1107,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1127,7 +1127,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1231,7 +1231,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1251,7 +1251,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1298,7 +1298,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1364,7 +1364,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1384,7 +1384,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             end_line: 0,
-                            file: String::new(),
+                            file: String::new().into(),
                             ns: String::new(),
                             decl_in: None,
                         },
@@ -1419,7 +1419,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     end_line: 0,
-                    file: String::new(),
+                    file: String::new().into(),
                     ns: String::new(),
                     decl_in: None,
                 },
@@ -1603,7 +1603,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     end_line: 0,
-                    file: String::new(),
+                    file: String::new().into(),
                     ns: String::new(),
                     decl_in: None,
                 },
@@ -2540,7 +2540,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     end_line: 0,
-                    file: String::new(),
+                    file: String::new().into(),
                     ns: String::new(),
                     decl_in: None,
                 },
@@ -2560,7 +2560,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     end_line: 0,
-                    file: String::new(),
+                    file: String::new().into(),
                     ns: String::new(),
                     decl_in: None,
                 },
@@ -2618,7 +2618,7 @@ impl<'a> Interp<'a> {
             // zend gives ErrorException its own ctor arginfo:
             // (message, code, severity, filename, line, previous).
             for m in d.methods.iter_mut() {
-                if m.decl.name == "__construct" {
+                if m.decl.name.as_ref() == "__construct" {
                     let mut decl = m.decl.clone();
                     decl.params = [
                         "message", "code", "severity", "filename", "line", "previous",
