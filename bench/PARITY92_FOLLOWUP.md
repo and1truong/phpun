@@ -439,3 +439,29 @@ assign_index_path3.59%; remaining writes still use canonical bridges.
 Malloc2.22%/cfree3.07%do not by themselves justify inline packed ownership
 rewrite on sieve. LLVM moved the main bucket into vm_exec_ops15.12%; this
 is not pure dispatch attribution or directly the old vm_exec symbol bucket.
+
+## Writable scalar argument values (#206)
+
+Runtime05804b7→ca76c30 lifts the read-only-parameter restriction for proven
+exact Null/Bool/Int/Float calls and metadata-only ThisProp hybrids. Scalar
+Store/IncDec updates the live argument value vector, so introspection/trace
+snapshots observe current parameters. Ownership-bearing writes first promote
+args/slots to canonical cells, preserving destructor/WeakReference/reference
+gates. Canonical binding/AST-body hybrids, named/by-ref/coercing/default-widening/
+unresolved calls keep their existing path; no universal cells-free ABI claim.
+
+Seven alternating profiler-off PHP-byte-gated release pairs:
+separate writable recursive fib29 661.794→598.660ms (0.905), typed writable
+fib29 676.618→630.621 (0.932); default10-fib150.934→150.280 (0.996, flat).
+Sieve231.623→206.908 (0.893), strings164.000→160.517 (0.979),
+objects333.581→334.652 (1.003),JSON625.659→620.971 (0.993),
+app45.695→41.977 (0.919), dispersion overlaps. Sieve/app changes are not
+attributed to argument elimination because their call patterns do not prove it.
+Do not call the writable phase a default-fib benchmark win or multiply step gains.
+
+One retained compiler/oracle check proves writable-body eligibility and PHP
+func_get_args mutation, null/float transitions, string/array/object promotion,
+WeakReference/destructor order, current traces/exceptions, reference calls and
+named/coercing/default fallback. Workspace tests/fmt/clippy pass. All3390PHPT
+individual statuses unchanged (2671pass/639fail/13existing crashes/4timeouts).
+Raw hashes, source phase files, samples and per-file maps retained.

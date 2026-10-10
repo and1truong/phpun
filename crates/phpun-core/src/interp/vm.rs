@@ -23,7 +23,7 @@ pub(in crate::interp) enum Slot {
     Uninit,
     V(Value),
     C(Cell),
-    /// Read-only parameter in the live frame value vector.
+    /// Scalar parameter in the live frame value vector; writes remain inline.
     Arg(u16),
 }
 
