@@ -53,3 +53,21 @@ Strings baseline after ABI: 639 CPU samples, zero lost. Repeated libc comparison
 occur below `str_replace_one`/`breplace`; the old code scans for count and output
 separately, materializes subject bytes and copies no-match results. #185 targets
 that shared search/replace path first. Raw stacks/flat reports are preserved.
+
+## Shared replacement pass (#185)
+
+Frozen ABI runtime db51239 → replacement runtime 54da20e, seven alternating
+release pairs, every rep PHP exit/stdout/stderr gate: strings 650.254→440.361 ms
+(0.677×); replace phase 216.959→121.042 (0.558×). Concat 14.530→14.726, objects
+454.669→449.984, JSON904.711→900.463, app39.185→39.071: small differences
+with overlapping ranges; no gain claimed there. New replacement check covers
+binary bytes, case folding, cascading searches, short replacement arrays, keys,
+count/subject aliasing, stringable objects and throwing conversion. 59 relevant
+string/search PHPT:26pass/33existingfail, all statuses unchanged, no crashes/timeouts.
+
+Replacement now borrows input, returns shared string for no matches, and produces
+output/count in one scan per search term. Case-insensitive search still has its
+existing byte matcher. Full concat/capacity storage remains a separate decision.
+
+Review arity fix49a3fff is inherited by this branch after frozen step timings;
+reported runtime54da20e is not relabelled as the later branch head.
