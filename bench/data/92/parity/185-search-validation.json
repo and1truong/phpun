@@ -1,0 +1,27 @@
+{
+  "runtime": "9961ea5",
+  "checks": [
+    "workspace tests",
+    "fmt",
+    "clippy",
+    "release",
+    "24 VM/standalone exit/stdout/stderr oracle probes",
+    "19 workload oracle checks",
+    "exhaustive binary search offsets"
+  ],
+  "phpt": {
+    "total": 59,
+    "passed": 26,
+    "failed": 33,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 0,
+    "unsupported": 0,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 59,
+    "compatibility_pct": 44.07
+  },
+  "status_changes": []
+}
