@@ -657,7 +657,7 @@ impl<'a> Interp<'a> {
                         cls_name = Some(c.decl.name.clone());
                         fn_name = Some(m.decl.name.to_string());
                         scope_cls = Some(sc);
-                        Some(Rc::new(m.decl.clone()))
+                        Some(self.method_function(&m))
                     }
                     None => {
                         return self.fail(PhpError::uncaught(
@@ -1465,7 +1465,7 @@ impl<'a> Interp<'a> {
                         match c {
                             Some(c) => self.find_method_in(&c, &mn).map(|(m, sc)| {
                                 scope_cls = Some(sc);
-                                Rc::new(m.decl.clone())
+                                self.method_function(&m)
                             }),
                             None => None,
                         }

@@ -8,6 +8,17 @@ use super::*;
 type AoUnserData = (i64, Value, Rc<RefCell<PhpArray>>);
 
 impl<'a> Interp<'a> {
+    pub(in crate::interp) fn method_function(
+        &mut self,
+        method: &Rc<MethodDecl>,
+    ) -> Rc<FunctionDecl> {
+        self.method_functions
+            .entry(Rc::as_ptr(method) as usize)
+            .or_insert_with(|| (method.clone(), Rc::new(method.decl.clone())))
+            .1
+            .clone()
+    }
+
     /// Native bodies for the ArrayIterator/ArrayObject stubs.
     /// Iteration state lives in the `ArrayIter` object internal;
     /// unknown methods return None so the generic dispatch can report
@@ -1971,10 +1982,11 @@ impl<'a> Interp<'a> {
         self.pending_decl_class = Some(dc.clone());
         self.pending_called_class = Some(called);
         self.pending_decl_site = Some(Rc::as_ptr(m) as usize);
+        let decl = self.method_function(m);
         let r = if m.is_static {
-            self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(dc))
+            self.invoke_fn(&decl, args, None, Some(dc))
         } else {
-            self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(obj), Some(dc))
+            self.invoke_fn(&decl, args, Some(obj), Some(dc))
         };
         self.pending_decl_class = None;
         self.pending_called_class = None;
@@ -2073,7 +2085,8 @@ impl<'a> Interp<'a> {
             self.pending_decl_class = Some(sc.clone());
             self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
             self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
-            let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(sc));
+            let decl = self.method_function(&m);
+            let r = self.invoke_fn(&decl, args, this_obj, Some(sc));
             self.pending_decl_class = None;
             self.pending_called_class = None;
             return r;
@@ -2104,8 +2117,9 @@ impl<'a> Interp<'a> {
                     self.pending_decl_class = Some(cdc.clone());
                     self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
                     self.pending_decl_site = Some(Rc::as_ptr(&cm) as usize);
+                    let decl = self.method_function(&cm);
                     let r = self.invoke_fn(
-                        &Rc::new(cm.decl.clone()),
+                        &decl,
                         CallArgs::positional(vec![
                             cell(Value::str(name)),
                             cell(Value::Array(Rc::new(RefCell::new(arr)))),

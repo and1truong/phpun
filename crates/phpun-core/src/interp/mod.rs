@@ -369,6 +369,9 @@ pub struct Interp<'a> {
     /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
     /// the stored Rc keeps the decl alive so the pointer can't recycle.
     compiled_fns: crate::value::FxMap<usize, vm::CompileCacheEntry>,
+    /// One function declaration per method identity, shared by every dispatch path.
+    /// Retain the method metadata so its address cannot recycle into another entry.
+    method_functions: crate::value::FxMap<usize, (Rc<MethodDecl>, Rc<FunctionDecl>)>,
     /// Recycled value vecs for VM frames (exec stacks + call argv) —
     /// a call mallocs zero vecs once warm. Bounded by vm_exec's cap.
     vm_val_pool: Vec<Vec<Value>>,
@@ -850,10 +853,9 @@ pub struct Interp<'a> {
     /// Called-scope (LSB) for the next invoke_fn frame — set by
     /// invoke_method/static_invoke, consumed like pending_decl_class.
     pending_called_class: Option<Rc<PhpClass>>,
-    /// Origin anchor for the next invoke_fn frame — set by method
-    /// dispatch sites that pass `Rc::new(m.decl.clone())` (whose
-    /// cloned bodies would otherwise get fresh `vars.as_ptr()` sites
-    /// per call). Consumed like pending_decl_class.
+    /// Method-origin anchor for the next invoke_fn frame. Keeps static
+    /// declaration identity tied to the method across dispatch paths.
+    /// Consumed like pending_decl_class.
     pending_decl_site: Option<usize>,
     /// (object id, prop, is_get, owner) whose hook is about to run —
     /// consumed by invoke_fn to fill Frame::hook_prop.
@@ -1738,6 +1740,7 @@ impl<'a> Interp<'a> {
             stack: Vec::new(),
             functions: crate::value::FxMap::default(),
             compiled_fns: crate::value::FxMap::default(),
+            method_functions: crate::value::FxMap::default(),
             vm_val_pool: Vec::new(),
             vm_target_pool: Vec::new(),
             vm_slot_pool: Vec::new(),

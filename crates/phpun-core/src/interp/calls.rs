@@ -3827,7 +3827,8 @@ impl<'a> Interp<'a> {
                     self.pending_decl_class = Some(dc.clone());
                     self.pending_called_class = Some(o.borrow().class.clone());
                     self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
-                    let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(o), Some(dc));
+                    let decl = self.method_function(&m);
+                    let r = self.invoke_fn(&decl, args, Some(o), Some(dc));
                     self.pending_decl_class = None;
                     self.pending_called_class = None;
                     r

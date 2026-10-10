@@ -8998,7 +8998,7 @@ impl<'a> Interp<'a> {
                     match c {
                         Some(c) => self
                             .find_method_in(&c, name)
-                            .map(|(m, _)| Rc::new(m.decl.clone()))
+                            .map(|(m, _)| self.method_function(&m))
                             // A magic-method trampoline (`C::undef(...)`
                             // on __callStatic / `$o->undef(...)` on
                             // __call) reflects as `mixed ...$arguments`
