@@ -11,7 +11,7 @@ use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, Param, Stmt};
 use crate::builtins;
 use crate::error::PhpError;
-use crate::value::{compare, identical, Cell, FxMap, PhpArray, PhpClass, Value};
+use crate::value::{compare, identical, ArrKey, Cell, FxMap, PhpArray, PhpClass, Value};
 
 use super::{Flow, Interp};
 
@@ -159,6 +159,12 @@ enum Op {
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
     Canonical(Box<Expr>),
+    DimCv {
+        array: u16,
+        key_slot: Option<u16>,
+        key_int: i64,
+        fallback: Box<Expr>,
+    },
     ThisProp {
         name: Rc<str>,
         site: usize,
@@ -397,7 +403,7 @@ impl Compiled {
         let canonical_binding = c.ops.iter().any(|op| {
             matches!(
                 op,
-                Op::Canonical(_) | Op::CanonicalStmt { .. } | Op::Foreach { .. }
+                Op::Canonical(_) | Op::DimCv { .. } | Op::CanonicalStmt { .. } | Op::Foreach { .. }
             )
         });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
@@ -1141,6 +1147,33 @@ impl Compiler {
                     fallback: Box::new(e.clone()),
                 });
             }
+            Expr::Index {
+                e: base,
+                i: Some(key),
+            } => {
+                if let Expr::Var(array) = &**base {
+                    if !Interp::is_superglobal(array) {
+                        let key = match &**key {
+                            Expr::Var(n) if !Interp::is_superglobal(n) => {
+                                Some((Some(self.slot(n)), 0))
+                            }
+                            Expr::Int(i) => Some((None, *i)),
+                            _ => None,
+                        };
+                        if let Some((key_slot, key_int)) = key {
+                            let array = self.slot(array);
+                            self.emit(Op::DimCv {
+                                array,
+                                key_slot,
+                                key_int,
+                                fallback: Box::new(e.clone()),
+                            });
+                            return Some(());
+                        }
+                    }
+                }
+                self.emit(Op::Canonical(Box::new(e.clone())));
+            }
             Expr::ArrayLit(_)
             | Expr::Index { .. }
             | Expr::Prop { .. }
@@ -1871,6 +1904,55 @@ impl<'a> Interp<'a> {
                     let result = self.eval(expr);
                     self.vm_refresh(comp, slots);
                     vs.push(result?);
+                }
+                Op::DimCv {
+                    array,
+                    key_slot,
+                    key_int,
+                    fallback,
+                } => {
+                    // ponytail: fresh current-table lookup, no offset cache. Global
+                    // views, non-scalars and missing/uninitialized keys stay AST;
+                    // generation-guarded offsets need a measured storage change.
+                    let plain = if comp.top_level && self.globals_arr.is_some() {
+                        None
+                    } else {
+                        let peek = |index: u16| match &slots[index as usize] {
+                            Slot::V(v) => Some(v.clone()),
+                            Slot::C(c) => Some(c.borrow().clone()),
+                            _ => None,
+                        };
+                        let key = match key_slot {
+                            Some(index) => match peek(*index) {
+                                Some(Value::Int(i)) => Some(i),
+                                _ => None,
+                            },
+                            None => Some(*key_int),
+                        };
+                        match (peek(*array), key) {
+                            (Some(Value::Array(a)), Some(k)) => {
+                                a.borrow().get(&ArrKey::Int(k)).filter(|v| {
+                                    matches!(
+                                        v,
+                                        Value::Null
+                                            | Value::Bool(_)
+                                            | Value::Int(_)
+                                            | Value::Float(_)
+                                            | Value::Str(_)
+                                    )
+                                })
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(value) = plain {
+                        vs.push(value);
+                    } else {
+                        self.vm_materialize(comp, slots);
+                        let result = self.eval(fallback);
+                        self.vm_refresh(comp, slots);
+                        vs.push(result?);
+                    }
                 }
                 Op::CanonicalStmt {
                     stmt,
