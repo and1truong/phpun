@@ -2071,10 +2071,10 @@ pub fn str_charge(len: usize) -> i64 {
 /// charge — a clone shares the charge (zend's CoW) and the last
 /// owner's drop returns it to the arena. `Deref` lands on `[u8]` so
 /// `s.len()`/`s[..]`/iteration sites read unchanged; `.rc` reaches the
-/// shared `Rc<[u8]>` for downgrade/ptr_eq/cache sites.
+/// shared `Rc<Vec<u8>>` for downgrade/ptr_eq/cache sites.
 #[derive(Debug, Clone)]
 pub struct PhpStr {
-    pub rc: Rc<[u8]>,
+    pub rc: Rc<Vec<u8>>,
 }
 
 impl PhpStr {
@@ -2085,13 +2085,25 @@ impl PhpStr {
         // (24B header + 8B emalloc header; oracle: 8000032 for 8MB).
         let req = bytes.len() as i64 + 32;
         mem_charge(&STR_LIVE, str_charge(bytes.len()), req);
-        PhpStr { rc: bytes.into() }
+        PhpStr { rc: Rc::new(bytes) }
+    }
+
+    /// The caller proves one PHP owner; make_mut detaches weak cache handles.
+    pub(crate) fn append_unique(&mut self, suffix: &[u8]) {
+        debug_assert_eq!(Rc::strong_count(&self.rc), 1);
+        let old = str_charge(self.len());
+        Rc::make_mut(&mut self.rc).extend_from_slice(suffix);
+        mem_charge(
+            &STR_LIVE,
+            str_charge(self.len()) - old,
+            self.len() as i64 + 32,
+        );
     }
 
     /// Re-attach a charge to shared bytes whose PhpStr owner died
     /// while a weak/raw clone kept the payload alive (DimPre
     /// resurrection). Bytes that stay live stay charged.
-    pub fn adopt(rc: Rc<[u8]>) -> Self {
+    pub fn adopt(rc: Rc<Vec<u8>>) -> Self {
         let req = rc.len() as i64 + 32;
         mem_charge(&STR_LIVE, str_charge(rc.len()), req);
         PhpStr { rc }

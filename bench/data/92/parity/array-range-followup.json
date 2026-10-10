@@ -1,0 +1,83 @@
+{
+  "threshold_seconds": 30,
+  "jobs": 1,
+  "CPU_activity": "no builds/PHPT/profiling/speed samples in parallel",
+  "runs": [
+    {
+      "binary": "capacity-final",
+      "test": "range_bug71132",
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 1,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "duration_ms": 15449
+    },
+    {
+      "binary": "capacity-final",
+      "test": "range_bug71197",
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 1,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "duration_ms": 16214
+    },
+    {
+      "binary": "array-reads-active",
+      "test": "range_bug71132",
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 1,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "duration_ms": 14554
+    },
+    {
+      "binary": "array-reads-active",
+      "test": "range_bug71197",
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 1,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "duration_ms": 15104
+    }
+  ]
+}

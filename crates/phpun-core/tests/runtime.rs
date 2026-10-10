@@ -774,6 +774,9 @@ class PrivateRef {
 $v = 2; $p = new PrivateRef(x: $v); $p->put(12); echo "$v ", $p->get(), "\n";
 class LockedRef { function __construct(public readonly int &$x) {} }
 try { new LockedRef($v); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+class LockedObjectRef { public readonly object $x; function __construct() { $this->x = new stdClass; } }
+$lockedObject = new LockedObjectRef; $replacement = new stdClass;
+try { $lockedObject->x =& $replacement; } catch (Error $e) { echo $e->getMessage(), "\n"; }
 class PairRef { function __construct(public int &$a, public int &$b) {} }
 $n = 4; $q = new PairRef($n, $n); $q->a++; echo "$n $q->a $q->b\n";
 class HookRef { function __construct(public int &$x { set { $this->x = $value; } }) {} }
@@ -781,7 +784,139 @@ try { new HookRef($v); } catch (Error $e) { echo $e->getMessage(), "\n"; }
 "#,
         &[],
     );
-    assert_eq!(out, "9 9\n10\nCannot assign array to reference held by property RefBox::$x of type int\narray\n12 12\nCannot indirectly modify readonly property LockedRef::$x\n5 5 5\nTyped property HookRef::$x must not be accessed before initialization\n");
+    assert_eq!(out, "9 9\n10\nCannot assign array to reference held by property RefBox::$x of type int\narray\n12 12\nCannot indirectly modify readonly property LockedRef::$x\nCannot assign by reference to overloaded object\n5 5 5\nTyped property HookRef::$x must not be accessed before initialization\n");
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn streaming_json_preserves_flags_nested_keys_hooks_and_utf8() {
+    let (out, err, code) = eval(
+        "json-sink.php",
+        r#"<?php
+class StreamJson implements JsonSerializable { function jsonSerialize(): mixed { echo "serialize\n"; return ['ok' => 3]; } }
+class HookJson {
+    public string $name { get { echo "get\n"; return 'hook'; } }
+    private int $hidden = 9;
+    public int $x = 2;
+}
+$payload = ['text' => "<>&'\"/\n\r\t\0\\é😀", 'nested' => [[null, true, false, 12, 2.5], [2 => 'two', 'x' => 'key']], 'empty' => []];
+foreach ([0, 15, 64, 256, 320] as $flags) echo json_encode($payload, $flags), "\n";
+echo json_encode([new StreamJson, new HookJson]), "\n";
+$s = '{"ascii":"user-123@example.com","utf8":"é😀","escaped":"a\\u0000b\\n","a":[1,true,null]}';
+$a = json_decode($s, true);
+echo $a['ascii'], ' ', bin2hex($a['utf8']), ' ', bin2hex($a['escaped']), ' ', json_encode($a['a']), "\n";
+echo json_encode(json_decode('{"x":1,"nested":{"k":"v"}}')), "\n";
+foreach (['"' . chr(92), '"ascii' . chr(92), '{"key":"value' . chr(92)] as $broken) {
+    var_dump(json_decode($broken));
+    echo json_last_error(), "\n";
+    var_dump(json_validate($broken));
+}
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"{"text":"<>&'\"\/\n\r\t\u0000\\\u00e9\ud83d\ude00","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"\u003C\u003E\u0026\u0027\u0022\/\n\r\t\u0000\\\u00e9\ud83d\ude00","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"<>&'\"/\n\r\t\u0000\\\u00e9\ud83d\ude00","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"<>&'\"\/\n\r\t\u0000\\é😀","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"<>&'\"/\n\r\t\u0000\\é😀","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+serialize
+get
+[{"ok":3},{"name":"hook","x":2}]
+user-123@example.com c3a9f09f9880 6100620a [1,true,null]
+{"x":1,"nested":{"k":"v"}}
+NULL
+4
+bool(false)
+NULL
+4
+bool(false)
+NULL
+4
+bool(false)
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn slot_immediates_preserve_numeric_fallbacks_errors_and_evaluation_order() {
+    let (out, err, code) = eval(
+        "slot.php",
+        r#"<?php
+function immediate($n) { return [$n + 1, $n < 2, $n * -3, $n === null, $n == false, $n . 'x']; }
+foreach ([0, 1, 3, 2.5, '4', null] as $n) echo json_encode(immediate($n)), "\n";
+function loops($n) { $s = 0; for ($i = 0; $i < $n; $i++) { if ($i % 2) continue; $s += 3; if ($s > 10) break; } return $s; }
+echo loops(20), "\n";
+function overflow($n) { return $n + 1; }
+var_dump(gettype(overflow(PHP_INT_MAX)));
+function zero($n) { return $n / 0; }
+try { zero(3); } catch (DivisionByZeroError $e) { echo $e->getMessage(), ' ', $e->getTrace()[0]['function'], "\n"; }
+function changed($n) { $n += 3; return $n; }
+echo changed(4), "\n";
+function order($n) { return $n + ($n = 5); }
+echo order(1), "\n";
+$x = 'a'; $x .= 'b'; $alias = $x; $x .= ($x = 'c'); echo "$x $alias\n";
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"[1,true,0,false,true,"0x"]
+[2,true,-3,false,false,"1x"]
+[4,false,-9,false,false,"3x"]
+[3.5,false,-7.5,false,false,"2.5x"]
+[5,false,-12,false,false,"4x"]
+[1,true,0,true,true,"x"]
+12
+string(6) "double"
+Division by zero zero
+7
+10
+cc ab
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn capacity_strings_preserve_aliases_binary_data_and_weak_utf8_guards() {
+    let (out, err, code) = eval(
+        "capacity.php",
+        r#"<?php
+function grow_bytes($n) { $s = ''; for ($i=0; $i<$n; $i++) $s .= "\xff\0"; return $s; }
+$s = grow_bytes(4000); $alias = $s; $s .= 'z'; echo strlen($s), ' ', strlen($alias), ' ', bin2hex(substr($s, -5)), "\n";
+$a = ['x' => 'a']; $r =& $a['x']; for ($i=0; $i<5; $i++) $r .= 'b'; echo "$r ", $a['x'], "\n";
+class TypedString { public string $x = 'v'; }
+$o = new TypedString; $t =& $o->x; $t .= '!'; echo "$t $o->x\n";
+$u = 'A'; $u .= ($u = 'B'); echo "$u\n";
+function canon_growth($s) { foreach ([1,2,3] as $unused) { $s .= 'x'; } return $s; }
+echo canon_growth(s: 'c'), "\n";
+$v = 'a'; var_dump(preg_match('/\A[ab]+\z/u', $v)); $v .= "\xff"; var_dump(preg_match('/\A[ab]+\z/u', $v)); echo preg_last_error(), "\n";
+$v .= 'b'; var_dump(preg_match('/\A[ab]+\z/u', $v)); echo preg_last_error(), "\n";
+$b = str_repeat('x', 300000); $copy=$b; for ($i=0; $i<8; $i++) $b .= str_repeat('x',300000); echo strlen($b), ' ', strlen($copy), "\n";
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"8001 8000 ff00ff007a
+abbbbb abbbbb
+v! v!
+BB
+cxxx
+int(1)
+bool(false)
+4
+bool(false)
+4
+2700000 300000
+"#
+    );
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }

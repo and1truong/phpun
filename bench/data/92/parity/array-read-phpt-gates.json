@@ -1,0 +1,35 @@
+{
+  "selection": 3390,
+  "before_runtime": "6dbf71c",
+  "after_runtime": "05804b7",
+  "after_summary": {
+    "total": 3390,
+    "passed": 2671,
+    "failed": 639,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 29,
+    "unsupported": 34,
+    "borked": 0,
+    "crashed": 13,
+    "timed_out": 4,
+    "applicable": 3327,
+    "compatibility_pct": 80.28
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "threshold_seconds": 30,
+  "jobs": 4,
+  "baseline_note": "union parent2521 +869extra; originals retained; extra baseline during build",
+  "range_note": "range_bug71132/71197 timeout\u2192crash; unchanged f64 range loop loses integer precision near MIN. Standalone before/after followups recorded separately, not hidden as status equality"
+}

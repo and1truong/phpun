@@ -1,0 +1,54 @@
+{
+  "before_summary": {
+    "total": 2521,
+    "passed": 2060,
+    "failed": 399,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 21,
+    "unsupported": 27,
+    "borked": 0,
+    "crashed": 9,
+    "timed_out": 5,
+    "applicable": 2473,
+    "compatibility_pct": 83.3
+  },
+  "after_summary": {
+    "total": 2521,
+    "passed": 2063,
+    "failed": 397,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 21,
+    "unsupported": 27,
+    "borked": 0,
+    "crashed": 9,
+    "timed_out": 4,
+    "applicable": 2473,
+    "compatibility_pct": 83.42
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/concat/concat_003.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/ctor_promotion/ctor_promotion_by_ref.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/property_hooks/gh16615_002.phpt",
+      "before": "fail",
+      "after": "pass"
+    }
+  ],
+  "runtime_before": "a5dc13f",
+  "runtime_after": "6dbf71c",
+  "timeout_seconds": 30,
+  "jobs": 4,
+  "baseline_was_run_during_a_build": true,
+  "note": "original statuses retained; GC threshold separately rerun",
+  "oracle": "PHP8.5.11"
+}

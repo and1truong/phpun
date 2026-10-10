@@ -278,3 +278,164 @@ a speedup claim; by-reference constructors still use canonical binding.
 status unchanged including3existing crashes/4timeouts. All18ctor_promotion PHPT gain
 ctor_promotion_by_ref (6→7pass), no regressions. Workspace tests/fmt/clippy pass.
 Raw per-test maps and summary in bench/data/92/parity/promoted-reference-gates.json.
+
+## JSON allocation and ASCII decode runs (#187)
+
+Main-equivalenta5dc13f CPU profile:1138 samples, zero lost; malloc7.82%,cfree7.21%,
+Utf8Chunks6.50%,String::from_utf8_lossy4.13%exclusive. Runtime03dcdb3 streams
+encoding into one sink instead of per-child strings/Vec<String>/join and borrows
+string keys. Decoding scans ASCII runs instead of UTF8-validating/copying each byte.
+Non-ASCII/escape paths and existing child-null/serialization scopes remain canonical.
+
+Seven alternating samples beforeb2c21b3→03dcdb3: JSON30 941.365→720.657ms (0.766);
+JSON150 2966.980→1937.965 (0.653). Strings234.257→234.408,objects336.632→330.512,
+sieve246.755→242.513,app45.893→43.204: overlapping ranges, no broad gain claim.
+All reps match PHP8.5.11 exit/stdout/stderr.300JSON/hooks PHPT every status unchanged
+(218pass,73fail,3unsupported,6existing JSON recursion crashes). Workspace tests,
+fmt/clippy pass; retained oracle covers flags/unicode/surrogates/NUL/scalars/key order,
+JsonSerializable/hooked getters/nested object decode. Parent reviews00f9c7f/160643a
+were merged after these frozen timings; final-stack measurements are separate.
+
+This removes temporary string allocations, not inline packed array storage or
+shape-generation caches. Raw hashes/samples/status maps/profile in bench/data/92/parity/json-*.
+
+## Direct slot / literal operations (#188)
+
+Runtime03dcdb3 →cc12b19: BinaryCvConst reads the CV and an immutable literal
+directly, avoiding RHS push/pop and one opcode. Shared vm_binary retains all
+coercion/overflow/error gates; side-effectful RHS retains its original path.
+CPU attribution:1,289samples/zero lost, vm_exec46.63%exclusive, vm_run12.02%.
+Annotated opcode PC/decode regions total ~6.5%of vm_exec (~3%overall); other
+indirect jumps dispatch Value kinds. Sampling/skid and unresolved libc limits
+apply. This is not evidence that pure dispatch dominates or that JIT is needed.
+
+Seven alternating, profiler-off, PHP8.5.11-byte-gated release pairs:
+sieve242.843→224.062ms (0.923), default fib152.553→151.499 (0.993),
+typed fib29 626.315→618.164 (0.987), objects314.968→309.081 (0.981),
+strings211.948→216.170 (1.020), app41.318→42.097 (1.019). Small changes
+overlap; only the bounded sieve benefit is selected, not a broad speedup.
+
+Separate seven-run function clocks: first fib10 call (includes compilation,
+not pure compile cost)0.097→0.094ms; warm fib29 631.925→615.329ms (0.974).
+PHP warm31.379ms; gap remains ~19.6× here. Cold CLI is recorded separately.
+The timer is wall microtime, samples are variable, fixed result/exit/stderr gate.
+Decision: continue bounded slot/shared-runtime improvements; defer register
+rewrite/native tier without larger attributed dispatch cost. No parity claim.
+
+Workspace tests/fmt/clippy and scalar/numeric-string/null/overflow/error/trace/
+RHS-mutation oracle pass. Frozen d8cef25 includes parent review fixes;2521PHPT
+gain two promoted-reference tests. One GC stress case crosses the30s threshold
+under the parallel suite; standalone60s reruns pass on before/after. Nine
+existing crashes and five pre-existing timeouts remain. Raw per-file maps,
+original timeout and followup thresholds are retained; timing IDs are not
+relabelled after parent review fixes. Parent JSON trailing-escape fix is included.
+
+## Capacity-backed PHP byte strings (#185)
+
+Runtime15f5d86 uses Rc<Vec<u8>>; constructing PhpStr moves the Vec instead of
+copying its payload into Rc<[u8]>. A proven unique-owner string CV can append
+using Vec capacity in AST and VM. Payload-sharing aliases and typed-reference
+owners retain canonical concatenation/write gates. Weak handles detach before
+mutation; tracked grow charges transfer by the old identity after a live sweep.
+One Rc shell is still allocated per append for cache invalidation; there is no
+stable-generation cache or inline packed-array storage claim. Existing memory
+accounting heuristics remain, measured compatibility is reported below.
+
+Correct frozen release verified by distinct hash and append symbols; shared Cargo
+target initially reused the parent artifact. That copy was quarantined before
+speed measurements, core cleaned/rebuilt, and never used for published timings.
+Final6dbf71c includes parent trailing-JSON-escape rejection; valid-workload timings
+retain15f5d86. Measured x86_64 layout: Value16B, Cell8B, TraceFrame160B.
+
+Seven alternating slot-final d8cef25 →15f5d86 pairs, all exit/stdout/stderr
+PHP-byte-identical, profiler off: concat4000 14.753→13.318ms (0.903),
+16000 63.661→33.017 (0.519),64000 643.407→106.854 (0.166).
+Strings251.316→191.829 (0.763), fib165.675→152.419 (0.920),
+arrays226.493→213.427 (0.942), objects387.853→371.660 (0.958),
+JSON738.307→637.630 (0.864). This removes increasing-prefix copying on the
+proven path; small-case noise remains and individual steps are not multiplied.
+
+Fresh native PHP/main3a-runtime-equivalent a5dc13f/15f5d86 comparison,7rotating
+reps, profilers off, every exit/stdout/stderr PHP byte-identical, cold CLI:
+
+| Bench | PHP / merged-main baseline / stack median ms | Main/PHP | Stack/PHP | Stack/main |
+|---|---:|---:|---:|---:|
+| bench/00-startup.php | 4.269 / 5.274 / 5.121 | 1.24× | 1.20× | 0.971× |
+| bench/10-fib.php | 13.577 / 204.566 / 147.123 | 15.07× | 10.84× | 0.719× |
+| bench/11-sieve.php | 8.427 / 244.067 / 246.210 | 28.96× | 29.22× | 1.009× |
+| bench/20-strings.php | 14.546 / 247.204 / 182.590 | 16.99× | 12.55× | 0.739× |
+| bench/30-arrays.php | 18.685 / 237.447 / 206.414 | 12.71× | 11.05× | 0.869× |
+| bench/40-objects.php | 8.599 / 385.936 / 364.962 | 44.88× | 42.44× | 0.946× |
+| bench/50-regex.php | 8.604 / 42.705 / 44.795 | 4.96× | 5.21× | 1.049× |
+| bench/60-json.php | 187.067 / 1016.983 / 649.746 | 5.44× | 3.47× | 0.639× |
+| bench/70-db.php | 31.481 / 127.692 / 124.250 | 4.06× | 3.95× | 0.973× |
+| bench/app/cli.php | 6.110 / 44.789 / 43.648 | 7.33× | 7.14× | 0.975× |
+| examples/composer/run.php | 5.324 / 9.096 / 8.114 | 1.71× | 1.52× | 0.892× |
+
+Nine-bench geomean9.398→8.155×, stack/main0.868 (~13.2%less time).
+Strings−26.1%, JSON−36.1%, fib−28.1%; objects−5.4%but still42.44×PHP here,
+sieve1.009×main and regex1.049×main with substantial overlapping dispersion.
+Cold app0.975×main, Composer0.892×main; seven small samples are insufficient
+for a broad app gain claim. This is a fresh same-host native setup and is separate
+from the existing user-reported main3a geomean3.05×; no cross-host ratio mixing.
+Main moved after these samples: baseline explicitly3a/a5dc, not ef63392.
+
+Workspace tests/fmt/clippy pass.26 VM/probe and19 workload byte gates pass,
+including binary/NUL bytes, aliases, refs, typed-owner fallback, RHS mutation,
+weak UTF8-cache invalidation after append and large tracked-string growth.
+
+Final2521PHPT:2060→2063pass,399→397fail,9unchanged existing crashes,
+5→4timeouts. Promoted-reference two fail→pass and concat_003 stress timeout→pass;
+all other individual statuses unchanged, including memory-limit/string/PCRE/
+class/hooks/lifetime selections. The GC30s threshold crossing on the earlier
+slot suite passes here. Original maps and individual followups retained; do not
+interpret changed timeout counts as full GC/JSON/generator compatibility.
+
+## Guarded scalar CV array reads (#187)
+
+Runtime6dbf71c →05804b7: DimCv reads an existing scalar at an integer key from
+the current table, avoiding canonical frame materialization/refresh. Plain CVs
+only; superglobals are excluded, and top-level global views, missing/unknown keys
+non-array/non-scalar values retain the original AST bridge. Hybrid binding remains
+canonical; reference-return functions still cannot compile. No offset cache,
+storage generation/shape change or inline packed representation is claimed.
+Current-table lookup naturally observes unset/sort/splice/unshift/CoW/ref writes.
+
+First e45b99d prototype did not unwrap parser source-line markers, so the fast
+opcode was not emitted. It was not published as an implementation. Its early
+samples overlap0.18s oracle work and are retained only as prototype history.
+05804b7 unwraps transparent source markers and has one retained runnable check
+for compiler opcode eligibility plus PHP-matching mutation/reference/global-view/
+missing-key/ArrayAccess/named-call results. Workspace tests/fmt/clippy pass;
+27VM/probes and19workload byte gates pass. Correct release core cleaned/rebuilt,
+source/runtime/hash explicit in array-read-provenance.json.
+
+Seven rotating PHP/parent-stack/new-stack reps, no builds/PHPT/profilers in parallel:
+sieve222.772→212.659ms (0.955), arrays196.298→186.877 (0.952).
+Independent seven alternating larger sieve3×200k1482.571→1363.094 (0.919).
+Other cases overlap; nine-bench geomean7.958→7.987×PHP (1.004×parent), no
+whole-suite gain claimed. PHP/config/absolute medians/raw samples all retained.
+Do not combine this dataset with the main3a→capacity dataset by multiplying steps.
+
+Seven Composer samples initially7.204→7.777ms (1.079×parent);31fresh isolated
+alternating followups7.030→7.168 (1.020). App40.718→40.927 (1.005),
+startup5.253→5.205 (0.991), ranges overlap. Both datasets retained, no app win.
+
+3390relevant PHPT:2671pass/639fail/29skip/34unsupported unchanged. Original
+baseline11crashes/6timeouts becomes13crashes/4timeouts: two range stress cases
+timeout→crash. The unchanged builtin range f64 loop cannot progress near
+PHP_INT_MIN; these files exercise no new dimension opcode. Standalone same30s
+before/after runs both crash on each case, confirming pre-existing failure mode,
+not hiding the original statuses. Other individual statuses unchanged. Raw maps,
+thresholds and range followups retained; no full PHP compatibility claim.
+
+#187 remains partial: bounded property-key cache, JSON shared sink and scalar CV
+array reads implemented. Actual packed inline storage/declared offset layouts
+remain pending evidence and ownership/lifetime gates, explicitly tracked in #92.
+
+After-read CPU profile946samples/zero lost: vm_refresh4.33%exclusive,
+vm_materialize6.87%,global_var_cell12.58%,assign_inner5.39%,
+assign_index_path3.59%; remaining writes still use canonical bridges.
+Malloc2.22%/cfree3.07%do not by themselves justify inline packed ownership
+rewrite on sieve. LLVM moved the main bucket into vm_exec_ops15.12%; this
+is not pure dispatch attribution or directly the old vm_exec symbol bucket.

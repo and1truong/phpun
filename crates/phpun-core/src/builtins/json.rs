@@ -69,24 +69,40 @@ pub(crate) fn dispatch(
 // ----- helpers -----
 
 fn json_encode(it: &mut Interp, v: &Value, flags: i64) -> Result<String, ()> {
-    let mut seen: Vec<usize> = Vec::new();
-    json_enc(it, v, flags, &mut seen)
+    let mut out = String::new();
+    json_enc(it, v, flags, &mut Vec::new(), &mut out)?;
+    Ok(out)
 }
 
-fn json_enc(_it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>) -> Result<String, ()> {
-    Ok(match v {
-        Value::Null => "null".into(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => i.to_string(),
+// Preserve the existing child-error null fallback without per-child strings.
+fn json_child(it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>, out: &mut String) {
+    let start = out.len();
+    if json_enc(it, v, flags, seen, out).is_err() {
+        out.truncate(start);
+        out.push_str("null");
+    }
+}
+
+fn json_enc(
+    it: &mut Interp,
+    v: &Value,
+    flags: i64,
+    seen: &mut Vec<usize>,
+    out: &mut String,
+) -> Result<(), ()> {
+    use std::fmt::Write;
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(i) => write!(out, "{i}").unwrap(),
         Value::Float(f) => {
             if f.fract() == 0.0 && f.abs() < 1e15 {
-                // PHP prints whole floats without a fraction in JSON
-                format!("{}", *f as i64)
+                write!(out, "{}", *f as i64).unwrap();
             } else {
-                crate::value::format_float(*f)
+                out.push_str(&crate::value::format_float(*f));
             }
         }
-        Value::Str(s) => json_str(&crate::value::lossy(&s), flags),
+        Value::Str(s) => json_str(&crate::value::lossy(s), flags, out),
         Value::Array(a) => {
             let a = a.borrow();
             let is_list = a
@@ -94,119 +110,111 @@ fn json_enc(_it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>) -> R
                 .iter()
                 .enumerate()
                 .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64));
-            if is_list {
-                let parts: Vec<String> = a
-                    .entries
-                    .iter()
-                    .map(|(_, c)| json_enc(_it, &c.borrow(), flags, seen).unwrap_or("null".into()))
-                    .collect();
-                format!("[{}]", parts.join(","))
-            } else {
-                let parts: Vec<String> = a
-                    .entries
-                    .iter()
-                    .map(|(k, c)| {
-                        format!(
-                            "{}:{}",
-                            json_str(&key_str(k), flags),
-                            json_enc(_it, &c.borrow(), flags, seen).unwrap_or("null".into())
-                        )
-                    })
-                    .collect();
-                format!("{{{}}}", parts.join(","))
+            out.push(if is_list { '[' } else { '{' });
+            for (i, (k, c)) in a.entries.iter().enumerate() {
+                if i != 0 {
+                    out.push(',');
+                }
+                if !is_list {
+                    json_key(k, flags, out);
+                    out.push(':');
+                }
+                json_child(it, &c.borrow(), flags, seen, out);
             }
+            out.push(if is_list { ']' } else { '}' });
         }
         Value::Object(o) => {
-            // JsonSerializable::jsonSerialize() wins over the raw
-            // public-property view (gh16725) — once per object per
-            // encode: a serializable that returns $this (gh10519)
-            // falls through to the property view instead of looping.
             let key = Rc::as_ptr(o) as usize;
             if !seen.contains(&key)
-                && _it
+                && it
                     .find_method_in(&o.borrow().class, "jsonserialize")
                     .is_some()
             {
                 seen.push(key);
-                let v = _it
+                let v = it
                     .method_invoke(o.clone(), "jsonSerialize", crate::interp::CallArgs::empty())
                     .unwrap_or(Value::Null);
-                return json_enc(_it, &v, flags, seen);
+                return json_enc(it, &v, flags, seen, out);
             }
-            // spl array-objects encode their internal storage as the
-            // object's property hash (spl_array_get_properties).
             let ao_arr = if matches!(
                 o.borrow().internal,
                 Some(crate::value::ObjectInternal::ArrayIter { .. })
             ) {
-                Some(_it.ao_arr(o))
+                Some(it.ao_arr(o))
             } else {
                 None
             };
+            let dtp = if ao_arr.is_none() {
+                crate::builtins::datetime::dt_public_props(&o.borrow())
+            } else {
+                None
+            };
+            out.push('{');
             if let Some(arr) = ao_arr {
-                let parts: Vec<String> = arr
-                    .borrow()
-                    .iter()
-                    .map(|(k, c)| {
-                        format!(
-                            "{}:{}",
-                            json_str(&key_str(k), flags),
-                            json_enc(_it, &c.borrow(), flags, seen).unwrap_or("null".into())
-                        )
-                    })
-                    .collect();
-                return Ok(format!("{{{}}}", parts.join(",")));
-            }
-            // DateTime-family encode the synthetic public view.
-            if let Some(dtp) = crate::builtins::datetime::dt_public_props(&o.borrow()) {
-                let parts: Vec<String> = dtp
-                    .iter()
-                    .map(|(k, v)| {
-                        format!(
-                            "{}:{}",
-                            json_str(k, flags),
-                            json_enc(_it, v, flags, seen).unwrap_or("null".into())
-                        )
-                    })
-                    .collect();
-                return Ok(format!("{{{}}}", parts.join(",")));
-            }
-            // Public props only; hooked props serialize their `get`
-            // value (property_hooks/dump, oss-fuzz-382922236).
-            let entries = _it.object_serial_entries(o);
-            let mut parts: Vec<String> = Vec::new();
-            for (out, slot, decl) in entries {
-                let public = decl
-                    .as_ref()
-                    .map(|(p, _)| p.visibility == crate::ast::Visibility::Public)
-                    .unwrap_or(true);
-                if !public {
-                    continue;
+                for (i, (k, c)) in arr.borrow().iter().enumerate() {
+                    if i != 0 {
+                        out.push(',');
+                    }
+                    json_key(k, flags, out);
+                    out.push(':');
+                    json_child(it, &c.borrow(), flags, seen, out);
                 }
-                // Int-keyed buckets encode their index as the name.
-                let out = match crate::value::int_prop_index(&out) {
-                    Some(i) => i.to_string(),
-                    None => out,
-                };
-                let v = match &decl {
-                    Some((p, dcls)) => _it.serial_entry_value(o, p, dcls, &slot),
-                    None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
-                };
-                if let Some(v) = v {
-                    parts.push(format!(
-                        "{}:{}",
-                        json_str(&out, flags),
-                        json_encode(_it, &v, flags).unwrap_or("null".into())
-                    ));
+            } else if let Some(dtp) = dtp {
+                for (i, (k, v)) in dtp.iter().enumerate() {
+                    if i != 0 {
+                        out.push(',');
+                    }
+                    json_str(k, flags, out);
+                    out.push(':');
+                    json_child(it, v, flags, seen, out);
+                }
+            } else {
+                let entries = it.object_serial_entries(o);
+                let mut first = true;
+                for (name, slot, decl) in entries {
+                    if !decl
+                        .as_ref()
+                        .map(|(p, _)| p.visibility == crate::ast::Visibility::Public)
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let name = match crate::value::int_prop_index(&name) {
+                        Some(i) => i.to_string(),
+                        None => name,
+                    };
+                    let v = match &decl {
+                        Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
+                        None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                    };
+                    if let Some(v) = v {
+                        if !first {
+                            out.push(',');
+                        }
+                        first = false;
+                        json_str(&name, flags, out);
+                        out.push(':');
+                        // Raw object fields historically use a fresh serializer scope.
+                        json_child(it, &v, flags, &mut Vec::new(), out);
+                    }
                 }
             }
-            format!("{{{}}}", parts.join(","))
+            out.push('}');
         }
-        _ => "null".into(),
-    })
+        _ => out.push_str("null"),
+    }
+    Ok(())
 }
 
-fn json_str(s: &str, flags: i64) -> String {
+fn json_key(key: &ArrKey, flags: i64, out: &mut String) {
+    match key {
+        ArrKey::Str(s) => json_str(s, flags, out),
+        _ => json_str(&key_str(key), flags, out),
+    }
+}
+
+fn json_str(s: &str, flags: i64, out: &mut String) {
+    use std::fmt::Write;
     const HEX_TAG: i64 = 1;
     const HEX_AMP: i64 = 2;
     const HEX_APOS: i64 = 4;
@@ -214,15 +222,15 @@ fn json_str(s: &str, flags: i64) -> String {
     const UNESCAPED_SLASHES: i64 = 64;
     const UNESCAPED_UNICODE: i64 = 256;
     // HEX-flag escapes use %04X; default unicode escapes %04x (PHP quirk).
-    let mut out = String::from("\"");
+    out.push('"');
     for c in s.chars() {
         let u = c as u32;
         match c {
-            '"' if flags & HEX_QUOT != 0 => out.push_str(&format!("\\u{:04X}", u)),
+            '"' if flags & HEX_QUOT != 0 => write!(out, "\\u{:04X}", u).unwrap(),
             '"' => out.push_str("\\\""),
-            '\'' if flags & HEX_APOS != 0 => out.push_str(&format!("\\u{:04X}", u)),
-            '<' | '>' if flags & HEX_TAG != 0 => out.push_str(&format!("\\u{:04X}", u)),
-            '&' if flags & HEX_AMP != 0 => out.push_str(&format!("\\u{:04X}", u)),
+            '\'' if flags & HEX_APOS != 0 => write!(out, "\\u{:04X}", u).unwrap(),
+            '<' | '>' if flags & HEX_TAG != 0 => write!(out, "\\u{:04X}", u).unwrap(),
+            '&' if flags & HEX_AMP != 0 => write!(out, "\\u{:04X}", u).unwrap(),
             '\\' => out.push_str("\\\\"),
             '/' if flags & UNESCAPED_SLASHES == 0 => out.push_str("\\/"),
             '\n' => out.push_str("\\n"),
@@ -230,24 +238,25 @@ fn json_str(s: &str, flags: i64) -> String {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            _ if u < 0x20 => out.push_str(&format!("\\u{:04x}", u)),
+            _ if u < 0x20 => write!(out, "\\u{:04x}", u).unwrap(),
             _ if u > 0x7f && flags & UNESCAPED_UNICODE == 0 => {
                 if u > 0xffff {
                     let x = u - 0x10000;
-                    out.push_str(&format!(
+                    write!(
+                        out,
                         "\\u{:04x}\\u{:04x}",
                         0xd800 + (x >> 10),
                         0xdc00 + (x & 0x3ff)
-                    ));
+                    )
+                    .unwrap();
                 } else {
-                    out.push_str(&format!("\\u{:04x}", u));
+                    write!(out, "\\u{:04x}", u).unwrap();
                 }
             }
             c => out.push(c),
         }
     }
     out.push('"');
-    out
 }
 
 fn json_decode(it: &mut Interp, s: &str, assoc: bool) -> Result<Value, ()> {
@@ -282,7 +291,10 @@ fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result
             *pos += 1;
             let mut s = String::new();
             while *pos < b.len() && b[*pos] != b'"' {
-                if b[*pos] == b'\\' && *pos + 1 < b.len() {
+                if b[*pos] == b'\\' {
+                    if *pos + 1 == b.len() {
+                        return Err(());
+                    }
                     *pos += 1;
                     match b[*pos] {
                         b'n' => s.push('\n'),
@@ -299,6 +311,13 @@ fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result
                         c => s.push(c as char),
                     }
                     *pos += 1;
+                } else if b[*pos].is_ascii() {
+                    // Scan ASCII runs once instead of validating/copying each byte.
+                    let start = *pos;
+                    while *pos < b.len() && b[*pos].is_ascii() && !matches!(b[*pos], b'"' | b'\\') {
+                        *pos += 1;
+                    }
+                    s.push_str(std::str::from_utf8(&b[start..*pos]).unwrap());
                 } else {
                     // UTF-8 pass-through
                     let ch_len = utf8_len(b[*pos]);

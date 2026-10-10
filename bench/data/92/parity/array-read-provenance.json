@@ -1,0 +1,11 @@
+{
+  "runtime_before": "6dbf71c",
+  "runtime_after": "05804b7",
+  "before_hash": "9e6d2b1484cbe0549b82eb36842fdbb1e2411198d5554c0ed9b809e89d4e78c2",
+  "after_hash": "52e3725e3967e8e262a975dac5d1dea4e0333027bec636ac2c7bc9c817f12a8d",
+  "build": "rustc1.99.0 release/LTO/codegen-units1; core cleaned before building; source clean",
+  "prototype_notes": "first prototype e45b99d failed to unwrap parser source-line markers, so fast opcode not emitted. Early inactive run overlaps 0.18s oracle checks and is not used as isolated speed evidence. Retained transparently; final active runs isolated, compiler-op proof in retained unit",
+  "guard_ceiling": "integer key, existing scalar value, plain CVs. Superglobals excluded; top-level global views, refs returned by callee, missing/uninit/non-scalar cases use exact canonical AST bridge. Fresh current-table lookup; no offsets cached or inline packed layout",
+  "workspace_tests_fmt_clippy": "pass;5core unit/21runtime/19format checks",
+  "oracle": "27 VM/probe +19workload exact exit/stdout/stderr PHP8.5.11 -n"
+}

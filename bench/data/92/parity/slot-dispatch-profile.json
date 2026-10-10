@@ -1,0 +1,30 @@
+{
+  "runtime_before": "03dcdb3",
+  "runtime_after": "cc12b19",
+  "frozen_gate_runtime": "d8cef25",
+  "samples": 1289,
+  "lost": 0,
+  "event": "cpu-clock:u / 199Hz / DWARF8192",
+  "exclusive_percent": {
+    "vm_exec": 46.63,
+    "vm_run": 12.02,
+    "call_site_frame": 5.82,
+    "vm_binary": 1.78
+  },
+  "opcode_decode": {
+    "vm_exec_samples": 601,
+    "percent_of_vm_exec_approx": 6.5,
+    "percent_of_overall_approx": 3.0,
+    "addresses": [
+      "0x4144e9\u20130x41450b",
+      "0x415b95\u20130x415bc5"
+    ],
+    "limitation": "symbol-local annotation; skid/sampling, unresolved libc/depth limits; other Value-kind jump tables excluded"
+  },
+  "decision": "continue bounded direct-slot operations, not evidence to select native/JIT tier",
+  "warm_command": "python3 bench/data/92/parity/compare-warm-slot.py PHP JSON SLOT CAPACITY SAVE",
+  "gates": {
+    "workspace_tests_fmt_clippy": "pass",
+    "phpt": "2521 selected; 2 expected fail\u2192pass, 1 pass\u219230s timeout in GC stress. Individual 60s reruns pass; retain both maps and thresholds."
+  }
+}

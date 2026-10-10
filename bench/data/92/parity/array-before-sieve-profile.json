@@ -1,0 +1,26 @@
+{
+  "runtime": "6dbf71c",
+  "binary_sha256": "9e6d2b1484cbe0549b82eb36842fdbb1e2411198d5554c0ed9b809e89d4e78c2",
+  "argv": [
+    "bench/11-sieve.php",
+    "10",
+    "200000"
+  ],
+  "samples": 999,
+  "lost": 0,
+  "event": "cpu-clock:u",
+  "frequency_hz": 199,
+  "callgraph": "DWARF8192",
+  "exclusive_percent": {
+    "global_var_cell": 14.71,
+    "vm_exec": 12.01,
+    "vm_refresh": 7.31,
+    "vm_materialize": 6.91,
+    "assign_inner": 6.01,
+    "malloc": 3.1,
+    "cfree": 3.2,
+    "index_into_key": 1.5
+  },
+  "decision": "test bounded fresh scalar integer CV array reads to avoid AST bridge; no stable offset/inline layout claims",
+  "limits": "unresolved libc and callgraph depth; speed timing isolated from CPU sampling"
+}

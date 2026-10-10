@@ -11,7 +11,7 @@ use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, Param, Stmt};
 use crate::builtins;
 use crate::error::PhpError;
-use crate::value::{compare, identical, Cell, FxMap, PhpArray, PhpClass, Value};
+use crate::value::{compare, identical, ArrKey, Cell, FxMap, PhpArray, PhpClass, Value};
 
 use super::{Flow, Interp};
 
@@ -159,6 +159,12 @@ enum Op {
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
     Canonical(Box<Expr>),
+    DimCv {
+        array: u16,
+        key_slot: Option<u16>,
+        key_int: i64,
+        fallback: Box<Expr>,
+    },
     ThisProp {
         name: Rc<str>,
         site: usize,
@@ -199,6 +205,9 @@ enum Op {
     /// value, bound at op-exec — zend binds the left CV of a binary
     /// when the op runs, so `$a . ($a = 'B')` yields "BB" not "AB".
     BinaryCv(&'static str, u16),
+    AppendCv(u16),
+    /// Direct slot + immediate: no RHS value-stack push/pop or separate dispatch.
+    BinaryCvConst(&'static str, u16, Value),
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
@@ -394,7 +403,7 @@ impl Compiled {
         let canonical_binding = c.ops.iter().any(|op| {
             matches!(
                 op,
-                Op::Canonical(_) | Op::CanonicalStmt { .. } | Op::Foreach { .. }
+                Op::Canonical(_) | Op::DimCv { .. } | Op::CanonicalStmt { .. } | Op::Foreach { .. }
             )
         });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
@@ -947,8 +956,15 @@ impl Compiler {
                     // zend binds the lhs CV when the op runs — rhs
                     // first, then BinaryCv reads the slot's CURRENT
                     // value (`$a .= ($a = 'B')` → 'BB').
-                    self.expr(value)?;
-                    self.emit(Op::BinaryCv(bop, slot));
+                    if bop == "." {
+                        self.expr(value)?;
+                        self.emit(Op::AppendCv(slot));
+                    } else if let Some(rhs) = const_val(value) {
+                        self.emit(Op::BinaryCvConst(bop, slot, rhs));
+                    } else {
+                        self.expr(value)?;
+                        self.emit(Op::BinaryCv(bop, slot));
+                    }
                 }
                 self.emit(Op::Store(slot));
             }
@@ -1036,9 +1052,13 @@ impl Compiler {
                     // the rhs may have just re-assigned it.
                     if let Expr::Var(n) = Interp::unmark_rhs(l) {
                         if n != "this" && self.assigned.contains(n.as_str()) {
-                            self.expr(r)?;
                             let sl = self.slot(n);
-                            self.emit(Op::BinaryCv(op, sl));
+                            if let Some(rhs) = const_val(r) {
+                                self.emit(Op::BinaryCvConst(op, sl, rhs));
+                            } else {
+                                self.expr(r)?;
+                                self.emit(Op::BinaryCv(op, sl));
+                            }
                             return Some(());
                         }
                     }
@@ -1126,6 +1146,33 @@ impl Compiler {
                     cache: std::cell::RefCell::new(None),
                     fallback: Box::new(e.clone()),
                 });
+            }
+            Expr::Index {
+                e: base,
+                i: Some(key),
+            } => {
+                if let Expr::Var(array) = Interp::unmark_rhs(base) {
+                    if !Interp::is_superglobal(array) {
+                        let key = match Interp::unmark_rhs(key) {
+                            Expr::Var(n) if !Interp::is_superglobal(n) => {
+                                Some((Some(self.slot(n)), 0))
+                            }
+                            Expr::Int(i) => Some((None, *i)),
+                            _ => None,
+                        };
+                        if let Some((key_slot, key_int)) = key {
+                            let array = self.slot(array);
+                            self.emit(Op::DimCv {
+                                array,
+                                key_slot,
+                                key_int,
+                                fallback: Box::new(e.clone()),
+                            });
+                            return Some(());
+                        }
+                    }
+                }
+                self.emit(Op::Canonical(Box::new(e.clone())));
             }
             Expr::ArrayLit(_)
             | Expr::Index { .. }
@@ -1858,6 +1905,55 @@ impl<'a> Interp<'a> {
                     self.vm_refresh(comp, slots);
                     vs.push(result?);
                 }
+                Op::DimCv {
+                    array,
+                    key_slot,
+                    key_int,
+                    fallback,
+                } => {
+                    // ponytail: fresh current-table lookup, no offset cache. Global
+                    // views, non-scalars and missing/uninitialized keys stay AST;
+                    // generation-guarded offsets need a measured storage change.
+                    let plain = if comp.top_level && self.globals_arr.is_some() {
+                        None
+                    } else {
+                        let peek = |index: u16| match &slots[index as usize] {
+                            Slot::V(v) => Some(v.clone()),
+                            Slot::C(c) => Some(c.borrow().clone()),
+                            _ => None,
+                        };
+                        let key = match key_slot {
+                            Some(index) => match peek(*index) {
+                                Some(Value::Int(i)) => Some(i),
+                                _ => None,
+                            },
+                            None => Some(*key_int),
+                        };
+                        match (peek(*array), key) {
+                            (Some(Value::Array(a)), Some(k)) => {
+                                a.borrow().get(&ArrKey::Int(k)).filter(|v| {
+                                    matches!(
+                                        v,
+                                        Value::Null
+                                            | Value::Bool(_)
+                                            | Value::Int(_)
+                                            | Value::Float(_)
+                                            | Value::Str(_)
+                                    )
+                                })
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(value) = plain {
+                        vs.push(value);
+                    } else {
+                        self.vm_materialize(comp, slots);
+                        let result = self.eval(fallback);
+                        self.vm_refresh(comp, slots);
+                        vs.push(result?);
+                    }
+                }
                 Op::CanonicalStmt {
                     stmt,
                     decl_site,
@@ -1934,6 +2030,30 @@ impl<'a> Interp<'a> {
                     let lv = self.vm_slot_value(comp, slots, *sl)?;
                     let v = self.vm_binary(op, lv, rv)?;
                     vs.push(v);
+                }
+                Op::AppendCv(sl) => {
+                    let rhs = vs.pop().unwrap();
+                    let fast = match (&rhs, &mut slots[*sl as usize]) {
+                        (Value::Str(rhs), Slot::V(Value::Str(s)))
+                            if Rc::strong_count(&s.rc) == 1 =>
+                        {
+                            Some(self.append_unique_string(s, rhs))
+                        }
+                        (_, Slot::C(c)) => self.append_string_cell(c, &rhs),
+                        _ => None,
+                    };
+                    let value = match fast {
+                        Some(v) => v,
+                        None => {
+                            let lv = self.vm_slot_value(comp, slots, *sl)?;
+                            self.vm_binary(".", lv, rhs)?
+                        }
+                    };
+                    vs.push(value);
+                }
+                Op::BinaryCvConst(op, sl, rhs) => {
+                    let lv = self.vm_slot_value(comp, slots, *sl)?;
+                    vs.push(self.vm_binary(op, lv, rhs.clone())?);
                 }
                 Op::Boolify => {
                     let v = vs.pop().unwrap();
@@ -2185,7 +2305,7 @@ impl<'a> Interp<'a> {
         self.last_prop_ov = saved.prop_ov;
         self.dim_by_ref = saved.dim_by_ref;
         if let Some(e) = probe {
-            self.stack_pop();
+            self.stack_discard();
             return self.fail(e);
         }
         args.cells = std::mem::take(fa);
@@ -2614,6 +2734,108 @@ impl<'a> Interp<'a> {
 #[cfg(test)]
 mod tests {
     use super::Interp;
+
+    #[test]
+    fn scalar_dimension_slots_preserve_mutation_refs_views_and_fallbacks() {
+        let mut it = Interp::new("array-read.php");
+        let result = it.run_source(r#"<?php
+function read_at($a, $k) { return $a[$k]; }
+function read_zero($a) { return $a[0]; }
+$a = [3, 1, 2]; $copy = $a; echo read_at($a, 1), ' ', read_zero($a), "\n";
+$r =& $a[1]; $r = 9; echo read_at($a, 1), ' ', read_at($copy, 1), "\n";
+unset($a[0]); $a[0] = 8; echo read_zero($a), "\n";
+sort($a); echo read_zero($a), "\n";
+array_unshift($a, 7); echo read_zero($a), "\n";
+array_splice($a, 0, 1, [4, 5]); echo read_zero($a), ' ', read_at($a, 1), "\n";
+foreach ($a as &$v) $v += 1; unset($v); echo read_zero($a), "\n";
+foreach ([null, false, 1, 1.5, "x\0z"] as $v) { $x=read_zero([$v]); echo gettype($x), ':', is_string($x) ? bin2hex($x) : json_encode($x), "\n"; }
+echo read_at(['k'=>'str', 2=>'num'], 'k'), ' ', read_at([2=>'num'], '2'), "\n";
+$o = new stdClass; $o->x=6; echo read_at([$o], 0)->x, ' ', read_at([[2]], 0)[0], "\n";
+class ReadAccess implements ArrayAccess {
+ function offsetExists(mixed $k): bool { return true; }
+ function offsetGet(mixed $k): mixed { echo "get:$k\n"; return 12; }
+ function offsetSet(mixed $k, mixed $v): void {}
+ function offsetUnset(mixed $k): void {}
+}
+echo read_at(new ReadAccess, 3), "\n";
+set_error_handler(function($errno, $message) { echo "warning:$message\n"; });
+var_dump(read_at([], 7));
+function missing_key($a) { return $a[$unknown]; }
+var_dump(missing_key([0=>2]));
+restore_error_handler();
+echo read_at(k: 0, a: [11]), "\n";
+$g=[1]; for ($i=0; $i<2; $i++) { echo $g[0], "\n"; $GLOBALS['g']=[5]; }
+echo $GLOBALS['g'][0], "\n";
+"#);
+        assert_eq!(
+            String::from_utf8_lossy(&it.out),
+            r#"1 3
+9 1
+8
+2
+7
+4 5
+5
+NULL:null
+boolean:false
+integer:1
+double:1.5
+string:78007a
+str num
+6 2
+get:3
+12
+warning:Undefined array key 7
+NULL
+warning:Undefined variable $unknown
+warning:Using null as an array offset is deprecated, use an empty string instead
+warning:Undefined array key ""
+NULL
+11
+1
+5
+5
+"#
+        );
+        assert_eq!(it.err_buf, "");
+        assert_eq!(result.exit_code, 0);
+        for name in ["read_at", "read_zero"] {
+            let decl = it.functions[name].clone();
+            let compiled = it.vm_compiled(&decl).unwrap();
+            assert!(compiled.needs_bind && !compiled.value_abi);
+            assert!(compiled
+                .ops
+                .iter()
+                .any(|op| matches!(op, super::Op::DimCv { .. })));
+        }
+    }
+
+    #[test]
+    fn canonical_frames_reuse_boxes_and_release_php_owners() {
+        let mut it = Interp::new("pool.php");
+        let result = it.run_source(
+            r#"<?php
+            class Receiver { function run($n = 1) { return $n; } }
+            function named($n, $m = 2) { return $n + $m; }
+            for ($i = 0; $i < 200; $i++) { named(m: 3, n: $i); }
+            $o = new Receiver; $w = WeakReference::create($o);
+            $o->run(n: 4); unset($o); var_dump($w->get());
+        "#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.out, b"NULL\n");
+        assert!(!it.vm_frame_pool.is_empty());
+        assert!(it.vm_frame_pool.iter().all(|f| f.vars.is_empty()
+            && f.args.is_empty()
+            && f.value_args.is_empty()
+            && f.this_obj.is_none()
+            && f.closure_rc.is_none()));
+        let frame = it.frame_new("first");
+        let ptr = &*frame as *const super::super::Frame;
+        it.frame_recycle(frame);
+        let frame = it.frame_new("second");
+        assert_eq!(&*frame as *const super::super::Frame, ptr);
+    }
 
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {

@@ -1,0 +1,18 @@
+{
+  "timing_runtime": "15f5d865c8ba43e5e5328117d2c50d2aeec47599",
+  "timing_binary_sha256": "93cb182f811ea76936c1a762848d1809769c2adc059549d36a005f4c620f43ef",
+  "final_gate_runtime": "6dbf71c",
+  "final_gate_binary_sha256": "9e6d2b1484cbe0549b82eb36842fdbb1e2411198d5554c0ed9b809e89d4e78c2",
+  "review_fix": "c307a7c trailing JSON escape rejection; valid-workload timings retain15f5",
+  "build": "rustc1.99.0; cargo clean --offline -p phpun-core --release then cargo build --offline --release -p phpun; LTO/codegen-units1",
+  "stale_artifact": "initial copy was byte-identical to slot-final; quarantined and never used in published timings. Correct copy verified via hash and nm append helpers",
+  "layout": {
+    "Value": 16,
+    "Cell": 8,
+    "TraceFrame": 160
+  },
+  "layout_command": "cargo run --offline -p phpun-core --example profile-lifecycle -- 1; layout only, debug timings excluded",
+  "oracle": "26 VM/probe cases and19 profile workloads exact exit/stdout/stderr == PHP8.5.11 -n",
+  "workspace_tests_fmt_clippy": "pass21runtime checks plus4core unit tests",
+  "storage_ceiling": "one Rc shell allocation per append to invalidate weak handles; capacity payload reused, shared/typed-reference cases canonical; no packed inline array storage"
+}
