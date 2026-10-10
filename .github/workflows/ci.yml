@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install PHP 8.5 reference
+      - name: Install distribution PHP smoke reference
         run: |
           sudo apt-get update
           sudo apt-get install -y php-cli
@@ -36,6 +36,7 @@ jobs:
       - name: Vendor php-src PHPT tests
         run: ./scripts/fetch-php-tests.sh php-8.5.11
       - run: cargo build --release
+      - run: python3 bench/check-profile-workloads.py
       - name: PHPT compatibility report (tests/lang)
         run: |
           ./target/release/phpun phpt vendor/php-tests/tests/lang \
