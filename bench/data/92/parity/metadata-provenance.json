@@ -1,0 +1,15 @@
+{
+  "before_runtime": "e84754183c9baebcde37c6432c8d2f56cfdf2751",
+  "after_source": "c5e7eca6c860b0ab22431bd3f35daf3f48ad51ff",
+  "runtime_change": "6afc6bd",
+  "before_sha256": "76fd8bb184d7853ddfe972b311feb691a9390d8a1c949b05441d49ddb6db9400",
+  "after_sha256": "5f3de127ff71092ae4a1e776f72dd282ae5302b5bc997b6696c8a1461edae89b",
+  "build": "each core force-cleaned; rustc1.99.0 release/LTO/codegen-units1",
+  "verification": {
+    "PHPT": "619 property/class/visibility/type/ref tests, every status unchanged:551pass63fail5unsupported0crash0timeout",
+    "workspace": "5core+22runtime+19format checks, clippy/fmt pass",
+    "oracle": "21 VM fixture scripts + metadata probe, exact exit/stdout/stderr;19 existing workload checks"
+  },
+  "timing": "seven alternating profiler-off PHP-gated pairs; first runner stopped at nonexistent app path after five valid benchmarks; no invalid/error case timed; subsequent app data separate",
+  "copy": "out-of-line memcpy/memmove lower bound only, separate instrumented run; no CPU share inferred from byte share"
+}

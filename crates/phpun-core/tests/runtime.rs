@@ -920,3 +920,80 @@ bool(false)
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn property_hook_metadata_preserves_private_scopes_and_inherited_hooks() {
+    let (out, err, code) = eval(
+        "metadata.php",
+        r#"<?php
+class PlainMetadata {
+    public int $p = 3;
+    private int $q = 4;
+    function sum() { return $this->p + $this->q; }
+}
+class ScopeParent {
+    private int $p = 10;
+    function parentValue() { return $this->p; }
+}
+class ScopeChild extends ScopeParent {
+    private int $p = 20;
+    function childValue() { return $this->p; }
+}
+class ParentHook {
+    public int $value = 2 {
+        get { echo "get\n"; return $this->value; }
+        set { echo "set:$value\n"; $this->value = $value; }
+    }
+}
+class InheritedHook extends ParentHook { public int $value = 5; }
+class OverrideHook extends ParentHook {
+    public int $value = 7 { get { echo "override\n"; return $this->value + 1; } }
+}
+class PrivateHook {
+    private int $p = 2 { get { echo "private-get\n"; return $this->p; } }
+    function parentValue() { return $this->p; }
+}
+class PrivateShadow extends PrivateHook {
+    private int $p = 9;
+    function childValue() { return $this->p; }
+}
+$o = new PlainMetadata;
+for ($i = 0; $i < 3; $i++) echo $o->sum(), "\n";
+$r =& $o->p; $r = 8; echo $o->sum(), "\n";
+try { $r = 'bad'; } catch (TypeError $e) { echo "typed\n"; }
+try { echo $o->q; } catch (Error $e) { echo "private\n"; }
+$w = WeakReference::create($o); unset($r, $o); var_dump($w->get());
+$o = new ScopeChild; echo $o->parentValue(), ' ', $o->childValue(), "\n";
+$o = new InheritedHook; echo $o->value, "\n"; $o->value = 11; echo $o->value, "\n";
+$o = new OverrideHook; echo $o->value, "\n"; $o->value = 13; echo $o->value, "\n";
+$o = new PrivateShadow; echo $o->parentValue(), ' ', $o->childValue(), "\n";
+"#,
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(err, "");
+    assert_eq!(
+        out,
+        r#"7
+7
+7
+12
+typed
+private
+NULL
+10 20
+get
+5
+set:11
+get
+11
+override
+8
+set:13
+override
+14
+private-get
+2 9
+"#
+    );
+}
