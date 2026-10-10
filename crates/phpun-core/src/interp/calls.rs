@@ -2735,8 +2735,8 @@ impl<'a> Interp<'a> {
                     site_file.clone()
                 },
                 line: site_line,
-                args: targs.clone(),
-                named_args: targs_named.clone(),
+                args: Vec::new(),
+                named_args: Vec::new(),
                 internal: false,
                 visible: true,
                 named_dispatch: false,
@@ -2749,14 +2749,16 @@ impl<'a> Interp<'a> {
                 ty: String::new(),
                 file: site_file,
                 line: site_line,
-                args: targs,
-                named_args: targs_named,
+                args: Vec::new(),
+                named_args: Vec::new(),
                 internal: false,
                 visible: true,
                 named_dispatch: false,
                 gen_resume: false,
                 gen_body: false,
             });
+        fr.args = targs;
+        fr.named_args = targs_named;
         // Zend runs FilterIterator's accept loop in internal C — its
         // `fetch` frame never reaches a PHP trace.
         if fr.function.eq_ignore_ascii_case("fetch")

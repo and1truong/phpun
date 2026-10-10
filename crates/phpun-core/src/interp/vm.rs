@@ -809,8 +809,10 @@ impl<'a> Interp<'a> {
         comp: &Compiled,
         mut args: super::CallArgs,
     ) -> Result<Value, PhpError> {
-        PROF[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let __p = pnow!();
+        if __p.is_some() {
+            PROF[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let saved = VmSaved {
             line: self.cur_line,
             prop_ov: self.last_prop_ov.take(),
@@ -1600,7 +1602,8 @@ impl<'a> Interp<'a> {
 
     /// ponytail: dev-only phase profiler — PHPUN_CALLPROF=1 accumulates
     /// ns per call phase; printed at process exit (registered once).
-    /// Instant::now skews absolute numbers; proportions stay valid.
+    /// Clock reads skew timings; exec includes nested calls. Report totals,
+    /// then normalize by calls; benchmark speed with profiling disabled.
     fn callprof_on() -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
         static ON: AtomicBool = AtomicBool::new(false);
@@ -1613,7 +1616,7 @@ impl<'a> Interp<'a> {
             extern "C" fn dump() {
                 use std::sync::atomic::Ordering;
                 eprintln!(
-                    "callprof: pre={}ns cells={}ns site={}ns bind={}ns exec={}ns post={}ns calls={}",
+                    "callprof: pre={}ns cells={}ns site={}ns bind={}ns exec={}ns post={}ns calls={}; unit=total_ns exec=inclusive",
                     PROF[0].load(Ordering::Relaxed),
                     PROF[1].load(Ordering::Relaxed),
                     PROF[2].load(Ordering::Relaxed),
