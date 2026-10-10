@@ -1,10 +1,15 @@
-import os, json, pathlib, platform, hashlib, subprocess, statistics, math, sys
-sys.path.insert(0, '/workspace/phpun/bench')
+import os, json, pathlib, platform, hashlib, subprocess, statistics, math, sys, argparse
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 from measure import capture
 assert not any(os.environ.get(k) is not None for k in ['PHPUN_ALLOC','PHPUN_CALLPROF','PHPUN_VMPROF'])
-bins=['/workspace/php85','/workspace/parity92/main','/workspace/parity92/185-concat']; cmds=[[bins[0],'-n'],[bins[1]],[bins[2]]]
-report={'metric':'cold CLI parse+execution; 7 rotating-order reps; profilers off','host':platform.platform(),'main_runtime':'5b227c05c5521cbb0f8ecd800d38ed8ca0d7b952','stack_source':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'dirty':bool(subprocess.check_output(['git','status','--porcelain'])),'build':'rust1.99.0 release LTO=true codegen-units=1','php_config':{'args':['-n'],'settings':json.loads(subprocess.check_output([bins[0],'-n','-r','echo json_encode(["version"=>PHP_VERSION,"opcache_loaded"=>extension_loaded("Zend OPcache"),"jit"=>ini_get("opcache.jit"),"extensions"=>get_loaded_extensions()]);']))},'sha256':{b:hashlib.sha256(pathlib.Path(b).read_bytes()).hexdigest() for b in bins},'cases':[]}
-save=pathlib.Path('/workspace/parity92/main-stack-php.json')
+parser = argparse.ArgumentParser(description='Native PHP/main/stack cold CLI comparison; run from repository root.')
+for option in ['php', 'main', 'stack', 'main-runtime', 'stack-runtime', 'save']:
+    parser.add_argument('--' + option, required=True)
+args = parser.parse_args()
+bins=[str(pathlib.Path(p).resolve()) for p in [args.php, args.main, args.stack]]
+cmds=[[bins[0],'-n'],[bins[1]],[bins[2]]]
+report={'metric':'cold CLI parse+execution; 7 rotating-order reps; profilers off','host':platform.platform(),'main_runtime':args.main_runtime,'stack_runtime':args.stack_runtime,'stack_source':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'dirty':bool(subprocess.check_output(['git','status','--porcelain'])),'build':'rust1.99.0 release LTO=true codegen-units=1','php_config':{'args':['-n'],'settings':json.loads(subprocess.check_output([bins[0],'-n','-r','echo json_encode(["version"=>PHP_VERSION,"opcache_loaded"=>extension_loaded("Zend OPcache"),"jit"=>ini_get("opcache.jit"),"extensions"=>get_loaded_extensions()]);']))},'sha256':{b:hashlib.sha256(pathlib.Path(b).read_bytes()).hexdigest() for b in bins},'cases':[]}
+save=pathlib.Path(args.save)
 for case in [[str(p)] for p in sorted(pathlib.Path('bench').glob('[0-9]*.php'))]+[['bench/app/cli.php','100','20'],['examples/composer/run.php']]:
  samples=[[],[],[]];oracle=capture(cmds[0]+case,300);assert oracle[1]==0,(case,oracle[1:])
  for rep in range(7):
