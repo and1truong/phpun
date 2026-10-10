@@ -47,14 +47,21 @@ pub(crate) fn dispatch(
             } else {
                 512
             };
+            // zend resets last_json_error at body start UNLESS THROW is
+            // effective (THROW without PARTIAL) — under it the global is
+            // never touched, not even on success.
+            let throw = flags & F_THROW != 0 && flags & F_PARTIAL == 0;
+            if !throw {
+                it.last_json_error = 0;
+            }
             let (s, code) = json_encode(it, &v, flags, depth)?;
-            // THROW wins over output; json_last_error stays untouched.
-            // PARTIAL overrides THROW (zend treats them as incompatible).
-            if code != 0 && flags & F_THROW != 0 && flags & F_PARTIAL == 0 {
+            if code != 0 && throw {
                 let e = it.exception_code("JsonException", json_err_msg(code), code);
                 return Err(it.throw_value(e));
             }
-            it.last_json_error = code;
+            if !throw {
+                it.last_json_error = code;
+            }
             if code != 0 && flags & F_PARTIAL == 0 {
                 Value::Bool(false)
             } else {
@@ -85,6 +92,22 @@ pub(crate) fn dispatch(
             } else {
                 512
             };
+            let flags = arg(args, 3).to_int();
+            // zend treats an empty document as an immediate syntax
+            // error, checked before the body start (and before depth).
+            if s.is_empty() {
+                if flags & F_THROW != 0 {
+                    let e = it.exception_code("JsonException", json_err_msg(J_SYNTAX), J_SYNTAX);
+                    return Err(it.throw_value(e));
+                }
+                it.last_json_error = J_SYNTAX;
+                return Ok(Some(Value::Null));
+            }
+            // Post-ZPP body start: reset unless THROW — then even the
+            // depth ValueErrors below leave err=0 (not the stale code).
+            if flags & F_THROW == 0 {
+                it.last_json_error = 0;
+            }
             if depth < 1 {
                 let e = it.exception(
                     "ValueError",
@@ -99,12 +122,8 @@ pub(crate) fn dispatch(
                 );
                 return Err(it.throw_value(e));
             }
-            let flags = arg(args, 3).to_int();
-            match json_decode(it, s, assoc, depth, flags, 0) {
-                Ok(v) => {
-                    it.last_json_error = 0;
-                    v
-                }
+            match json_decode(it, s, assoc, depth, flags) {
+                Ok(v) => v,
                 Err(code) => {
                     if flags & F_THROW != 0 {
                         let e = it.exception_code("JsonException", json_err_msg(code), code);
@@ -132,6 +151,22 @@ pub(crate) fn dispatch(
             } else {
                 512
             };
+            let flags = arg(args, 2).to_int();
+            // zend whitelists validate's flags BEFORE the body start — a
+            // bad flag leaves the stale code; depth errors after it see 0.
+            if flags & !F_UTF8_IGNORE != 0 {
+                let e = it.exception(
+                    "ValueError",
+                    "json_validate(): Argument #3 ($flags) must be a valid flag (allowed flags: JSON_INVALID_UTF8_IGNORE)",
+                );
+                return Err(it.throw_value(e));
+            }
+            // Empty document short-circuits to syntax error before depth.
+            if s.is_empty() {
+                it.last_json_error = J_SYNTAX;
+                return Ok(Some(Value::Bool(false)));
+            }
+            it.last_json_error = 0;
             if depth < 1 {
                 let e = it.exception(
                     "ValueError",
@@ -146,8 +181,7 @@ pub(crate) fn dispatch(
                 );
                 return Err(it.throw_value(e));
             }
-            let flags = arg(args, 2).to_int();
-            match json_decode(it, s, true, depth, flags, 0) {
+            match json_decode(it, s, true, depth, flags) {
                 Ok(_) => {
                     it.last_json_error = 0;
                     Value::Bool(true)
@@ -343,8 +377,17 @@ fn json_enc(
         }
         Value::Array(a) => {
             let lvl = lvl + 1;
-            if lvl > cx.max || lvl * LEVEL_BYTES > cx.lim {
+            if lvl * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH.into());
+            }
+            if lvl > cx.max {
+                // zend ignores the depth cap under PARTIAL — encodes the
+                // whole shape and still records err=1.
+                if cx.esc.flags & F_PARTIAL != 0 {
+                    cx.err = J_DEPTH;
+                } else {
+                    return Err(J_DEPTH.into());
+                }
             }
             let key = Rc::as_ptr(a) as usize;
             if it.json_enc_stack.contains(&key) {
@@ -357,8 +400,15 @@ fn json_enc(
         }
         Value::Object(o) => {
             let lvl = lvl + 1;
-            if lvl > cx.max || lvl * LEVEL_BYTES > cx.lim {
+            if lvl * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH.into());
+            }
+            if lvl > cx.max {
+                if cx.esc.flags & F_PARTIAL != 0 {
+                    cx.err = J_DEPTH;
+                } else {
+                    return Err(J_DEPTH.into());
+                }
             }
             let key = Rc::as_ptr(o) as usize;
             if it.json_enc_stack.contains(&key) {
@@ -712,26 +762,10 @@ fn json_decode(
     assoc: bool,
     depth: i64,
     flags: i64,
-    lim: i64,
 ) -> Result<Value, i64> {
-    let lim = if lim > 0 {
-        lim
-    } else {
-        let ini = it.ini_bytes("zend.max_allowed_stack_size");
-        if ini > 0 {
-            ini
-        } else {
-            4 << 20
-        }
-    };
-    let cx = Dec {
-        assoc,
-        flags,
-        depth,
-        lim,
-    };
+    let cx = Dec { assoc, flags };
     let mut pos = 0;
-    let v = json_value(it, s, &mut pos, &cx, depth)?;
+    let v = json_value(it, s, &mut pos, &cx, depth, 0)?;
     json_ws(s, &mut pos)?;
     match s.get(pos) {
         // ws already rejected <0x20 and broken utf8 in the tail.
@@ -760,14 +794,21 @@ fn json_ws(b: &[u8], pos: &mut usize) -> Result<(), i64> {
     Ok(())
 }
 
-/// Per-call decode context — assoc/flags/depth are fixed for the whole
-/// document; lim is the native-stack budget in bytes.
+/// Per-call decode context — assoc/flags are fixed for the document.
 struct Dec {
     assoc: bool,
     flags: i64,
-    depth: i64,
-    lim: i64,
 }
+
+/// zend's decoder stack budget, reverse-engineered from the oracle:
+/// [`[` costs 2499 units, `{` 4998; a pure `[[[` chain trips at nest
+/// 4999 (err4), `{"a":{"a":` at 2500, strict `[{"a":` alternation at
+/// 1667. ponytail: the real bound is zend's C-stack measurement whose
+/// per-frame cost varies by parser path — exotic mixes can land a few
+/// percent off; uniform and alternating patterns are exact.
+const DEC_STACK: i64 = 4998 * 2499;
+const DEC_ARR_COST: i64 = 2499;
+const DEC_OBJ_COST: i64 = 4998;
 
 fn json_value(
     it: &mut Interp,
@@ -775,6 +816,7 @@ fn json_value(
     pos: &mut usize,
     cx: &Dec,
     rem: i64,
+    stk: i64,
 ) -> Result<Value, i64> {
     json_ws(b, pos)?;
     match b.get(*pos) {
@@ -789,8 +831,12 @@ fn json_value(
             *pos += 1;
             // zend counts one extra level past the deepest container.
             let rem = rem - 1;
-            if rem == 0 || (cx.depth - rem) * LEVEL_BYTES > cx.lim {
+            let stk = stk + DEC_ARR_COST;
+            if rem == 0 {
                 return Err(J_DEPTH);
+            }
+            if stk > DEC_STACK {
+                return Err(J_SYNTAX);
             }
             let mut a = PhpArray::new();
             json_ws(b, pos)?;
@@ -804,7 +850,7 @@ fn json_value(
                 return Err(J_STATE);
             }
             loop {
-                let v = json_value(it, b, pos, cx, rem)?;
+                let v = json_value(it, b, pos, cx, rem, stk)?;
                 a.push(v);
                 json_ws(b, pos)?;
                 match b.get(*pos) {
@@ -822,8 +868,12 @@ fn json_value(
         Some(b'{') => {
             *pos += 1;
             let rem = rem - 1;
-            if rem == 0 || (cx.depth - rem) * LEVEL_BYTES > cx.lim {
+            let stk = stk + DEC_OBJ_COST;
+            if rem == 0 {
                 return Err(J_DEPTH);
+            }
+            if stk > DEC_STACK {
+                return Err(J_SYNTAX);
             }
             json_ws(b, pos)?;
             if b.get(*pos) == Some(&b'}') {
@@ -851,7 +901,7 @@ fn json_value(
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let v = json_value(it, b, pos, cx, rem)?;
+                    let v = json_value(it, b, pos, cx, rem, stk)?;
                     a.set(k, v);
                     json_ws(b, pos)?;
                     match b.get(*pos) {
@@ -882,7 +932,7 @@ fn json_value(
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let v = json_value(it, b, pos, cx, rem)?;
+                    let v = json_value(it, b, pos, cx, rem, stk)?;
                     // \0-prefixed names are zend's private-prop mangling
                     // form — illegal as a decoded member (bug68546).
                     if k.starts_with('\0') {
