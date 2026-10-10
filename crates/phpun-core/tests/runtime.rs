@@ -824,3 +824,44 @@ user-123@example.com c3a9f09f9880 6100620a [1,true,null]
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn slot_immediates_preserve_numeric_fallbacks_errors_and_evaluation_order() {
+    let (out, err, code) = eval(
+        "slot.php",
+        r#"<?php
+function immediate($n) { return [$n + 1, $n < 2, $n * -3, $n === null, $n == false, $n . 'x']; }
+foreach ([0, 1, 3, 2.5, '4', null] as $n) echo json_encode(immediate($n)), "\n";
+function loops($n) { $s = 0; for ($i = 0; $i < $n; $i++) { if ($i % 2) continue; $s += 3; if ($s > 10) break; } return $s; }
+echo loops(20), "\n";
+function overflow($n) { return $n + 1; }
+var_dump(gettype(overflow(PHP_INT_MAX)));
+function zero($n) { return $n / 0; }
+try { zero(3); } catch (DivisionByZeroError $e) { echo $e->getMessage(), ' ', $e->getTrace()[0]['function'], "\n"; }
+function changed($n) { $n += 3; return $n; }
+echo changed(4), "\n";
+function order($n) { return $n + ($n = 5); }
+echo order(1), "\n";
+$x = 'a'; $x .= 'b'; $alias = $x; $x .= ($x = 'c'); echo "$x $alias\n";
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"[1,true,0,false,true,"0x"]
+[2,true,-3,false,false,"1x"]
+[4,false,-9,false,false,"3x"]
+[3.5,false,-7.5,false,false,"2.5x"]
+[5,false,-12,false,false,"4x"]
+[1,true,0,true,true,"x"]
+12
+string(6) "double"
+Division by zero zero
+7
+10
+cc ab
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
