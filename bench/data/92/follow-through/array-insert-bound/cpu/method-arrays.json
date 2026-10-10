@@ -1,0 +1,74 @@
+{
+  "runtime": "55d8646",
+  "argv": [
+    "bench/30-arrays.php",
+    "100"
+  ],
+  "event": "cpu-clock:u",
+  "frequency_hz": 199,
+  "call_graph": "dwarf,8192",
+  "samples": 1520,
+  "lost_samples": 0,
+  "exclusive_symbols": [
+    {
+      "exclusive_pct": 81.25,
+      "symbol": "<phpun_core::value::PhpArray>::pos_of"
+    },
+    {
+      "exclusive_pct": 2.24,
+      "symbol": "<phpun_core::interp::Interp>::vm_run"
+    },
+    {
+      "exclusive_pct": 1.84,
+      "symbol": "<phpun_core::interp::Interp>::vm_exec"
+    },
+    {
+      "exclusive_pct": 1.64,
+      "symbol": "phpun_core::builtins::array::zend_sort_user::{closure#0}"
+    },
+    {
+      "exclusive_pct": 1.05,
+      "symbol": "<phpun_core::interp::Interp>::call_value"
+    },
+    {
+      "exclusive_pct": 1.05,
+      "symbol": "0x000000000017bacf"
+    },
+    {
+      "exclusive_pct": 0.72,
+      "symbol": "malloc"
+    },
+    {
+      "exclusive_pct": 0.66,
+      "symbol": "0x000000000017bbcd"
+    },
+    {
+      "exclusive_pct": 0.53,
+      "symbol": "<phpun_core::interp::Interp>::assign_inner"
+    },
+    {
+      "exclusive_pct": 0.53,
+      "symbol": "<phpun_core::interp::Interp>::call_site_frame"
+    },
+    {
+      "exclusive_pct": 0.53,
+      "symbol": "cfree"
+    }
+  ],
+  "dispatch_buckets": {
+    "samples": 1520,
+    "counts": {
+      "VM-nearest-dispatch": 841,
+      "AST-nearest-dispatch": 658,
+      "other-or-incomplete": 21
+    },
+    "estimated_cpu_ns": 7638190000,
+    "sample_weight_pct": {
+      "VM-nearest-dispatch": 55.328947368421055,
+      "AST-nearest-dispatch": 43.28947368421053,
+      "other-or-incomplete": 1.381578947368421
+    }
+  },
+  "stack_text_sha256": "b501885c50c5f9a85cb0e48d717ba757f8b3f47e3fb2d81a08cb8afda2cb1802",
+  "perf_data_sha256": "a516e40f59d63c7836b3e8d0d52cf30cab5e932a0c4b8aa1e7349745909f384e"
+}

@@ -118,3 +118,73 @@ GC/exception/backtrace gate keeps all parent statuses at the same 60s cutoff:
 
 Raw samples/ranges/hashes and diagnostics:
 [data/92/follow-through/method-properties](data/92/follow-through/method-properties).
+
+## Integer insert absence proof — runtime bbbd74d vs 55d8646
+
+A working `perf cpu-clock:u` collector found **81.25%** of sampled userspace CPU
+in `PhpArray::pos_of` for arrays at 100,000 elements. Both array-map result inserts
+and dimension binding searched a growing table for keys that were provably new.
+Use the existing append cursor's upper bound before lookup; move bind_cell's
+cursor update after lookup so it can use the same proof. Negative/wrapped cursors
+retain searching. Integer gaps, existing keys, tombstones, references and CoW
+keep their handlers. Raw key-layout callers were inspected, including the common
+sort renumber/cursor tail and clones; no new index/cache is introduced.
+
+Seven alternating unprofiled release repetitions, PHP 8.5.11 exit/stdout/stderr
+gates, cold CLI median [min,max] ms:
+
+| Workload | Before | After | Change |
+|---|---:|---:|---:|
+| `bench/30-arrays.php` | 457.571 [447.887, 539.102] | 225.909 [208.967, 239.634] | -50.6% |
+| `bench/profile/arrays.php map 20000` | 279.855 [268.544, 306.617] | 35.411 [34.131, 41.208] | -87.3% |
+| `bench/profile/arrays.php filter 20000` | 163.538 [156.948, 187.415] | 36.006 [33.922, 47.304] | -78.0% |
+| `bench/30-arrays.php 100` | 7502.984 [7175.843, 7673.136] | 1305.549 [1212.810, 1380.953] | -82.6% |
+| `bench/40-objects.php` | 476.242 [450.998, 495.312] | 429.748 [415.155, 461.873] | -9.8% |
+| `examples/composer/run.php` | 6.780 [6.127, 7.178] | 6.948 [6.704, 7.563] | +2.5% |
+
+This removes quadratic integer insert search in the measured map/filter paths.
+It does not optimize missing string-key search. Allocation requests are unchanged:
+arrays 2,769,890, objects 6,825,045; the CPU improvement comes from avoided work,
+not fewer allocations. Workspace tests/clippy and all VM oracle fixtures pass.
+987 array/foreach/ArrayAccess/argument/named-parameter PHPT statuses are identical:
+694 pass, 277 existing fail, 7 skip, 5 unsupported, **4 pre-existing crashes**,
+no new failures/crashes. A new fixture covers sparse keys, aliases/rebinding,
+unset/reinsert, CoW, map/filter, negative keys, prepend, sort cursor reset and a
+large integer key. Existing crashes are not claimed fixed.
+
+### CPU sampling restored
+
+Linux perf 6.1.176 was extracted in the workspace with its shared libraries;
+no host configuration or repository dependency was changed. Hardware cycles are
+unsupported here; userspace **software cpu-clock** is available. The previous
+gprofng timer-warning experiments remain rejected. Commands:
+
+```sh
+perf record -e cpu-clock:u -F 199 --call-graph dwarf,8192 -o run.data -- phpun SCRIPT ARGS
+perf report --stdio --no-children --call-graph none --sort symbol -i run.data
+perf script --fields comm,pid,time,event,period,ip,sym,dso -i run.data > run.stacks
+python3 bench/profile/cpu-stacks.py --input run.stacks
+python3 bench/profile/cpu-stacks.py --self-check
+```
+
+Before: arrays (100k), **1,520 samples, zero lost**; observed exclusive top three:
+`PhpArray::pos_of` 81.25%, `Interp::vm_run` 2.24%, `Interp::vm_exec` 1.84%.
+Objects (50x5000), **1,093 samples, zero lost**: `StrSearcher::new` 8.78%,
+`PhpArray::pos_of` 6.40%, `cfree` 5.95%. After the bound fix, the same 100k arrays
+case completes much sooner and supplies only **260 samples**: observed top three
+`vm_run` 13.08%, sort callback 10.00%, `vm_exec` 8.46%; lower sample count limits
+confidence in close ranks. These are sampled percentages, not wall-time speedups.
+
+Nearest-dispatch stack buckets (weighted sample periods): before arrays
+VM 55.3%, AST 43.3%, other/incomplete 1.4%; objects VM 30.6%, AST 49.0%,
+other/incomplete 20.3%; after arrays VM 77.3%, AST 16.9%, other/incomplete 5.8%.
+The **nearest** VM/eval/exec frame wins: an outer AST caller must not classify
+its inner VM callee as AST time. VM buckets include shared runtime/builtin work;
+they are not proof that all operations execute native bytecode. DWARF stack size
+is capped at 8192 bytes, release inlining/stripped libraries limit attribution,
+and small differences/rank order require more samples. Raw text stacks are
+archived compressed, together with CPU symbol tables, sample counts, hashes and
+bucket summaries. The new classifier's self-check tests overlapping caller/callee
+stacks and keeps other/incomplete samples explicit.
+
+Raw data: [data/92/follow-through/array-insert-bound](data/92/follow-through/array-insert-bound).

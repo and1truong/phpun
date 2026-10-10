@@ -1,0 +1,35 @@
+{
+  "baseline_runtime": "55d8646",
+  "candidate_runtime": "bbbd74d9b65d45033c4f3d831df62d7bdabb2628",
+  "before": {
+    "total": 987,
+    "passed": 694,
+    "failed": 277,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 7,
+    "unsupported": 5,
+    "borked": 0,
+    "crashed": 4,
+    "timed_out": 0,
+    "applicable": 975,
+    "compatibility_pct": 71.18
+  },
+  "after": {
+    "total": 987,
+    "passed": 694,
+    "failed": 277,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 7,
+    "unsupported": 5,
+    "borked": 0,
+    "crashed": 4,
+    "timed_out": 0,
+    "applicable": 975,
+    "compatibility_pct": 71.18
+  },
+  "status_changes": [],
+  "jobs": 4,
+  "timeout": 30
+}
