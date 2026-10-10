@@ -962,10 +962,10 @@ impl<'a> Interp<'a> {
                     self.stack
                         .last()
                         .map(|f| {
-                            if f.fn_name.is_empty() || f.fn_name == "{main}" {
+                            if f.fn_name.is_empty() || f.fn_name.as_ref() == "{main}" {
                                 String::new()
                             } else if f.fn_name.starts_with("{closure:") {
-                                f.fn_name.clone()
+                                f.fn_name.to_string()
                             } else {
                                 match f.trait_origin.clone().or_else(|| {
                                     f.decl_class
@@ -974,7 +974,7 @@ impl<'a> Interp<'a> {
                                         .map(|c| c.name().to_string())
                                 }) {
                                     Some(o) => format!("{}::{}", o, f.fn_name),
-                                    None => f.fn_name.clone(),
+                                    None => f.fn_name.to_string(),
                                 }
                             }
                         })
@@ -994,7 +994,7 @@ impl<'a> Interp<'a> {
                 if decl.file.is_empty() {
                     decl.file = cfile;
                 }
-                decl.name = fname.clone();
+                decl.name = fname.clone().into();
                 // A closure declared lexically inside a trait method
                 // keeps the trait as its __TRAIT__ origin; the decl is
                 // cloned per instance so the creating context stamps it
@@ -1317,10 +1317,10 @@ impl<'a> Interp<'a> {
             .or_else(|| {
                 self.stack
                     .last()
-                    .map(|f| f.file.clone())
+                    .map(|f| f.file.to_string())
                     .filter(|s| !s.is_empty())
             })
-            .unwrap_or_else(|| self.cur_file.clone());
+            .unwrap_or_else(|| self.cur_file.to_string());
         match m {
             MagicConst::Line => Value::Int(self.cur_line as i64),
             MagicConst::File => Value::str(decl_file.clone()),
@@ -1343,7 +1343,7 @@ impl<'a> Interp<'a> {
             MagicConst::Function => Value::str(
                 self.stack
                     .last()
-                    .map(|f| f.fn_name.clone())
+                    .map(|f| f.fn_name.to_string())
                     .unwrap_or_default(),
             ),
             MagicConst::Method => {
@@ -1358,7 +1358,7 @@ impl<'a> Interp<'a> {
                     }
                     // Inside a closure __METHOD__ is the closure's Zend
                     // name (`{closure:C::m():L}` — closure_033).
-                    Some(f) if f.fn_name.starts_with("{closure:") => Value::str(f.fn_name.clone()),
+                    Some(f) if f.fn_name.starts_with("{closure:") => Value::str(f.fn_name.as_ref()),
                     Some(f) => {
                         // `T::m` when the method was merged from trait T
                         // (`__METHOD__` names the trait; `__CLASS__`
@@ -8963,7 +8963,7 @@ impl<'a> Interp<'a> {
             by_ref: false,
             line: 0,
             end_line: 0,
-            file: String::new(),
+            file: String::new().into(),
             ns: String::new(),
             decl_in: None,
         })
@@ -9054,7 +9054,7 @@ impl<'a> Interp<'a> {
             by_ref: false,
             line: 0,
             end_line: 0,
-            file: String::new(),
+            file: String::new().into(),
             ns: String::new(),
             decl_in: None,
         }))

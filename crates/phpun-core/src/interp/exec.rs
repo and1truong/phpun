@@ -594,7 +594,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let mut d = d.clone();
-                d.file = self.diag_file();
+                d.file = self.diag_file_shared();
                 self.functions.insert(key, Rc::new(d));
                 Flow::Normal
             }
@@ -1017,7 +1017,7 @@ impl<'a> Interp<'a> {
                 if name.eq_ignore_ascii_case("strict_types")
                     && matches!(self.eval(value), Ok(Value::Int(1)))
                 {
-                    self.strict_files.insert(self.cur_file.clone());
+                    self.strict_files.insert(self.cur_file.to_string());
                 }
                 Flow::Normal
             }

@@ -257,8 +257,8 @@ pub(crate) fn dispatch(
                 .filter(|&pos| crate::value::include_frame(&frames[pos]));
             for (pos, fr) in frames.iter().enumerate() {
                 let mut f = PhpArray::new();
-                if fr.file != "[internal function]" {
-                    f.set(ArrKey::Str("file".into()), Value::str(fr.file.clone()));
+                if fr.file.as_ref() != "[internal function]" {
+                    f.set(ArrKey::Str("file".into()), Value::str(fr.file.as_ref()));
                     f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
                 }
                 let incl = crate::value::include_frame(fr);
@@ -277,7 +277,7 @@ pub(crate) fn dispatch(
                 }
                 f.set(
                     ArrKey::Str("function".into()),
-                    Value::str(fr.function.clone()),
+                    Value::str(fr.function.as_ref()),
                 );
                 if let Some(c) = &fr.class {
                     f.set(ArrKey::Str("class".into()), Value::str(c.clone()));

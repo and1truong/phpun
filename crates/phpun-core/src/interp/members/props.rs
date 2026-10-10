@@ -549,7 +549,7 @@ impl<'a> Interp<'a> {
         // declaring class into `C::$prop::set` (backed_implicit_get).
         let decl = Rc::new(FunctionDecl {
             ret: None,
-            name: format!("${}::{}", pname, kind),
+            name: format!("${}::{}", pname, kind).into(),
             params,
             body: hook.body.clone().unwrap_or_default(),
             attrs: vec![],

@@ -39,10 +39,11 @@ impl<'a> Interp<'a> {
                 IncludeKind::Require => "require",
                 _ => "require_once",
             }
-            .to_string(),
+            .to_string()
+            .into(),
             class: None,
             ty: String::new(),
-            file: self.diag_file(),
+            file: self.diag_file_shared(),
             line: self.cur_line as u32,
             args: Vec::new(),
             named_args: Vec::new(),
@@ -79,7 +80,7 @@ impl<'a> Interp<'a> {
             let base = self
                 .stack
                 .last()
-                .map(|f| f.file.as_str())
+                .map(|f| f.file.as_ref())
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&self.cur_file);
             let dir = std::path::Path::new(base)
@@ -244,7 +245,7 @@ impl<'a> Interp<'a> {
         // includer's (namespaces/ns_069). __FILE__/__DIR__ and diag
         // attribution inside its top-level code bind to the included
         // file, so the executing frame's file swaps with it.
-        let saved_file = std::mem::replace(&mut self.cur_file, canon.display().to_string());
+        let saved_file = std::mem::replace(&mut self.cur_file, canon.display().to_string().into());
         let saved_frame_file = self
             .stack
             .last_mut()
@@ -278,7 +279,7 @@ impl<'a> Interp<'a> {
         // A compile diagnostic's handler runs at THIS include's callsite.
         let saved_callsite = self
             .compile_callsite
-            .replace((saved_file.clone(), saved_line as u32));
+            .replace((saved_file.to_string(), saved_line as u32));
         // yield_gate applies per-unit: a top-level yield in included
         // code is invalid even when the includer is itself a generator
         // body — Zend compiles each unit with its own function context.
@@ -297,7 +298,7 @@ impl<'a> Interp<'a> {
                 // already carries the live trace (class-kind 'Cannot
                 // redeclare' binds at exec phase, inside the include
                 // frame) keeps it.
-                self.last_err_file = self.cur_file.clone();
+                self.last_err_file = self.cur_file.to_string();
                 if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
                     e.trace = Some(self.compile_err_frames());
                 }
@@ -407,7 +408,7 @@ impl<'a> Interp<'a> {
                 // the call runs inside an included unit.
                 let site_file = self.diag_file();
                 let eval_ctx = format!("{}({}) : eval()'d code", site_file, self.cur_line);
-                let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx);
+                let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx.into());
                 // eval'd top-level stmts execute in the caller's frame —
                 // attribution (throwable file, __FILE__) reads the frame's
                 // file, so it swaps to the eval context like include() does.
@@ -431,14 +432,14 @@ impl<'a> Interp<'a> {
                 // eval()` frame at the call site (rendered bare — the
                 // eval'd source is not an arg in backtraces).
                 self.call_trace.push(TraceFrame {
-                    function: "eval".to_string(),
+                    function: "eval".to_string().into(),
                     class: None,
                     ty: String::new(),
                     // The frame's FILE is the call site — the executing
                     // frame's decl file (diag_file), so eval() inside a
                     // function still points at the function's own file
                     // even while an include is in progress.
-                    file: site_file,
+                    file: site_file.into(),
                     line: saved_line as u32,
                     args: Vec::new(),
                     named_args: Vec::new(),
@@ -451,7 +452,7 @@ impl<'a> Interp<'a> {
                 // A compile diagnostic's handler runs at THIS eval()'s callsite.
                 let saved_callsite = self
                     .compile_callsite
-                    .replace((saved_file.clone(), saved_line as u32));
+                    .replace((saved_file.to_string(), saved_line as u32));
                 let flow = match Self::const_closure_gate(&stmts)
                     .and_then(|_| self.flow_gate(&stmts))
                     // eval'd code is its own compile unit — a top-level
@@ -472,7 +473,7 @@ impl<'a> Interp<'a> {
                         // phase in Zend, inside the eval() frame) keeps
                         // it — only compile-phase errors get the
                         // compile-context frames.
-                        self.last_err_file = self.cur_file.clone();
+                        self.last_err_file = self.cur_file.to_string();
                         if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
                             e.trace = Some(self.compile_err_frames());
                         }
@@ -494,7 +495,7 @@ impl<'a> Interp<'a> {
                 // compile-context backtrace — same arm as include().
                 let flow = match flow {
                     Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => {
-                        self.last_err_file = self.cur_file.clone();
+                        self.last_err_file = self.cur_file.to_string();
                         let mut e = match &flow {
                             Flow::Goto(l) => PhpError::compile_fatal(
                                 format!("'goto' to undefined label '{}'", l),
@@ -557,7 +558,7 @@ impl<'a> Interp<'a> {
                     // compile-context backtrace with the eval frame
                     // itself dropped like the exec-time gates below.
                     self.call_trace.push(TraceFrame {
-                        function: "eval".to_string(),
+                        function: "eval".to_string().into(),
                         class: None,
                         ty: String::new(),
                         file: self.cur_file.clone(),

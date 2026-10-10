@@ -1482,7 +1482,7 @@ impl<'a> Interp<'a> {
         match flow {
             Flow::Return(v) => {
                 if let Some(ty) = &resolved_ret {
-                    let ret_strict = self.strict_files.contains(&decl.file);
+                    let ret_strict = self.strict_files.contains(decl.file.as_ref());
                     let ok = ty
                         .iter()
                         .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))

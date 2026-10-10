@@ -242,9 +242,9 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn call_site(
         &self,
         no_frame_internal: bool,
-        file: String,
+        file: Rc<str>,
         fallback_line: usize,
-    ) -> (String, u32) {
+    ) -> (Rc<str>, u32) {
         // An SPL-prelude frame stands in for zend's C-level SPL
         // delegation: calls it makes (gen resumes, inner-iterator
         // hops, user callbacks) all site `[internal function]` —
@@ -270,7 +270,7 @@ impl<'a> Interp<'a> {
                     .map(|f| f.internal)
                     .unwrap_or(no_frame_internal));
         if from_builtin {
-            ("[internal function]".to_string(), 0)
+            (Rc::from("[internal function]"), 0)
         } else {
             (
                 file,
@@ -1391,7 +1391,7 @@ impl<'a> Interp<'a> {
     pub fn callable_ctx_name(&mut self, v: &Value) -> String {
         match v {
             Value::Callable(c) => match &c.kind {
-                CallableKind::Closure(d) => d.name.clone(),
+                CallableKind::Closure(d) => d.name.to_string(),
                 CallableKind::Named(n) => n.trim_start_matches('\\').to_string(),
                 CallableKind::Method { obj, class, name } => {
                     let cn = obj
@@ -1485,7 +1485,7 @@ impl<'a> Interp<'a> {
             .stack
             .last()
             .map(|f| f.fn_name.clone())
-            .unwrap_or_else(|| "{main}".to_string());
+            .unwrap_or_else(|| Rc::from("{main}"));
         let cache_key = if unqualified {
             Some((caller, self.caller_ns().to_lowercase(), lname.clone()))
         } else {
@@ -1531,17 +1531,22 @@ impl<'a> Interp<'a> {
             // Function names resolve case-insensitively but display in
             // declared case (ReflectionFunction::getNamespaceName,
             // closure_068).
-            Some(r) => Ok(Value::Callable(self.new_callable(PhpCallable {
-                id: std::cell::Cell::new(0),
-                kind: CallableKind::Named(
-                    self.functions.get(&r).map(|d| d.name.clone()).unwrap_or(r),
-                ),
-                captures: Vec::new(),
-                this_obj: None,
-                scope_class: None,
-                called_class: None,
-                is_static: false,
-            }))),
+            Some(r) => Ok(Value::Callable(
+                self.new_callable(PhpCallable {
+                    id: std::cell::Cell::new(0),
+                    kind: CallableKind::Named(
+                        self.functions
+                            .get(&r)
+                            .map(|d| d.name.to_string())
+                            .unwrap_or(r),
+                    ),
+                    captures: Vec::new(),
+                    this_obj: None,
+                    scope_class: None,
+                    called_class: None,
+                    is_static: false,
+                }),
+            )),
             None => self.fail(PhpError::uncaught(
                 "Error",
                 format!("Call to undefined function {}()", miss),
@@ -2730,7 +2735,7 @@ impl<'a> Interp<'a> {
                 // iterator_*) the body frame instead shows the
                 // consumer's resume site (`FILE(line): fn(args)`).
                 file: if f.gen_body && self.iter_calls == 0 && self.gen_internal_resume == 0 {
-                    "[internal function]".to_string()
+                    Rc::from("[internal function]")
                 } else {
                     site_file.clone()
                 },
@@ -3472,8 +3477,8 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn exec_file_strict(&self) -> bool {
         self.stack
             .last()
-            .map(|f| self.strict_files.contains(&f.file))
-            .unwrap_or_else(|| self.strict_files.contains(&self.cur_file))
+            .map(|f| self.strict_files.contains(f.file.as_ref()))
+            .unwrap_or_else(|| self.strict_files.contains(self.cur_file.as_ref()))
     }
 
     /// Strictness for argument checks is determined by the file holding
@@ -3483,10 +3488,10 @@ impl<'a> Interp<'a> {
             // Top-level call site: `self.globals` lives off `self.stack`,
             // so the caller is the top-level file currently executing
             // (`cur_file` swaps for includes mid-eval).
-            return self.strict_files.contains(&self.cur_file);
+            return self.strict_files.contains(self.cur_file.as_ref());
         }
         self.strict_files
-            .contains(&self.stack[self.stack.len() - 2].file)
+            .contains(self.stack[self.stack.len() - 2].file.as_ref())
     }
 
     /// `callable` accepts an actual callable: a Closure/FCC value, a
@@ -3501,7 +3506,7 @@ impl<'a> Interp<'a> {
             Value::Callable(c) => Some(match &c.kind {
                 // A Closure's name is always its Zend name, syntax
                 // flag or not (closure_016).
-                CallableKind::Closure(d) => d.name.clone(),
+                CallableKind::Closure(d) => d.name.to_string(),
                 CallableKind::Named(n) => n.trim_start_matches('\\').to_string(),
                 CallableKind::Method { obj, class, name } => {
                     let cn = obj
@@ -4168,7 +4173,7 @@ impl<'a> Interp<'a> {
         let base = if decl.name.is_empty() {
             format!("{{closure:{}:{}}}", decl.file, decl.line)
         } else {
-            decl.name.clone()
+            decl.name.to_string()
         };
         self.stack
             .last()
@@ -4412,7 +4417,7 @@ impl<'a> Interp<'a> {
                 let internal_site = self
                     .call_trace
                     .last()
-                    .map(|f| f.file == "[internal function]")
+                    .map(|f| f.file.as_ref() == "[internal function]")
                     .unwrap_or(false);
                 let msg = if call_alias.is_some() || internal_site {
                     format!(
@@ -4495,10 +4500,10 @@ impl<'a> Interp<'a> {
                     if let Some(crate::value::ObjectInternal::Exception { file, .. }) =
                         &mut o.borrow_mut().internal
                     {
-                        *file = decl.file.clone();
+                        *file = decl.file.to_string();
                     }
                 }
-                self.last_err_file = decl.file.clone();
+                self.last_err_file = decl.file.to_string();
                 return r;
             }
         }
@@ -4809,7 +4814,7 @@ impl<'a> Interp<'a> {
                     return Ok(v);
                 }
                 if let Some(ty) = &resolved_ret {
-                    let ret_strict = self.strict_files.contains(&decl.file);
+                    let ret_strict = self.strict_files.contains(decl.file.as_ref());
                     let ok = ty
                         .iter()
                         .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
@@ -4906,7 +4911,7 @@ impl<'a> Interp<'a> {
                 e.trace = Some(self.compile_err_frames());
                 let r = self.fail(e);
                 if let Some(f) = &popped_file {
-                    self.last_err_file = f.clone();
+                    self.last_err_file = f.to_string();
                 }
                 r
             }
@@ -4918,7 +4923,7 @@ impl<'a> Interp<'a> {
                 e.trace = Some(self.compile_err_frames());
                 let r = self.fail(e);
                 if let Some(f) = &popped_file {
-                    self.last_err_file = f.clone();
+                    self.last_err_file = f.to_string();
                 }
                 r
             }
@@ -4930,7 +4935,7 @@ impl<'a> Interp<'a> {
                 e.trace = Some(self.compile_err_frames());
                 let r = self.fail(e);
                 if let Some(f) = &popped_file {
-                    self.last_err_file = f.clone();
+                    self.last_err_file = f.to_string();
                 }
                 r
             }

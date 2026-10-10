@@ -130,14 +130,14 @@ impl<'a> Parser<'a> {
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
                 ret: cret,
-                name: String::new(),
+                name: String::new().into(),
                 params,
                 body,
                 attrs: vec![],
                 by_ref,
                 line,
                 end_line,
-                file: String::new(),
+                file: String::new().into(),
                 ns: self.cur_ns.clone(),
                 decl_in: None,
             },

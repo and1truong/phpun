@@ -58,7 +58,7 @@ impl<'a> Interp<'a> {
             // eval()/include() callsite, not the in-unit diagnostic
             // line (the $file/$line args still carry the unit's own).
             let saved_site = self.compile_callsite.clone().map(|(f, l)| {
-                let sf = std::mem::replace(&mut self.cur_file, f);
+                let sf = std::mem::replace(&mut self.cur_file, f.into());
                 let sl = std::mem::replace(&mut self.cur_line, l as usize);
                 (sf, sl)
             });
@@ -694,7 +694,9 @@ impl<'a> Interp<'a> {
         let upto = self
             .call_trace
             .iter()
-            .rposition(|f| crate::value::include_frame(f) || (f.internal && f.function == "eval"))
+            .rposition(|f| {
+                crate::value::include_frame(f) || (f.internal && f.function.as_ref() == "eval")
+            })
             .unwrap_or(self.call_trace.len());
         let frames: Vec<&crate::value::TraceFrame> = self.call_trace[..upto]
             .iter()
@@ -763,6 +765,10 @@ impl<'a> Interp<'a> {
     /// Inside eval'd code cur_file is the `FILE(N) : eval()'d code`
     /// context — Zend attributes every diagnostic there.
     pub(in crate::interp) fn diag_file(&self) -> String {
+        self.diag_file_shared().to_string()
+    }
+
+    pub(in crate::interp) fn diag_file_shared(&self) -> Rc<str> {
         if self.cur_file.contains("eval()'d code") {
             return self.cur_file.clone();
         }

@@ -639,7 +639,7 @@ pub fn trace_frame_hidden(fr: &TraceFrame) -> bool {
         || (fr.internal
             && !fr.named_dispatch
             && matches!(
-                fr.function.as_str(),
+                fr.function.as_ref(),
                 "call_user_func" | "call_user_func_array"
             ))
 }
@@ -740,14 +740,14 @@ pub fn trace_arg(v: &Value) -> String {
 /// `format_backtrace_frames` and synthetic exception traces (arg-type
 /// TypeErrors carry real callee frames below the call site).
 pub fn trace_frame_str(fr: &TraceFrame) -> String {
-    let site = if fr.file == "[internal function]" {
-        fr.file.clone()
+    let site = if fr.file.as_ref() == "[internal function]" {
+        fr.file.to_string()
     } else {
         format!("{}({})", fr.file, fr.line)
     };
     let callee = match &fr.class {
         Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
-        None => fr.function.clone(),
+        None => fr.function.to_string(),
     };
     let mut arg_strs: Vec<String> = fr
         .args
@@ -756,7 +756,7 @@ pub fn trace_frame_str(fr: &TraceFrame) -> String {
         .map(|(i, c)| {
             // zend's #[SensitiveParameter] params render as an opaque
             // SensitiveParameterValue object in backtraces.
-            let sensitive = match fr.function.as_str() {
+            let sensitive = match fr.function.as_ref() {
                 "hash_pbkdf2" => i == 1,
                 "password_hash" | "password_verify" | "password_needs_rehash" => i == 0,
                 _ => false,
@@ -780,7 +780,7 @@ pub fn trace_frame_str(fr: &TraceFrame) -> String {
 pub fn include_frame(fr: &TraceFrame) -> bool {
     fr.internal
         && matches!(
-            fr.function.as_str(),
+            fr.function.as_ref(),
             "include" | "include_once" | "require" | "require_once"
         )
 }
@@ -2311,14 +2311,14 @@ impl Drop for PhpArray {
 #[derive(Debug, Clone)]
 pub struct TraceFrame {
     /// Callee name (`fopen`, `Error2Exception`, `Cls::m`/`{closure}`-ish).
-    pub function: String,
+    pub function: Rc<str>,
     /// Class name for method calls (None for plain/builtin functions).
     pub class: Option<String>,
     /// `->` for object methods, `::` for static — empty for functions.
     pub ty: String,
     /// Call-site file and line; `"[internal function]"`/0 when the caller
     /// is a builtin (e.g. a userland callback invoked from ob_end_clean).
-    pub file: String,
+    pub file: Rc<str>,
     pub line: u32,
     /// Call args (rendered with trace_arg).
     pub args: Vec<Cell>,
@@ -2514,8 +2514,8 @@ pub struct GenFinData {
     /// The body's function name and file — destruction-site frames
     /// attribute the raise (`FILE(n): g()` at an unset/overwrite
     /// point, `[internal function]: g()` at request shutdown).
-    pub fn_name: String,
-    pub file: String,
+    pub fn_name: Rc<str>,
+    pub file: Rc<str>,
     /// Journals of `yield from` delegates that merged into this
     /// stream — a delegate replays only while the consumer's cursor
     /// sits inside its spliced range (`entry <= pos < entry + span`),
