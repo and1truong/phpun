@@ -90,7 +90,7 @@ pub(crate) fn dispatch(
                 return Err(it.throw_value(e));
             }
             let flags = arg(args, 3).to_int();
-            match json_decode(it, s, assoc, depth, flags) {
+            match json_decode(it, s, assoc, depth, flags, 0) {
                 Ok(v) => {
                     it.last_json_error = 0;
                     v
@@ -130,7 +130,7 @@ pub(crate) fn dispatch(
                 return Err(it.throw_value(e));
             }
             let flags = arg(args, 2).to_int();
-            Value::Bool(json_decode(it, s, true, depth, flags).is_ok())
+            Value::Bool(json_decode(it, s, true, depth, flags, 0).is_ok())
         }
         _ => return Ok(None),
     }))
@@ -206,14 +206,21 @@ impl Esc {
     }
 }
 
-/// Per-call encode context: flag table, container-recursion stack, depth
-/// ceiling, and PARTIAL's last-seen error code.
+/// Per-call encode context: flag table, depth ceiling, native-stack
+/// budget, and PARTIAL's last-seen error code. The recursion stack
+/// itself lives on the Interp (json_enc_stack) so a JsonSerializable
+/// body re-entering json_encode sees it — zend marks the container
+/// busy for the whole nested call.
 struct Enc<'x> {
     esc: &'x Esc,
-    seen: Vec<usize>,
     max: i64,
+    lim: i64,
     err: i64,
 }
+
+/// Bytes each container level costs against zend.max_allowed_stack_size
+/// (three Rust frames per level; zend charges its own encoder frames).
+const LEVEL_BYTES: i64 = 1024;
 
 /// Returns (output, zend error code) — under PARTIAL_OUTPUT_ON_ERROR the
 /// string still ships and `code` reports the LAST substituted error.
@@ -221,10 +228,14 @@ fn json_encode(it: &mut Interp, v: &Value, flags: i64, max_depth: i64) -> (Strin
     let esc = Esc::new(flags);
     // ponytail: fixed 4KB head start — not sized to the payload.
     let mut out = String::with_capacity(4096);
+    // ponytail: when zend.max_allowed_stack_size is unset (zend's
+    // "use the real stack" mode), cap at 4MB — beyond ~8K levels the
+    // native thread stack dies before any useful payload anyway.
+    let ini = it.ini_bytes("zend.max_allowed_stack_size");
     let mut cx = Enc {
         esc: &esc,
-        seen: Vec::new(),
         max: max_depth,
+        lim: if ini > 0 { ini } else { 4 << 20 },
         err: 0,
     };
     if let Err(code) = json_enc(it, v, &mut cx, &mut out, 0) {
@@ -282,28 +293,28 @@ fn json_enc(
         }
         Value::Array(a) => {
             let lvl = lvl + 1;
-            if lvl > cx.max {
+            if lvl > cx.max || lvl * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH);
             }
             let key = Rc::as_ptr(a) as usize;
-            if cx.seen.contains(&key) {
+            if it.json_enc_stack.contains(&key) {
                 return Err(J_RECURSION);
             }
-            cx.seen.push(key);
+            it.json_enc_stack.push(key);
             let r = json_arr(it, a, cx, out, lvl);
-            cx.seen.pop();
+            it.json_enc_stack.pop();
             return r;
         }
         Value::Object(o) => {
             let lvl = lvl + 1;
-            if lvl > cx.max {
+            if lvl > cx.max || lvl * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH);
             }
             let key = Rc::as_ptr(o) as usize;
-            if cx.seen.contains(&key) {
+            if it.json_enc_stack.contains(&key) {
                 return Err(J_RECURSION);
             }
-            cx.seen.push(key);
+            it.json_enc_stack.push(key);
             let r = if it
                 .find_method_in(&o.borrow().class, "jsonserialize")
                 .is_some()
@@ -322,7 +333,7 @@ fn json_enc(
             } else {
                 json_obj(it, o, cx, out, lvl)
             };
-            cx.seen.pop();
+            it.json_enc_stack.pop();
             return r;
         }
         Value::Callable(_) => out.push_str("{}"),
@@ -624,9 +635,26 @@ fn json_decode(
     assoc: bool,
     depth: i64,
     flags: i64,
+    lim: i64,
 ) -> Result<Value, i64> {
+    let lim = if lim > 0 {
+        lim
+    } else {
+        let ini = it.ini_bytes("zend.max_allowed_stack_size");
+        if ini > 0 {
+            ini
+        } else {
+            4 << 20
+        }
+    };
+    let cx = Dec {
+        assoc,
+        flags,
+        depth,
+        lim,
+    };
     let mut pos = 0;
-    let v = json_value(it, s, &mut pos, assoc, flags, depth)?;
+    let v = json_value(it, s, &mut pos, &cx, depth)?;
     json_ws(s, &mut pos)?;
     match s.get(pos) {
         // ws already rejected <0x20 and broken utf8 in the tail.
@@ -655,12 +683,20 @@ fn json_ws(b: &[u8], pos: &mut usize) -> Result<(), i64> {
     Ok(())
 }
 
+/// Per-call decode context — assoc/flags/depth are fixed for the whole
+/// document; lim is the native-stack budget in bytes.
+struct Dec {
+    assoc: bool,
+    flags: i64,
+    depth: i64,
+    lim: i64,
+}
+
 fn json_value(
     it: &mut Interp,
     b: &[u8],
     pos: &mut usize,
-    assoc: bool,
-    flags: i64,
+    cx: &Dec,
     rem: i64,
 ) -> Result<Value, i64> {
     json_ws(b, pos)?;
@@ -670,13 +706,13 @@ fn json_value(
         Some(b'f') => json_lit(b, pos, b"false", Value::Bool(false)),
         Some(b'"') => {
             *pos += 1;
-            Ok(Value::bytes(jstr(b, pos, flags)?.into_owned()))
+            Ok(Value::bytes(jstr(b, pos, cx.flags)?.into_owned()))
         }
         Some(b'[') => {
             *pos += 1;
             // zend counts one extra level past the deepest container.
             let rem = rem - 1;
-            if rem == 0 {
+            if rem == 0 || (cx.depth - rem) * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH);
             }
             let mut a = PhpArray::new();
@@ -686,7 +722,7 @@ fn json_value(
                 return Ok(Value::Array(Rc::new(RefCell::new(a))));
             }
             loop {
-                let v = json_value(it, b, pos, assoc, flags, rem)?;
+                let v = json_value(it, b, pos, cx, rem)?;
                 a.push(v);
                 json_ws(b, pos)?;
                 match b.get(*pos) {
@@ -703,19 +739,19 @@ fn json_value(
         Some(b'{') => {
             *pos += 1;
             let rem = rem - 1;
-            if rem == 0 {
+            if rem == 0 || (cx.depth - rem) * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH);
             }
             json_ws(b, pos)?;
             if b.get(*pos) == Some(&b'}') {
                 *pos += 1;
-                return Ok(if assoc {
+                return Ok(if cx.assoc {
                     Value::Array(Rc::new(RefCell::new(PhpArray::new())))
                 } else {
                     stdclass(it, HashMap::new(), Vec::new())
                 });
             }
-            if assoc {
+            if cx.assoc {
                 let mut a = PhpArray::new();
                 loop {
                     json_ws(b, pos)?;
@@ -723,13 +759,13 @@ fn json_value(
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let k = key_cast(&jstr(b, pos, flags)?)?;
+                    let k = key_cast(&jstr(b, pos, cx.flags)?)?;
                     json_ws(b, pos)?;
                     if b.get(*pos) != Some(&b':') {
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let v = json_value(it, b, pos, assoc, flags, rem)?;
+                    let v = json_value(it, b, pos, cx, rem)?;
                     a.set(k, v);
                     json_ws(b, pos)?;
                     match b.get(*pos) {
@@ -752,14 +788,14 @@ fn json_value(
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let k =
-                        String::from_utf8(jstr(b, pos, flags)?.into_owned()).map_err(|_| J_UTF8)?;
+                    let k = String::from_utf8(jstr(b, pos, cx.flags)?.into_owned())
+                        .map_err(|_| J_UTF8)?;
                     json_ws(b, pos)?;
                     if b.get(*pos) != Some(&b':') {
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let v = json_value(it, b, pos, assoc, flags, rem)?;
+                    let v = json_value(it, b, pos, cx, rem)?;
                     if !props.contains_key(&k) {
                         order.push(k.clone());
                     }
@@ -777,7 +813,7 @@ fn json_value(
                 Ok(stdclass(it, props, order))
             }
         }
-        Some(&c) if c == b'-' || c.is_ascii_digit() => jnum(b, pos, flags),
+        Some(&c) if c == b'-' || c.is_ascii_digit() => jnum(b, pos, cx.flags),
         _ => Err(J_SYNTAX),
     }
 }

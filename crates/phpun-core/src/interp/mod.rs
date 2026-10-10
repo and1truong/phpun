@@ -503,6 +503,11 @@ pub struct Interp<'a> {
     pub resp_code: i64,
     /// Set by json_encode/json_decode for json_last_error().
     pub last_json_error: i64,
+    /// json_encode's in-flight container Rc keys — shared across nested
+    /// calls (a JsonSerializable body encoding $this hits zend's
+    /// recursion guard through it). Empties again once the outermost
+    /// encode returns.
+    pub(crate) json_enc_stack: Vec<usize>,
     /// Set by the preg_* builtins for preg_last_error().
     pub last_preg_error: i64,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
@@ -1837,6 +1842,7 @@ impl<'a> Interp<'a> {
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
+            json_enc_stack: Vec::new(),
             last_preg_error: 0,
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
