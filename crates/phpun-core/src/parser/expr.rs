@@ -4,6 +4,175 @@
 use super::*;
 use crate::interp::util::is_compile_const;
 
+// Compute lexical imports once, rather than retaining every caller variable
+// when an arrow is created. Nested closures expose only their own imports.
+fn arrow_uses(e: &Expr, out: &mut Vec<(String, bool)>) {
+    fn name(n: &str, out: &mut Vec<(String, bool)>) {
+        if !out.iter().any(|(old, _)| old == n) {
+            out.push((n.to_owned(), false));
+        }
+    }
+    fn prop(p: &PropName, out: &mut Vec<(String, bool)>) {
+        match p {
+            PropName::Name(_) => {}
+            PropName::Var(n) => name(n, out),
+            PropName::Expr(e) => arrow_uses(e, out),
+        }
+    }
+    match e {
+        Expr::Var(n) => name(n, out),
+        Expr::Interp(parts) => {
+            for p in parts {
+                match p {
+                    StringPart::Lit(_) => {}
+                    StringPart::Var(n, _) => name(n, out),
+                    StringPart::Expr(src, base) | StringPart::DollarBraceExpr(src, base) => {
+                        if let Ok((e, _)) = parse_expr_src(src, *base) {
+                            arrow_uses(&e, out);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::ArrayLit(items) => {
+            for (k, v) in items {
+                if let Some(k) = k {
+                    arrow_uses(k, out);
+                }
+                arrow_uses(v, out);
+            }
+        }
+        Expr::List(items) => {
+            for (k, v) in items.iter().flatten() {
+                if let Some(k) = k {
+                    arrow_uses(k, out);
+                }
+                arrow_uses(v, out);
+            }
+        }
+        Expr::Assign {
+            target: l,
+            value: r,
+            ..
+        }
+        | Expr::Binary { l, r, .. }
+        | Expr::ClassConstDyn { class: l, name: r }
+        | Expr::Instanceof { obj: l, class: r } => {
+            arrow_uses(l, out);
+            arrow_uses(r, out);
+        }
+        Expr::ByRef(e)
+        | Expr::Unary { e, .. }
+        | Expr::PreInc(e)
+        | Expr::PreDec(e)
+        | Expr::PostInc(e)
+        | Expr::PostDec(e)
+        | Expr::Empty(e)
+        | Expr::Print(e)
+        | Expr::YieldFrom(e)
+        | Expr::Include { e, .. }
+        | Expr::Throw(e)
+        | Expr::Paren(e)
+        | Expr::Clone(e)
+        | Expr::Cast { e, .. }
+        | Expr::VarVar(e, _)
+        | Expr::Fcc(e)
+        | Expr::Unpack(e)
+        | Expr::ClassConst { class: e, .. } => arrow_uses(e, out),
+        Expr::Ternary { c, t, f } => {
+            arrow_uses(c, out);
+            if let Some(t) = t {
+                arrow_uses(t, out);
+            }
+            arrow_uses(f, out);
+        }
+        Expr::Index { e, i } => {
+            arrow_uses(e, out);
+            if let Some(i) = i {
+                arrow_uses(i, out);
+            }
+        }
+        Expr::Call { name: e, args, .. }
+        | Expr::New { class: e, args, .. }
+        | Expr::StaticCall { class: e, args, .. } => {
+            arrow_uses(e, out);
+            for a in args {
+                arrow_uses(a, out);
+            }
+        }
+        Expr::StaticCallDyn {
+            class,
+            name: e,
+            args,
+            ..
+        } => {
+            arrow_uses(class, out);
+            arrow_uses(e, out);
+            for a in args {
+                arrow_uses(a, out);
+            }
+        }
+        Expr::Prop { obj, name: p, .. }
+        | Expr::StaticProp {
+            class: obj,
+            name: p,
+        } => {
+            arrow_uses(obj, out);
+            prop(p, out);
+        }
+        Expr::MethodCall {
+            obj, name: p, args, ..
+        } => {
+            arrow_uses(obj, out);
+            prop(p, out);
+            for a in args {
+                arrow_uses(a, out);
+            }
+        }
+        Expr::Closure(c) => {
+            for (n, _) in &c.uses {
+                name(n, out);
+            }
+        }
+        Expr::Isset(es) => {
+            for e in es {
+                arrow_uses(e, out);
+            }
+        }
+        Expr::Yield { key, val } => {
+            if let Some(e) = key {
+                arrow_uses(e, out);
+            }
+            if let Some(e) = val {
+                arrow_uses(e, out);
+            }
+        }
+        Expr::Exit(e) => {
+            if let Some(e) = e {
+                arrow_uses(e, out);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            arrow_uses(subject, out);
+            for a in arms {
+                for e in &a.conds {
+                    arrow_uses(e, out);
+                }
+                arrow_uses(&a.result, out);
+            }
+        }
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Const(_)
+        | Expr::MagicConst(_)
+        | Expr::FccMark
+        | Expr::AnonClass(_) => {}
+    }
+}
+
 impl<'a> Parser<'a> {
     /// `function (&$a) use ($x, &$y) { }`, `static function () {}`,
     /// `fn($x) => $x + 1`.
@@ -127,6 +296,12 @@ impl<'a> Parser<'a> {
         self.fn_ctx.pop();
         self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
+        if arrow {
+            if let Some(Stmt::Return(Some(e))) = body.last() {
+                arrow_uses(e, &mut uses);
+            }
+            uses.retain(|(n, _)| n != "this" && !params.iter().any(|p| p.name == *n));
+        }
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
                 ret: cret,

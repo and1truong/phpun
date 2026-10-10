@@ -1016,13 +1016,14 @@ impl<'a> Interp<'a> {
                 }
                 let mut captures = Vec::new();
                 if c.arrow {
-                    // `fn` captures whole scope by value — the zval
-                    // share keeps the same array until a write, when
-                    // cow_split separates it (cyclic self-refs stay
-                    // intact; writes can't leak out).
-                    let f = self.stack.last().unwrap_or(&self.globals);
-                    for (n, cellv) in f.vars.iter() {
-                        captures.push((n.clone(), cell(cellv.borrow().clone()), false));
+                    for (n, _) in &c.uses {
+                        if !Self::is_superglobal(n) {
+                            // Missing imports stay undefined until read; arrow
+                            // creation itself emits no undefined-var warning.
+                            if let Some(v) = self.var_cell_opt(n) {
+                                captures.push((n.clone(), cell(v.borrow().clone()), false));
+                            }
+                        }
                     }
                 } else {
                     for (n, by_ref) in &c.uses {
