@@ -145,6 +145,11 @@ enum Op {
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
     Canonical(Box<Expr>),
+    ThisProp {
+        name: Rc<str>,
+        site: usize,
+        fallback: Box<Expr>,
+    },
     CanonicalStmt {
         stmt: Box<Stmt>,
         decl_site: Option<usize>,
@@ -347,10 +352,11 @@ impl Compiled {
                 }
             })
             .collect();
-        let hybrid = c
+        let canonical_binding = c
             .ops
             .iter()
             .any(|op| matches!(op, Op::Canonical(_) | Op::CanonicalStmt { .. }));
+        let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -360,7 +366,9 @@ impl Compiled {
             defaults,
             bind_free,
             // Canonical expressions need the canonical frame lifetime/teardown.
-            needs_bind: needs_bind || hybrid,
+            needs_bind: needs_bind
+                || canonical_binding
+                || decl.name.eq_ignore_ascii_case("__toString"),
             ret_fast,
             param_fast,
         }))
@@ -956,6 +964,18 @@ impl Compiler {
                     *at = call;
                 }
             }
+            Expr::Prop {
+                obj,
+                name: crate::ast::PropName::Name(name),
+                nullsafe: false,
+                site,
+            } if matches!(Interp::unmark_rhs(obj), Expr::Var(n) if n == "this") => {
+                self.emit(Op::ThisProp {
+                    name: Rc::from(name.as_str()),
+                    site: *site,
+                    fallback: Box::new(e.clone()),
+                });
+            }
             Expr::ArrayLit(_)
             | Expr::Index { .. }
             | Expr::Prop { .. }
@@ -1082,6 +1102,15 @@ impl<'a> Interp<'a> {
         comp: &Compiled,
         mut args: super::CallArgs,
     ) -> Result<Value, PhpError> {
+        // Scalar slots may share this call's arg cells, never the caller's
+        // by-value cells (array_walk, unpack and call_user_func_array share them).
+        // Do this before tracing/coercion so both see the isolated argument.
+        for (c, p) in args.cells.iter_mut().zip(&decl.params) {
+            if !p.by_ref && (Rc::strong_count(c) > 1 || Rc::weak_count(c) > 0) {
+                let value = c.borrow().clone();
+                *c = cell(value);
+            }
+        }
         let __p = pnow!();
         if __p.is_some() {
             PROF[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1558,6 +1587,24 @@ impl<'a> Interp<'a> {
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
+                Op::ThisProp {
+                    name,
+                    site,
+                    fallback,
+                } => {
+                    self.cur_line = *site;
+                    self.send_line = Some(*site);
+                    let receiver = self.stack.last().and_then(|f| f.this_obj.clone());
+                    let plain = receiver.and_then(|o| self.prop_read_plain(&o, name));
+                    if let Some(value) = plain {
+                        vs.push(value);
+                    } else {
+                        self.vm_materialize(comp, slots);
+                        let result = self.eval(fallback);
+                        self.vm_refresh(comp, slots);
+                        vs.push(result?);
+                    }
+                }
                 Op::Canonical(expr) => {
                     self.vm_materialize(comp, slots);
                     let result = self.eval(expr);

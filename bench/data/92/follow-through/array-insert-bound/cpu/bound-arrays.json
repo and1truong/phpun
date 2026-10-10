@@ -1,0 +1,182 @@
+{
+  "runtime": "bbbd74d",
+  "argv": [
+    "bench/30-arrays.php",
+    "100"
+  ],
+  "event": "cpu-clock:u",
+  "frequency_hz": 199,
+  "call_graph": "dwarf,8192",
+  "samples": 260,
+  "lost_samples": 0,
+  "exclusive_symbols": [
+    {
+      "exclusive_pct": 13.08,
+      "symbol": "<phpun_core::interp::Interp>::vm_run"
+    },
+    {
+      "exclusive_pct": 10.0,
+      "symbol": "phpun_core::builtins::array::zend_sort_user::{closure#0}"
+    },
+    {
+      "exclusive_pct": 8.46,
+      "symbol": "<phpun_core::interp::Interp>::vm_exec"
+    },
+    {
+      "exclusive_pct": 5.77,
+      "symbol": "0x000000000017bacf"
+    },
+    {
+      "exclusive_pct": 4.62,
+      "symbol": "cfree"
+    },
+    {
+      "exclusive_pct": 3.85,
+      "symbol": "<phpun_core::interp::Interp>::call_value"
+    },
+    {
+      "exclusive_pct": 3.85,
+      "symbol": "malloc"
+    },
+    {
+      "exclusive_pct": 2.31,
+      "symbol": "<phpun_core::interp::Interp>::assign_inner"
+    },
+    {
+      "exclusive_pct": 2.31,
+      "symbol": "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>"
+    },
+    {
+      "exclusive_pct": 2.31,
+      "symbol": "phpun_core::builtins::array::dispatch"
+    },
+    {
+      "exclusive_pct": 2.31,
+      "symbol": "0x000000000017bbcd"
+    },
+    {
+      "exclusive_pct": 1.92,
+      "symbol": "<phpun_core::interp::Interp>::call_site_frame"
+    },
+    {
+      "exclusive_pct": 1.92,
+      "symbol": "<phpun_core::interp::Interp>::global_var_cell"
+    },
+    {
+      "exclusive_pct": 1.92,
+      "symbol": "core::ptr::drop_glue::<alloc::vec::Vec<alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>>>"
+    },
+    {
+      "exclusive_pct": 1.54,
+      "symbol": "<phpun_core::interp::Interp>::expr_yield_kind"
+    },
+    {
+      "exclusive_pct": 1.54,
+      "symbol": "<phpun_core::interp::Interp>::stmt_yield_kind"
+    },
+    {
+      "exclusive_pct": 1.15,
+      "symbol": "<hashbrown::raw::RawTable<(alloc::string::String, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>)>>::clear"
+    },
+    {
+      "exclusive_pct": 1.15,
+      "symbol": "<phpun_core::interp::Frame>::new::<alloc::rc::Rc<str>>"
+    },
+    {
+      "exclusive_pct": 1.15,
+      "symbol": "<phpun_core::interp::Interp>::binary_operands"
+    },
+    {
+      "exclusive_pct": 1.15,
+      "symbol": "<phpun_core::interp::Interp>::destruct_frame_objs"
+    },
+    {
+      "exclusive_pct": 1.15,
+      "symbol": "phpun_core::value::zend_sort::<(u32, phpun_core::value::ArrKey, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>), phpun_core::builtins::array::zend_sort_user::{closure#1}>"
+    },
+    {
+      "exclusive_pct": 1.15,
+      "symbol": "0x000000000017bb7b"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "<alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>>::drop_slow"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "<phpun_core::interp::Interp>::binary"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "<phpun_core::interp::Interp>::call_site"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "<phpun_core::interp::Interp>::eval"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "<phpun_core::interp::Interp>::isset_val_mode"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "<phpun_core::interp::Interp>::vm_refresh"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "core::ptr::drop_glue::<phpun_core::interp::CallArgs>"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "phpun_core::builtins::array::zend_sort_user::{closure#1}"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x00000000001724e5"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x00000000001724e7"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x000000000017bac0"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x000000000017bac3"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x000000000017bb83"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x000000000017bb90"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x000000000017bbdd"
+    },
+    {
+      "exclusive_pct": 0.77,
+      "symbol": "0x000000000017bbf4"
+    }
+  ],
+  "dispatch_buckets": {
+    "samples": 260,
+    "counts": {
+      "VM-nearest-dispatch": 201,
+      "AST-nearest-dispatch": 44,
+      "other-or-incomplete": 15
+    },
+    "estimated_cpu_ns": 1306532500,
+    "sample_weight_pct": {
+      "VM-nearest-dispatch": 77.3076923076923,
+      "AST-nearest-dispatch": 16.923076923076923,
+      "other-or-incomplete": 5.769230769230769
+    }
+  },
+  "stack_text_sha256": "96ec3147c2e88b0cbb57d02a6070f55ca4f87f9910e4c16aad92052e1c45ba39",
+  "perf_data_sha256": "3d88328b8a8decdca3e79944a530880b14f7245bf28ddf0da0231f56c7aff258"
+}

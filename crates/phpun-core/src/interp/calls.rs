@@ -1290,8 +1290,20 @@ impl<'a> Interp<'a> {
                         };
                         let decl = decl.clone();
                         self.stack.push(frame);
-                        // bind params manually (frame already pushed for captures)
-
+                        // Reuse the existing scalar VM binder after establishing
+                        // closure context. Captures and missing/default/named/ref
+                        // arguments retain the canonical binder. The scalar slot
+                        // binder has no imported-local initialization protocol.
+                        if c.captures.is_empty()
+                            && args.named.is_empty()
+                            && args.cells.len() >= decl.params.len()
+                        {
+                            if let Some(comp) = self.vm_compiled(&decl) {
+                                if !comp.needs_bind {
+                                    return self.vm_run(&decl, &comp, args);
+                                }
+                            }
+                        }
                         self.bind_and_run(&decl, args, frame_args.split_off(0))
                     }
                     CallableKind::Named(n) => {

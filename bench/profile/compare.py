@@ -36,6 +36,8 @@ if args.phases:
     cases += [('bench/profile/objects.php', mode, '5000') for mode in ('ctor', 'norm', 'scaled')]
     cases += [('bench/profile/fib.php', mode, '26', '1') for mode in ('typed', 'untyped')]
     cases += [('bench/profile/fib.php', mode, '29', '2') for mode in ('typed', 'untyped')]
+    cases += [('bench/profile/closures.php', '20000')]
+    cases += [('bench/profile/closures.php', '20000', 'scalar')]
     cases += [('bench/11-sieve.php', '1', n) for n in ('10000', '20000', '40000', '80000')]
     cases += [('bench/50-regex.php', '1'), ('bench/60-json.php', '1'), ('bench/70-db.php', '1')]
     cases += [('bench/app/cli.php', '100', '1'), ('bench/app/cli.php', '100', '20')]

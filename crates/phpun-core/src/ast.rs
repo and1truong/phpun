@@ -575,7 +575,7 @@ pub struct ClosureExpr {
     pub decl: FunctionDecl,
     /// `use ($a, &$b)` captures; bool = by-ref.
     pub uses: Vec<(String, bool)>,
-    /// Arrow fn `fn(...) => expr`: captures whole parent scope by value.
+    /// Arrow fn `fn(...) => expr`: `uses` contains lexical imports by value.
     pub arrow: bool,
     /// `static function` — never binds $this.
     pub is_static: bool,

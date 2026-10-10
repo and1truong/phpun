@@ -1,0 +1,207 @@
+{
+  "runtime": "55d8646",
+  "argv": [
+    "bench/40-objects.php",
+    "50",
+    "5000"
+  ],
+  "event": "cpu-clock:u",
+  "frequency_hz": 199,
+  "call_graph": "dwarf,8192",
+  "samples": 1093,
+  "lost_samples": 0,
+  "exclusive_symbols": [
+    {
+      "exclusive_pct": 8.78,
+      "symbol": "<core::str::pattern::StrSearcher>::new"
+    },
+    {
+      "exclusive_pct": 6.4,
+      "symbol": "<phpun_core::value::PhpArray>::pos_of"
+    },
+    {
+      "exclusive_pct": 5.95,
+      "symbol": "cfree"
+    },
+    {
+      "exclusive_pct": 4.76,
+      "symbol": "malloc"
+    },
+    {
+      "exclusive_pct": 2.47,
+      "symbol": "<phpun_core::interp::Interp>::vm_exec"
+    },
+    {
+      "exclusive_pct": 2.29,
+      "symbol": "<phpun_core::interp::Interp>::is_a_str"
+    },
+    {
+      "exclusive_pct": 2.2,
+      "symbol": "0x00000000001724da"
+    },
+    {
+      "exclusive_pct": 2.1,
+      "symbol": "0x000000000009ef43"
+    },
+    {
+      "exclusive_pct": 2.01,
+      "symbol": "0x000000000009ede1"
+    },
+    {
+      "exclusive_pct": 2.01,
+      "symbol": "0x00000000000a152b"
+    },
+    {
+      "exclusive_pct": 1.83,
+      "symbol": "<phpun_core::interp::Interp>::mem_realloc::<core::cell::RefCell<phpun_core::value::PhpArray>>::{closure#4}"
+    },
+    {
+      "exclusive_pct": 1.83,
+      "symbol": "<str>::to_lowercase"
+    },
+    {
+      "exclusive_pct": 1.83,
+      "symbol": "0x000000000009eee6"
+    },
+    {
+      "exclusive_pct": 1.65,
+      "symbol": "<phpun_core::interp::Interp>::gc_note_dying"
+    },
+    {
+      "exclusive_pct": 1.46,
+      "symbol": "<phpun_core::value::PhpClass>::name"
+    },
+    {
+      "exclusive_pct": 1.37,
+      "symbol": "alloc::fmt::format::format_inner"
+    },
+    {
+      "exclusive_pct": 1.28,
+      "symbol": "0x00000000000a1398"
+    },
+    {
+      "exclusive_pct": 1.19,
+      "symbol": "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write"
+    },
+    {
+      "exclusive_pct": 1.19,
+      "symbol": "<phpun_core::interp::Interp>::destruct_cells"
+    },
+    {
+      "exclusive_pct": 1.19,
+      "symbol": "<phpun_core::interp::Interp>::global_var_cell"
+    },
+    {
+      "exclusive_pct": 1.19,
+      "symbol": "<phpun_core::interp::Interp>::obj_prop_key"
+    },
+    {
+      "exclusive_pct": 1.19,
+      "symbol": "0x00000000001724e1"
+    },
+    {
+      "exclusive_pct": 1.19,
+      "symbol": "0x00000000001724e7"
+    },
+    {
+      "exclusive_pct": 1.1,
+      "symbol": "<phpun_core::ast::PropDecl as core::clone::Clone>::clone"
+    },
+    {
+      "exclusive_pct": 1.1,
+      "symbol": "<phpun_core::interp::Interp>::assign_inner"
+    },
+    {
+      "exclusive_pct": 1.1,
+      "symbol": "core::ptr::drop_glue::<phpun_core::value::PhpObject>"
+    },
+    {
+      "exclusive_pct": 1.01,
+      "symbol": "<phpun_core::interp::Interp>::push_handle"
+    },
+    {
+      "exclusive_pct": 1.01,
+      "symbol": "0x000000000009edc3"
+    },
+    {
+      "exclusive_pct": 0.91,
+      "symbol": "<phpun_core::interp::Interp>::bind_and_run_inner"
+    },
+    {
+      "exclusive_pct": 0.82,
+      "symbol": "<phpun_core::interp::Interp>::gc_cycle_collect_impl"
+    },
+    {
+      "exclusive_pct": 0.82,
+      "symbol": "<phpun_core::interp::Interp>::gc_scan_obj_fields"
+    },
+    {
+      "exclusive_pct": 0.82,
+      "symbol": "<phpun_core::interp::Interp>::prop_read_plain"
+    },
+    {
+      "exclusive_pct": 0.82,
+      "symbol": "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>"
+    },
+    {
+      "exclusive_pct": 0.82,
+      "symbol": "0x00000000000a1b8c"
+    },
+    {
+      "exclusive_pct": 0.73,
+      "symbol": "0x000000000017bac0"
+    },
+    {
+      "exclusive_pct": 0.64,
+      "symbol": "<phpun_core::interp::Interp>::eval"
+    },
+    {
+      "exclusive_pct": 0.64,
+      "symbol": "<phpun_core::interp::Interp>::instantiate"
+    },
+    {
+      "exclusive_pct": 0.64,
+      "symbol": "<phpun_core::interp::Interp>::vm_refresh"
+    },
+    {
+      "exclusive_pct": 0.64,
+      "symbol": "<phpun_core::interp::Interp>::vm_site"
+    },
+    {
+      "exclusive_pct": 0.64,
+      "symbol": "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&alloc::string::String>"
+    },
+    {
+      "exclusive_pct": 0.64,
+      "symbol": "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&str>"
+    },
+    {
+      "exclusive_pct": 0.64,
+      "symbol": "0x000000000017bacf"
+    },
+    {
+      "exclusive_pct": 0.55,
+      "symbol": "<phpun_core::interp::Interp>::mem_track::<phpun_core::interp::VmSite>"
+    },
+    {
+      "exclusive_pct": 0.55,
+      "symbol": "core::ptr::drop_glue::<phpun_core::value::PhpArray>"
+    }
+  ],
+  "dispatch_buckets": {
+    "samples": 1093,
+    "counts": {
+      "AST-nearest-dispatch": 536,
+      "other-or-incomplete": 222,
+      "VM-nearest-dispatch": 335
+    },
+    "estimated_cpu_ns": 5492461625,
+    "sample_weight_pct": {
+      "AST-nearest-dispatch": 49.03934126258005,
+      "other-or-incomplete": 20.31107044830741,
+      "VM-nearest-dispatch": 30.649588289112533
+    }
+  },
+  "stack_text_sha256": "313c2f89d771c2fe6b839d521858cde91210d88853a28724bbc3a834fc4739d9",
+  "perf_data_sha256": "bd2ebd73e366f61638c0b33e0147cc7fe363a3020743e9d2afc02e62751d3b2c"
+}

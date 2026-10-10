@@ -1,0 +1,8 @@
+{
+  "commit": "ecc31840a03b453e553e83dd0b014c12716742cd",
+  "command": "cargo build --offline --release",
+  "rustc": "1.99.0",
+  "lto": true,
+  "codegen_units": 1,
+  "profilers": "off"
+}

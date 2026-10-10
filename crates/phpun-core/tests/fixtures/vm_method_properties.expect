@@ -1,0 +1,8 @@
+17:99:16:7
+15:11
+Typed property VmPropertyMagic::$uninitialized must not be accessed before initialization
+Using $this when not in object context
+19
+hook-destroyed
+ok
+VmPropertyString::__toString(): Return value must be of type string, array returned

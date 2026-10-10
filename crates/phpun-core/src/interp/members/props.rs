@@ -1511,6 +1511,24 @@ impl<'a> Interp<'a> {
         self.prop_read_value(ov, &pn, nullsafe)
     }
 
+    /// A visible initialized backing slot can be read without entering PHP.
+    /// The VM uses the same proof; all hooks/magic/errors retain the full path.
+    pub(in crate::interp) fn prop_read_plain(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+    ) -> Option<Value> {
+        if !self.in_own_hook(o, pn) && self.hooked_prop(o, pn).is_some() {
+            return None;
+        }
+        let k = self.obj_prop_key(o, pn)?;
+        let cls = o.borrow().class.clone();
+        if !self.prop_visible(&cls, pn) {
+            return None;
+        }
+        Some(o.borrow().props.get(&k).unwrap().borrow().clone())
+    }
+
     /// prop_read with a pre-bound name — zend binds the operand once,
     /// so a name mutation inside __isset/__get doesn't re-evaluate it
     /// (bug75420).
@@ -1523,17 +1541,13 @@ impl<'a> Interp<'a> {
         match ov {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {
+                if let Some(v) = self.prop_read_plain(&o, pn) {
+                    return Ok(v);
+                }
                 let cls = o.borrow().class.clone();
                 if !self.in_own_hook(&o, pn) {
                     if let Some((pd, hs)) = self.hooked_prop(&o, pn) {
                         return self.hook_read(&o, &pd, &hs);
-                    }
-                }
-                if let Some(k) = self.obj_prop_key(&o, pn) {
-                    // Declared but not visible from this scope →
-                    // __get territory (bug37667).
-                    if self.prop_visible(&cls, pn) {
-                        return Ok(o.borrow().props.get(&k).unwrap().borrow().clone());
                     }
                 }
                 // Typed prop whose slot was never initialized → Error

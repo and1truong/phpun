@@ -1,0 +1,56 @@
+[
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 1878947\n",
+    "stderr": "allocs: 6975032 bytes: 168505189\n  cell: 400018\n  vm_site: 75000\n  mem_track: 150011\n  trace_frame: 50000\n  vars_insert: 1\n  call_args: 50000\n"
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 1878947\n",
+    "stderr": ""
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_VMPROF",
+    "stdout": "RESULT 1878947\n",
+    "stderr": "vm-coverage: compiled-lookup=50000\nvm-coverage: executed-body=50000\nvm-coverage: reference-return=0\nvm-coverage: variable=0\nvm-coverage: assignment=0\nvm-coverage: call=0\nvm-coverage: array=0\nvm-coverage: property=0\nvm-coverage: closure=0\nvm-coverage: interpolation=0\nvm-coverage: foreach=0\nvm-coverage: switch=0\nvm-coverage: match=0\nvm-coverage: exception=0\nvm-coverage: static=0\nvm-coverage: scope=0\nvm-coverage: operator=0\nvm-coverage: other=0\nvm-coverage: hybrid-lookup=50000\nvm-coverage: hybrid-body=25000\nvm-coverage: top-level-entry=1\n"
+  },
+  {
+    "build": "method",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 1878947\n",
+    "stderr": "allocs: 6825045 bytes: 167846097\n  cell: 400018\n  vm_site: 75000\n  mem_track: 125012\n  trace_frame: 50000\n  vars_insert: 1\n  call_args: 50000\n"
+  },
+  {
+    "build": "method",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 1878947\n",
+    "stderr": "callprof: pre=0ns cells=0ns site=3043323ns bind=952998ns exec=70391811ns post=17557909ns calls=25000; unit=total_ns exec=inclusive\n"
+  },
+  {
+    "build": "method",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_VMPROF",
+    "stdout": "RESULT 1878947\n",
+    "stderr": "vm-coverage: compiled-lookup=50000\nvm-coverage: executed-body=50000\nvm-coverage: reference-return=0\nvm-coverage: variable=0\nvm-coverage: assignment=0\nvm-coverage: call=0\nvm-coverage: array=0\nvm-coverage: property=0\nvm-coverage: closure=0\nvm-coverage: interpolation=0\nvm-coverage: foreach=0\nvm-coverage: switch=0\nvm-coverage: match=0\nvm-coverage: exception=0\nvm-coverage: static=0\nvm-coverage: scope=0\nvm-coverage: operator=0\nvm-coverage: other=0\nvm-coverage: hybrid-lookup=25000\nvm-coverage: hybrid-body=25000\nvm-coverage: top-level-entry=1\n"
+  }
+]
