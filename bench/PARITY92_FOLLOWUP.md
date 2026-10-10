@@ -383,3 +383,10 @@ Main moved after these samples: baseline explicitly3a/a5dc, not ef63392.
 Workspace tests/fmt/clippy pass.26 VM/probe and19 workload byte gates pass,
 including binary/NUL bytes, aliases, refs, typed-owner fallback, RHS mutation,
 weak UTF8-cache invalidation after append and large tracked-string growth.
+
+Final2521PHPT:2060→2063pass,399→397fail,9unchanged existing crashes,
+5→4timeouts. Promoted-reference two fail→pass and concat_003 stress timeout→pass;
+all other individual statuses unchanged, including memory-limit/string/PCRE/
+class/hooks/lifetime selections. The GC30s threshold crossing on the earlier
+slot suite passes here. Original maps and individual followups retained; do not
+interpret changed timeout counts as full GC/JSON/generator compatibility.
