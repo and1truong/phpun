@@ -1061,11 +1061,6 @@ impl<'a> Interp<'a> {
                 // compiled defaults (closure_const_expr/static_variable).
                 let mut sv = Vec::new();
                 closure_static_vars(&decl.body, &mut sv);
-                let mut seed_frame = Frame::new(fname.clone());
-                seed_frame.fn_line = decl.line;
-                seed_frame.file = decl.file.clone();
-                seed_frame.ns = decl.ns.clone();
-                seed_frame.trait_origin = decl.decl_in.clone();
                 let callable = self.new_callable(PhpCallable {
                     id: std::cell::Cell::new(0),
                     kind: CallableKind::Closure(Rc::new(decl)),
@@ -1086,6 +1081,15 @@ impl<'a> Interp<'a> {
                     is_static,
                 });
                 if !sv.is_empty() {
+                    let CallableKind::Closure(decl) = &callable.kind else {
+                        unreachable!()
+                    };
+                    let mut seed_frame = self.frame_new(fname.clone());
+                    seed_frame.fn_line = decl.line;
+                    seed_frame.file = decl.file.clone();
+                    seed_frame.ns = decl.ns.clone();
+                    seed_frame.trait_origin = decl.decl_in.clone();
+
                     let key = format!("{}\u{0}c{}", fname, callable.id.get());
                     let mut table = crate::value::FxMap::default();
                     // The seeded defaults compile against the CLOSURE's
@@ -1096,7 +1100,7 @@ impl<'a> Interp<'a> {
                     seed_frame.scope_class = callable.scope_class.clone();
                     seed_frame.called_class = callable.called_class.clone();
                     let saved_line = self.cur_line;
-                    self.stack.push(Box::new(seed_frame));
+                    self.stack.push(seed_frame);
                     for (n, d, sline) in sv {
                         // Only literal-only defaults are bound at
                         // creation — consts, `new`, calls and anything
@@ -1115,7 +1119,7 @@ impl<'a> Interp<'a> {
                         };
                         table.insert(n, cell(v));
                     }
-                    self.stack_pop();
+                    self.stack_discard();
                     self.cur_line = saved_line;
                     // Wholesale replace: a recycled handle id could
                     // otherwise expose a dead closure's stale table
@@ -4237,15 +4241,21 @@ impl<'a> Interp<'a> {
                         }
                         if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
                             if pd.readonly {
-                                return self.fail(PhpError::uncaught(
-                                    "Error",
+                                let key = self.obj_prop_key(o, &pn);
+                                let object = key
+                                    .as_ref()
+                                    .and_then(|k| o.borrow().props.get(k).cloned())
+                                    .is_some_and(|c| matches!(&*c.borrow(), Value::Object(_)));
+                                let message = if object {
+                                    "Cannot assign by reference to overloaded object".to_string()
+                                } else {
                                     format!(
                                         "Cannot indirectly modify readonly property {}::${}",
                                         dcls.name(),
                                         pd.name
-                                    ),
-                                    0,
-                                ));
+                                    )
+                                };
+                                return self.fail(PhpError::uncaught("Error", message, 0));
                             }
                         }
                         // `=&` installs the source cell as the prop's
