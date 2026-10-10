@@ -2658,18 +2658,18 @@ impl<'a> Interp<'a> {
         values: [Value; 2],
         nonref: bool,
     ) -> Result<Value, PhpError> {
+        let Some((decl, comp, closure)) = self.vm_callback_values_target(callable, &values) else {
+            // Fallbacks go straight to their original fresh cells. Do not add a
+            // value-vector transfer for bound/object/string/captured callbacks.
+            let mut args = super::CallArgs::positional(values.into_iter().map(cell).collect());
+            if nonref {
+                args.nonref_cells.extend(0..2);
+            }
+            return self.call_value(callable, args);
+        };
         let mut argv = self.vm_val_pool.pop().unwrap_or_default();
         argv.extend(values);
-        let result = match self.vm_value_callback(callable, &mut argv) {
-            Some(result) => result,
-            None => {
-                let mut args = super::CallArgs::positional(argv.drain(..).map(cell).collect());
-                if nonref {
-                    args.nonref_cells.extend(0..2);
-                }
-                self.call_value(callable, args)
-            }
-        };
+        let result = self.vm_run_direct(decl, &comp, &mut argv, Some(closure.clone()));
         argv.clear();
         if self.vm_val_pool.len() < 64 {
             self.vm_val_pool.push(argv);
@@ -2677,11 +2677,11 @@ impl<'a> Interp<'a> {
         result
     }
 
-    fn vm_value_callback(
+    fn vm_callback_values_target<'cb>(
         &mut self,
-        callable: &Value,
-        argv: &mut Vec<Value>,
-    ) -> Option<Result<Value, PhpError>> {
+        callable: &'cb Value,
+        values: &[Value; 2],
+    ) -> Option<(&'cb Rc<FunctionDecl>, Rc<Compiled>, &'cb Rc<PhpCallable>)> {
         let Value::Callable(c) = callable else {
             return None;
         };
@@ -2696,13 +2696,12 @@ impl<'a> Interp<'a> {
             || c.scope_class.is_some()
             || c.called_class.is_some()
             || decl.by_ref
-            || argv.is_empty()
-            || argv.len() != decl.params.len()
+            || values.len() != decl.params.len()
             || decl
                 .params
                 .iter()
                 .any(|p| p.by_ref || p.variadic || p.promoted)
-            || !argv.iter().all(|v| {
+            || !values.iter().all(|v| {
                 matches!(
                     v,
                     Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
@@ -2721,12 +2720,12 @@ impl<'a> Interp<'a> {
         let comp = self.vm_compiled(decl)?;
         if !comp.value_abi
             || !decl.params.iter().enumerate().all(|(i, p)| {
-                p.ty.is_none() || comp.param_fast[i].is_some_and(|gate| gate(&argv[i]))
+                p.ty.is_none() || comp.param_fast[i].is_some_and(|gate| gate(&values[i]))
             })
         {
             return None;
         }
-        Some(self.vm_run_direct(decl, &comp, argv, Some(c.clone())))
+        Some((decl, comp, c))
     }
 
     /// The typed check a fast `param_fast` gate could not settle for a
