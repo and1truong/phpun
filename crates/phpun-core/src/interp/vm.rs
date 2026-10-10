@@ -1164,7 +1164,7 @@ impl<'a> Interp<'a> {
         let popped = self.stack_pop();
         self.last_popped_frame = popped;
         self.last_call_by_ref = decl.by_ref;
-        self.call_trace.pop();
+        self.trace_pop();
         self.cur_line = saved.line;
         self.send_line = Some(saved.line);
         let sweep_err = self.sweep_expr_temps(temps_base).err();
@@ -1729,7 +1729,7 @@ impl<'a> Interp<'a> {
         fa: &mut Vec<Cell>,
         saved: VmSaved,
     ) -> Result<Value, PhpError> {
-        self.call_trace.pop();
+        self.trace_pop();
         self.cur_line = saved.line;
         self.send_line = Some(saved.line);
         self.last_prop_ov = saved.prop_ov;
