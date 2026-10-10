@@ -115,6 +115,13 @@ pub(crate) fn dispatch(
 // ----- helpers -----
 
 pub(crate) fn date_format(fmt: &str, ts: i64) -> String {
+    date_format_tz(fmt, ts, 0, "UTC", "UTC")
+}
+
+/// `ts` here is the WALL seconds (instant + off). `off` feeds O/P/Z,
+/// `e_name`/`t_name` the e/T letters (zone name vs abbreviation —
+/// for numeric-offset zones both are the `±HH:MM` string).
+pub(crate) fn date_format_tz(fmt: &str, ts: i64, off: i64, e_name: &str, t_name: &str) -> String {
     // minimal strftime-ish for the common tokens
     let days = ts.div_euclid(86400);
     let secs = ts.rem_euclid(86400);
@@ -184,15 +191,35 @@ pub(crate) fn date_format(fmt: &str, ts: i64) -> String {
                 ][(m - 1) as usize],
             ),
             'U' => out.push_str(&ts.to_string()),
-            'e' | 'T' => out.push_str("UTC"),
-            'O' => out.push_str("+0000"),
-            'P' => out.push_str("+00:00"),
+            'e' => out.push_str(e_name),
+            'T' => out.push_str(t_name),
+            'O' => out.push_str(&format!(
+                "{}{:02}{:02}",
+                if off < 0 { '-' } else { '+' },
+                off.abs() / 3600,
+                off.abs() % 3600 / 60
+            )),
+            'P' => out.push_str(&format!(
+                "{}{:02}:{:02}",
+                if off < 0 { '-' } else { '+' },
+                off.abs() / 3600,
+                off.abs() % 3600 / 60
+            )),
+            'Z' => out.push_str(&off.to_string()),
             'c' => out.push_str(&format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
-                y, m, d, h, mi, s
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+                y,
+                m,
+                d,
+                h,
+                mi,
+                s,
+                if off < 0 { '-' } else { '+' },
+                off.abs() / 3600,
+                off.abs() % 3600 / 60
             )),
             'r' => out.push_str(&format!(
-                "{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+                "{}, {:02} {} {:04} {:02}:{:02}:{:02} {}{:02}{:02}",
                 ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
                     [(days + 4).rem_euclid(7) as usize],
                 d,
@@ -203,7 +230,10 @@ pub(crate) fn date_format(fmt: &str, ts: i64) -> String {
                 y,
                 h,
                 mi,
-                s
+                s,
+                if off < 0 { '-' } else { '+' },
+                off.abs() / 3600,
+                off.abs() % 3600 / 60
             )),
             'w' => out.push_str(&(days + 4).rem_euclid(7).to_string()),
             'z' => {
@@ -1409,4 +1439,427 @@ impl StrtoP {
         dt.add_secs(self.bag.secs);
         dt
     }
+}
+
+/// `DateTime::createFromFormat` subset parser. Fields the format
+/// doesn't set come from `now` (zend default); `!` resets them to
+/// epoch inline, `|` resets whatever's still unset at the end, `+`
+/// permits trailing data. `c`/`r` expand to their composite formats.
+/// ponytail: `e`/`T`/`D`/`l`/`N`/`w`/`W`/`t` consume their input but
+/// set nothing (UTC-only store — no tz names, weekday letters are
+/// decorative); unknown directive letters act as literals, which is
+/// zend's fallback for non-directive chars too.
+/// Parsed field+display bundle: `ts` is the instant (wall-minus-
+/// offset), `off` the seconds format() shifts by, `tzty`/`tz` zend's
+/// var_dump timezone_type (1 = `±HH:MM`, 3 = named) + name.
+pub(crate) struct DtNew {
+    pub ts: i64,
+    pub off: i64,
+    pub tzty: i64,
+    pub tz: String,
+}
+
+pub(crate) fn date_create_from_format(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
+    let first = cff_inner(fmt, val, now)?;
+    // zend fills unparsed fields from `now` in the TARGET zone, so
+    // run once to learn the offset, then again with it applied —
+    // a no-op second pass when the input carries its own zoneless
+    // fields or the zone is UTC.
+    if first.off == 0 && first.tz == "UTC" {
+        return Some(first);
+    }
+    cff_inner(fmt, val, now + first.off)
+}
+
+fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
+    let (ny, nm, nd) = civil_from_days(now.div_euclid(86400));
+    let nsec = now.rem_euclid(86400);
+    // (y, m, d, h, i, s, off, z) — None = take from `now` unless reset.
+    let mut f: [Option<i64>; 8] = [None; 8];
+    let mut reset_seen = false;
+    let mut twelve: Option<i64> = None;
+    let mut meridiem: Option<bool> = None; // true = pm
+    let mut epoch: Option<i64> = None;
+    let mut tz_name: Option<String> = None;
+    let mut off_named = true;
+    let mut trailing_ok = false;
+    let fb = fmt.as_bytes();
+    let vb = val.as_bytes();
+    let mut fi = 0usize;
+    let mut vi = 0usize;
+    let months: &[&[u8]] = &[
+        b"january",
+        b"february",
+        b"march",
+        b"april",
+        b"may",
+        b"june",
+        b"july",
+        b"august",
+        b"september",
+        b"october",
+        b"november",
+        b"december",
+    ];
+    let num = |vb: &[u8], vi: &mut usize, max: usize| -> Option<i64> {
+        let start = *vi;
+        while *vi - start < max && *vi < vb.len() && vb[*vi].is_ascii_digit() {
+            *vi += 1;
+        }
+        if *vi == start {
+            None
+        } else {
+            vb[start..*vi]
+                .iter()
+                .fold(0i64, |a, b| a * 10 + (b - b'0') as i64)
+                .into()
+        }
+    };
+    let word = |vb: &[u8], vi: &mut usize| -> Vec<u8> {
+        let start = *vi;
+        while *vi < vb.len() && vb[*vi].is_ascii_alphabetic() {
+            *vi += 1;
+        }
+        vb[start..*vi].to_vec()
+    };
+    // one directive; returns false on hard mismatch
+    macro_rules! need {
+        ($e:expr) => {
+            match $e {
+                Some(x) => x,
+                None => return None,
+            }
+        };
+    }
+    while fi < fb.len() {
+        let c = fb[fi];
+        fi += 1;
+        match c {
+            b'!' => {
+                for x in f.iter_mut() {
+                    *x = None;
+                }
+                twelve = None;
+                meridiem = None;
+                epoch = None;
+                reset_seen = true;
+            }
+            b'|' => {
+                // reset the UNPARSED fields to epoch — parsed stay
+                reset_seen = true;
+            }
+            b'+' => trailing_ok = true,
+            b'?' => {
+                if vi >= vb.len() {
+                    return None;
+                }
+                vi += 1;
+            }
+            b'#' => {
+                if vi >= vb.len() || !b";:/.,-".contains(&vb[vi]) {
+                    return None;
+                }
+                vi += 1;
+            }
+            b'*' => {
+                // consume until the next fmt literal would match
+                let next = fb.get(fi).copied();
+                if let Some(nl) = next {
+                    while vi < vb.len() && vb[vi] != nl {
+                        vi += 1;
+                    }
+                } else {
+                    vi = vb.len();
+                }
+            }
+            b'\\' => {
+                let l = *fb.get(fi)?;
+                fi += 1;
+                if vb.get(vi) != Some(&l) {
+                    return None;
+                }
+                vi += 1;
+            }
+            b' ' => {
+                while vi < vb.len() && vb[vi].is_ascii_whitespace() {
+                    vi += 1;
+                }
+            }
+            b'Y' | b'o' => f[0] = Some(need!(num(vb, &mut vi, 6))),
+            b'y' => {
+                let n = need!(num(vb, &mut vi, 2));
+                f[0] = Some(if n < 70 { 2000 + n } else { 1900 + n });
+            }
+            b'm' | b'n' => {
+                let n = need!(num(vb, &mut vi, 2));
+                if !(1..=12).contains(&n) {
+                    return None;
+                }
+                f[1] = Some(n);
+            }
+            b'M' | b'F' => {
+                let w = word(vb, &mut vi);
+                let lw: Vec<u8> = w.iter().map(|b| b.to_ascii_lowercase()).collect();
+                let hit = months.iter().position(|m| {
+                    let k = if c == b'M' { 3 } else { m.len() };
+                    lw.len() >= 3
+                        && lw[..k.min(lw.len())] == m[..k.min(lw.len())]
+                        && if c == b'M' { lw.len() == 3 } else { lw == **m }
+                });
+                f[1] = Some(hit? as i64 + 1);
+            }
+            b'd' | b'j' => {
+                let n = need!(num(vb, &mut vi, 2));
+                if !(1..=31).contains(&n) {
+                    return None;
+                }
+                f[2] = Some(n);
+            }
+            b'z' => f[7] = Some(need!(num(vb, &mut vi, 3))),
+            b'D' | b'l' | b'N' | b'w' | b'W' | b't' | b'S' => {
+                // weekday/month trivia — consume, set nothing
+                let w = word(vb, &mut vi);
+                if w.is_empty() && num(vb, &mut vi, 3).is_none() {
+                    return None;
+                }
+            }
+            b'H' | b'G' => {
+                let n = need!(num(vb, &mut vi, 2));
+                if n > 23 {
+                    return None;
+                }
+                f[3] = Some(n);
+            }
+            b'h' | b'g' => {
+                let n = need!(num(vb, &mut vi, 2));
+                if !(1..=12).contains(&n) {
+                    return None;
+                }
+                twelve = Some(n);
+            }
+            b'i' => {
+                let n = need!(num(vb, &mut vi, 2));
+                if n > 59 {
+                    return None;
+                }
+                f[4] = Some(n);
+            }
+            b's' => {
+                let n = need!(num(vb, &mut vi, 2));
+                if n > 59 {
+                    return None;
+                }
+                f[5] = Some(n);
+            }
+            b'u' => {
+                let _ = num(vb, &mut vi, 6);
+            }
+            b'v' => {
+                let _ = num(vb, &mut vi, 3);
+            }
+            b'a' | b'A' => {
+                let w = word(vb, &mut vi);
+                let lw: Vec<u8> = w.iter().map(|b| b.to_ascii_lowercase()).collect();
+                match lw.as_slice() {
+                    b"am" => meridiem = Some(false),
+                    b"pm" => meridiem = Some(true),
+                    _ => return None,
+                }
+            }
+            b'U' => epoch = Some(need!(num(vb, &mut vi, 20))),
+            b'e' | b'T' => {
+                // timezone name — sets the render offset + display name
+                let st = vi;
+                while vi < vb.len()
+                    && (vb[vi].is_ascii_alphanumeric()
+                        || matches!(vb[vi], b'/' | b'_' | b'+' | b'-' | b':'))
+                {
+                    vi += 1;
+                }
+                if vi == st {
+                    return None;
+                }
+                tz_name = Some(String::from_utf8_lossy(&vb[st..vi]).to_string());
+            }
+            b'O' | b'P' => {
+                off_named = false;
+                let sgn = match vb.get(vi) {
+                    Some(b'+') => 1,
+                    Some(b'-') => -1,
+                    _ => return None,
+                };
+                vi += 1;
+                let h = need!(num(vb, &mut vi, 2));
+                if c == b'P' {
+                    if vb.get(vi) != Some(&b':') {
+                        return None;
+                    }
+                    vi += 1;
+                }
+                let m = need!(num(vb, &mut vi, 2));
+                f[6] = Some(sgn * (h * 3600 + m * 60));
+            }
+            b'Z' => {
+                // oracle rejects Z in createFromFormat outright
+                return None;
+            }
+            b'c' => return date_create_from_format("Y-m-d\\TH:i:sP", val, now),
+            b'r' => return date_create_from_format("D, d M Y H:i:s O", val, now),
+            _ => {
+                if vb.get(vi) != Some(&c) {
+                    return None;
+                }
+                vi += 1;
+            }
+        }
+    }
+    // trailing input is an error unless `+` permitted it
+    if vi < vb.len() && !trailing_ok {
+        return None;
+    }
+    if let Some(u) = epoch {
+        return Some(DtNew {
+            ts: u,
+            off: 0,
+            tzty: 3,
+            tz: "UTC".into(),
+        });
+    }
+    // Field-wise defaults: unset date fields come from today, and
+    // unset time fields come from now — but only when NO time field
+    // was parsed at all; one time field present zeroes the rest.
+    let saw_time = f[3].is_some() || f[4].is_some() || f[5].is_some() || twelve.is_some();
+    let base: [i64; 8] = if reset_seen {
+        [1970, 1, 1, 0, 0, 0, 0, 0]
+    } else if saw_time {
+        [ny, nm, nd, 0, 0, 0, 0, 0]
+    } else {
+        [ny, nm, nd, nsec / 3600, nsec % 3600 / 60, nsec % 60, 0, 0]
+    };
+    let get = |i: usize| f[i].unwrap_or(base[i]);
+    let h = match (twelve, meridiem) {
+        (Some(t), Some(true)) => t % 12 + 12,
+        (Some(t), Some(false)) => t % 12,
+        (Some(t), None) => t % 24,
+        (None, _) => get(3),
+    };
+    let days = if f[7].is_some() {
+        days_from_civil(get(0), 1, 1) + get(7)
+    } else {
+        days_from_civil(get(0), get(1), get(2))
+    };
+    let wall = days * 86400 + h * 3600 + get(4) * 60 + get(5);
+    match (tz_name, off_named) {
+        (Some(name), true) => {
+            let off = tz_offset_at(&name, wall);
+            Some(DtNew {
+                ts: wall - off,
+                off,
+                tzty: 3,
+                tz: name,
+            })
+        }
+        _ => {
+            let off = get(6);
+            let (tzty, tz) = if f[6].is_some() {
+                // canonical `±HH:MM`
+                let sgn = if off < 0 { '-' } else { '+' };
+                (
+                    1,
+                    format!(
+                        "{}{:02}:{:02}",
+                        sgn,
+                        off.abs() / 3600,
+                        off.abs() % 3600 / 60
+                    ),
+                )
+            } else {
+                (3, "UTC".to_string())
+            };
+            Some(DtNew {
+                ts: wall - off,
+                off,
+                tzty,
+                tz,
+            })
+        }
+    }
+}
+
+/// tz abbreviation ("JST", "UTC") of a named zone at `ts` — same
+/// libc/TZ swap as tz_offset_at.
+pub(crate) fn tz_abbr_at(name: &str, ts: i64) -> String {
+    let b = name.as_bytes();
+    if b.len() == 6 && matches!(b[0], b'+' | b'-') && b[3] == b':' {
+        return name.to_string();
+    }
+    extern "C" {
+        fn tzset();
+    }
+    let old = std::env::var("TZ").ok();
+    std::env::set_var("TZ", name);
+    let t = ts as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let out = unsafe {
+        tzset();
+        if libc::localtime_r(&t, &mut tm).is_null() || tm.tm_zone.is_null() {
+            name.to_string()
+        } else {
+            std::ffi::CStr::from_ptr(tm.tm_zone)
+                .to_string_lossy()
+                .to_string()
+        }
+    };
+    match old {
+        Some(v) => std::env::set_var("TZ", v),
+        None => std::env::remove_var("TZ"),
+    }
+    unsafe { tzset() };
+    out
+}
+
+/// UTC offset (seconds) of a named zone at `ts`. `±HH:MM` is
+/// arithmetic; `Area/City` and legacy names go through libc's
+/// `localtime_r` under a temporary `TZ=` — the system zoneinfo db is
+/// already on the box, no tz tables to ship.
+/// ponytail: `TZ` is process-global — fine while the interp is
+/// single-threaded; a threaded VM needs a lock around the swap.
+pub(crate) fn tz_offset_at(name: &str, ts: i64) -> i64 {
+    let b = name.as_bytes();
+    if b.len() == 6
+        && matches!(b[0], b'+' | b'-')
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3] == b':'
+        && b[4].is_ascii_digit()
+        && b[5].is_ascii_digit()
+    {
+        let off = (b[1] - b'0') as i64 * 36000
+            + (b[2] - b'0') as i64 * 3600
+            + (b[4] - b'0') as i64 * 600
+            + (b[5] - b'0') as i64 * 60;
+        return if b[0] == b'+' { off } else { -off };
+    }
+    extern "C" {
+        // not in the libc crate; glibc needs it to notice TZ changes
+        fn tzset();
+    }
+    let old = std::env::var("TZ").ok();
+    std::env::set_var("TZ", name);
+    let t = ts as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let off = unsafe {
+        tzset();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff
+        }
+    };
+    match old {
+        Some(v) => std::env::set_var("TZ", v),
+        None => std::env::remove_var("TZ"),
+    }
+    unsafe { tzset() };
+    off
 }
