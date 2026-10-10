@@ -250,7 +250,7 @@ pub(crate) fn dispatch(
             if let Some(c) = args.get(3) {
                 *c.borrow_mut() = Value::Int(n);
             }
-            Value::bytes(r)
+            r
         }
         "substr" => {
             let s = arg_bs(it, args, 0);
@@ -1292,7 +1292,45 @@ fn trim_set(s: &[u8], chars: &[u8], left: bool, right: bool) -> Vec<u8> {
     }
 }
 
-fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> (Vec<u8>, i64) {
+fn str_replace_one(
+    finds: &[Vec<u8>],
+    repls: &[Vec<u8>],
+    repl_scalar: bool,
+    subj: &[u8],
+    ci: bool,
+    count: &mut i64,
+) -> Vec<u8> {
+    let mut out = subj.to_vec();
+    for (i, f) in finds.iter().enumerate() {
+        if f.is_empty() {
+            continue;
+        }
+        // Scalar repl applies to every find; a short repl array pads ''.
+        let r = if repl_scalar {
+            &repls[0]
+        } else {
+            repls.get(i).map(|r| r.as_slice()).unwrap_or(&[])
+        };
+        // Each replace is replace-all: occurrences present now are all hit.
+        let mut i0 = 0usize;
+        while let Some(p) = if ci {
+            bfind_ci(&out, f, i0)
+        } else {
+            bfind(&out, f, i0)
+        } {
+            *count += 1;
+            i0 = p + f.len();
+        }
+        out = if ci {
+            breplace_ci(&out, f, r)
+        } else {
+            breplace(&out, f, r)
+        };
+    }
+    out
+}
+
+fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> (Value, i64) {
     let finds: Vec<Vec<u8>> = match find {
         Value::Array(a) => a
             .borrow()
@@ -1311,33 +1349,40 @@ fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> (Vec<u8>, 
             .collect(),
         v => vec![v.to_php_bytes()],
     };
-    let mut out = subj.to_php_bytes();
+    let repl_scalar = !matches!(repl, Value::Array(_));
     let mut count = 0i64;
-    for (i, f) in finds.iter().enumerate() {
-        if f.is_empty() {
-            continue;
+    if let Value::Array(a) = subj {
+        // zend maps each element and sums replacements across the array.
+        let a = a.borrow();
+        let mut out = PhpArray::default();
+        for (k, c) in &a.entries {
+            let bytes = c.borrow().to_php_bytes();
+            out.set(
+                k.clone(),
+                Value::bytes(str_replace_one(
+                    &finds,
+                    &repls,
+                    repl_scalar,
+                    &bytes,
+                    ci,
+                    &mut count,
+                )),
+            );
         }
-        let r = repls
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| repls.last().cloned().unwrap_or_default());
-        // Each replace is replace-all: occurrences present now are all hit.
-        let mut i0 = 0usize;
-        while let Some(p) = if ci {
-            bfind_ci(&out, f, i0)
-        } else {
-            bfind(&out, f, i0)
-        } {
-            count += 1;
-            i0 = p + f.len();
-        }
-        out = if ci {
-            breplace_ci(&out, f, &r)
-        } else {
-            breplace(&out, f, &r)
-        };
+        (Value::Array(Rc::new(RefCell::new(out))), count)
+    } else {
+        (
+            Value::bytes(str_replace_one(
+                &finds,
+                &repls,
+                repl_scalar,
+                &subj.to_php_bytes(),
+                ci,
+                &mut count,
+            )),
+            count,
+        )
     }
-    (out, count)
 }
 
 pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<Vec<u8>> {
