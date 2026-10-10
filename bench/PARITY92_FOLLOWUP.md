@@ -704,3 +704,10 @@ Each release core force-cleaned/rebuilt; parent SHA256
 finaldf19afc5bf14758f5021e028ac1ee7b97ea209be35d8e1d9c90f642d5d1ad63b.
 Same native host/Rust/PHP config as preceding steps, frozen identities/config/
 argv/maps/counters/callsite lower bounds/samples under `data/92/parity/callback-*`.
+
+Integration: PR #218 targets main. After main advanced to0179ed3 (#217),
+ordinary merge81ca6ef had no conflict. Workspace tests/fmt/clippy and rebuilt
+release22VM/callback byte gates plus19workload gates pass. This integration
+binary is recorded separately in `callback-main-integration.json`; the timings
+and583PHPT maps above remain frozen92d0be0 evidence, not timing/status claims
+for a different binary.
