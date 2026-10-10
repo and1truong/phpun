@@ -242,17 +242,15 @@ pub(crate) fn dispatch(
             }
             Value::Array(Rc::new(RefCell::new(a)))
         }
-        "str_replace" => {
+        "str_replace" | "str_ireplace" => {
             let find = arg(args, 0);
             let repl = arg(args, 1);
             let subj = arg(args, 2);
-            Value::bytes(str_replace(&find, &repl, &subj, false))
-        }
-        "str_ireplace" => {
-            let find = arg(args, 0);
-            let repl = arg(args, 1);
-            let subj = arg(args, 2);
-            Value::bytes(str_replace(&find, &repl, &subj, true))
+            let (r, n) = str_replace(&find, &repl, &subj, name == "str_ireplace");
+            if let Some(c) = args.get(3) {
+                *c.borrow_mut() = Value::Int(n);
+            }
+            Value::bytes(r)
         }
         "substr" => {
             let s = arg_bs(it, args, 0);
@@ -1294,7 +1292,7 @@ fn trim_set(s: &[u8], chars: &[u8], left: bool, right: bool) -> Vec<u8> {
     }
 }
 
-fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> Vec<u8> {
+fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> (Vec<u8>, i64) {
     let finds: Vec<Vec<u8>> = match find {
         Value::Array(a) => a
             .borrow()
@@ -1314,6 +1312,7 @@ fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> Vec<u8> {
         v => vec![v.to_php_bytes()],
     };
     let mut out = subj.to_php_bytes();
+    let mut count = 0i64;
     for (i, f) in finds.iter().enumerate() {
         if f.is_empty() {
             continue;
@@ -1322,13 +1321,23 @@ fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> Vec<u8> {
             .get(i)
             .cloned()
             .unwrap_or_else(|| repls.last().cloned().unwrap_or_default());
+        // Each replace is replace-all: occurrences present now are all hit.
+        let mut i0 = 0usize;
+        while let Some(p) = if ci {
+            bfind_ci(&out, f, i0)
+        } else {
+            bfind(&out, f, i0)
+        } {
+            count += 1;
+            i0 = p + f.len();
+        }
         out = if ci {
             breplace_ci(&out, f, &r)
         } else {
             breplace(&out, f, &r)
         };
     }
-    out
+    (out, count)
 }
 
 pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<Vec<u8>> {

@@ -616,9 +616,11 @@ impl Compiler {
                     ) {
                         return None;
                     }
-                    self.emit(Op::Load(slot));
+                    // zend binds the lhs CV when the op runs — rhs
+                    // first, then BinaryCv reads the slot's CURRENT
+                    // value (`$a .= ($a = 'B')` → 'BB').
                     self.expr(value)?;
-                    self.emit(Op::Binary(bop));
+                    self.emit(Op::BinaryCv(bop, slot));
                 }
                 self.emit(Op::Store(slot));
             }
@@ -1750,24 +1752,73 @@ impl<'a> Interp<'a> {
         // arg must hand over its slot cell (a Slot::V local upgrades to
         // Slot::C, zend's separate-into-reference), or the callee's
         // writes die on a throwaway cell.
+        let link = |slots: &mut [Slot], cells: &mut Vec<Cell>, i: usize| {
+            let Some(&sl) = arg_slots.get(i) else { return };
+            if sl == u16::MAX || i >= cells.len() {
+                return;
+            }
+            let sl = sl as usize;
+            match &mut slots[sl] {
+                Slot::C(c) => cells[i] = c.clone(),
+                Slot::V(v) => {
+                    let c = cell(std::mem::replace(v, Value::Null));
+                    slots[sl] = Slot::C(c.clone());
+                    cells[i] = c;
+                }
+            }
+        };
         if let Some(d) = &decl {
             for (i, p) in d.params.iter().enumerate() {
-                if !p.by_ref || p.variadic {
-                    continue;
-                }
-                let Some(&sl) = arg_slots.get(i) else { break };
-                if sl == u16::MAX || i >= cells.len() {
-                    continue;
-                }
-                let sl = sl as usize;
-                match &mut slots[sl] {
-                    Slot::C(c) => cells[i] = c.clone(),
-                    Slot::V(v) => {
-                        let c = cell(std::mem::replace(v, Value::Null));
-                        slots[sl] = Slot::C(c.clone());
-                        cells[i] = c;
+                if p.variadic {
+                    // `&...$v` — every extra arg binds by-ref too.
+                    if p.by_ref {
+                        for j in i..cells.len() {
+                            link(slots, &mut cells, j);
+                        }
                     }
+                    break;
                 }
+                if !p.by_ref || i >= cells.len() {
+                    continue;
+                }
+                if arg_slots.get(i).copied().unwrap_or(u16::MAX) == u16::MAX {
+                    // Non-lvalue into a by-ref slot is a zend Error,
+                    // not a silent fresh cell.
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!(
+                            "{}(): Argument #{} (${}) could not be passed by reference",
+                            self.decl_fname(d),
+                            i + 1,
+                            p.name
+                        ),
+                        0,
+                    ));
+                }
+                link(slots, &mut cells, i);
+            }
+        } else if let Some(bp) = super::calls::builtin_byref(lname) {
+            for (i, &br) in bp.iter().enumerate() {
+                if !br || i >= cells.len() {
+                    continue;
+                }
+                if arg_slots.get(i).copied().unwrap_or(u16::MAX) == u16::MAX {
+                    let pname = builtins::builtin_params(lname)
+                        .and_then(|ps| ps.get(i))
+                        .map(|p| format!(" (${})", p.0))
+                        .unwrap_or_default();
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!(
+                            "{}(): Argument #{}{} could not be passed by reference",
+                            lname,
+                            i + 1,
+                            pname
+                        ),
+                        0,
+                    ));
+                }
+                link(slots, &mut cells, i);
             }
         }
         let mut args = super::CallArgs::empty();
