@@ -1730,18 +1730,12 @@ impl<'a> Interp<'a> {
         if let Some(hit) = cache.borrow().clone() {
             return Ok(hit);
         }
-        let mut decl = self.functions.get(lname).cloned();
-        let mut miss_name: Option<String> = None;
-        if decl.is_none() {
-            let ns = self.caller_ns();
-            if !ns.is_empty() {
-                let cand = format!("{}\\{}", ns.to_lowercase(), lname);
-                decl = self.functions.get(&cand).cloned();
-                if decl.is_none() {
-                    miss_name = Some(format!("{}\\{}", ns, raw));
-                }
-            }
-        }
+        let (decl, _) = self.resolve_user_fn(lname, true);
+        let miss_name = if decl.is_none() && !self.caller_ns().is_empty() {
+            Some(format!("{}\\{}", self.caller_ns(), raw))
+        } else {
+            None
+        };
         // INIT_FCALL fails before argument evaluation can have effects.
         if decl.is_none()
             && !builtins::is_builtin(lname)

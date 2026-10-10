@@ -969,25 +969,12 @@ impl<'a> Interp<'a> {
                 self.cur_line,
             ));
         }
-        let mut decl = self.functions.get(lname.as_ref()).cloned();
-        // A namespaced user function outranks the global/builtin one for
-        // unqualified calls (namespaces/ns_013).
-        let mut ns_resolved = false;
-        // When the ns\name fallback misses too, the undefined-function
-        // error names the ns-qualified candidate (bugs/77376). Lazy:
-        // only built on the error path — None means "use raw_name".
-        let mut miss_name: Option<String> = None;
-        if decl.is_none() && unqualified {
-            let ns = self.caller_ns();
-            if !ns.is_empty() {
-                let cand = format!("{}\\{}", ns.to_lowercase(), lname.as_ref());
-                decl = self.functions.get(&cand).cloned();
-                ns_resolved = decl.is_some();
-                if !ns_resolved {
-                    miss_name = Some(format!("{}\\{}", ns, fname.trim_start_matches('\u{1}')));
-                }
-            }
-        }
+        let (decl, ns_resolved) = self.resolve_user_fn(lname.as_ref(), unqualified);
+        let miss_name = if unqualified && decl.is_none() && !self.caller_ns().is_empty() {
+            Some(format!("{}\\{}", self.caller_ns(), raw_name))
+        } else {
+            None
+        };
         // Zend resolves the callee at INIT — before any arg op — so an
         // unresolvable name aborts the call before args ever evaluate.
         if decl.is_none()
@@ -1108,6 +1095,22 @@ impl<'a> Interp<'a> {
             }
         };
         self.invoke_fn(&decl, argvals, None, None)
+    }
+
+    /// Literal unqualified calls try the declaring namespace before global
+    /// user functions. Dynamic/fully-qualified names use the supplied name.
+    pub(in crate::interp) fn resolve_user_fn(
+        &self,
+        lname: &str,
+        unqualified: bool,
+    ) -> (Option<Rc<FunctionDecl>>, bool) {
+        if unqualified && !self.caller_ns().is_empty() {
+            let candidate = format!("{}\\{}", self.caller_ns().to_lowercase(), lname);
+            if let Some(decl) = self.functions.get(&candidate) {
+                return (Some(decl.clone()), true);
+            }
+        }
+        (self.functions.get(lname).cloned(), false)
     }
 
     /// Call any callable-ish Value: Callable, string name, [obj,'m'], obj
