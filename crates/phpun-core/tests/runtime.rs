@@ -323,7 +323,9 @@ string(4) "keep"
 
 #[test]
 fn scalar_value_calls_preserve_observed_arguments_and_cell_fallbacks() {
-    let (out, err, code) = eval("scalar-value.php", r#"<?php
+    let (out, err, code) = eval(
+        "scalar-value.php",
+        r#"<?php
 function recur(int $n): int { return $n < 2 ? $n : recur($n-1) + recur($n-2); }
 function untyped($n) { return $n < 2 ? $n : untyped($n-1) + untyped($n-2); }
 function introspect(int $n) { return func_get_arg(0) + func_num_args() + count(func_get_args()); }
@@ -347,8 +349,12 @@ set_error_handler(function($n,$m) { $t=debug_backtrace(); var_dump($t[2]['args']
 observe_error(13);
 echo extra(3,4), ' ', optional(), ' ', optional(n:5), ' ', decimal(7), "\n";
 try { recur('not numeric'); } catch (Throwable $e) { echo "type-error\n"; }
-"#, &[]);
-    assert_eq!(out, r#"144 144 9 16 8
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"144 144 9 16 8
 array(1) {
   [0]=>
   int(9)
@@ -371,7 +377,8 @@ array(1) {
 }
 2 3 5 7
 type-error
-"#);
+"#
+    );
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
