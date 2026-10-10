@@ -2173,6 +2173,10 @@ impl<'a> Interp<'a> {
             decl.is_none(),
             Some(site),
             false,
+            decl.is_some()
+                || !builtin_params.is_empty()
+                || crate::builtins::builtin_sig(lname).is_some_and(|sg| !sg.is_empty())
+                || crate::builtins::builtin_params(lname).is_some(),
         )?;
         if let Some(d) = decl {
             return self.invoke_fn(d, args, None, None);

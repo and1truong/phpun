@@ -1175,7 +1175,15 @@ impl<'a> Interp<'a> {
                 } else {
                     format!("{base}::__construct")
                 };
-                let argvals = s.arg_cells(args, &params, &ctx, false, Some(*site), true)?;
+                let argvals = s.arg_cells(
+                    args,
+                    &params,
+                    &ctx,
+                    false,
+                    Some(*site),
+                    true,
+                    !params.is_empty(),
+                )?;
                 s.new_instance(&name, argvals)
             }),
             Expr::Prop {
@@ -1254,6 +1262,7 @@ impl<'a> Interp<'a> {
                     &format!("{}::{{closure}}", cls.name()),
                     false,
                     Some(*site),
+                    false,
                     false,
                 )?;
                 s.static_invoke_vis(cls, &n, argvals, None, fwd)
