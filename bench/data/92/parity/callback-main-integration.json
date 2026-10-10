@@ -1,0 +1,11 @@
+{
+  "head": "81ca6efdeb6c4d0c56a8ce22753473d2f29134ac",
+  "main": "0179ed3d4d5bbc9469e033523be508601b055a5a",
+  "binary_sha256": "70d8a243f2ea065132abf36dab40353e7fea2f945780c861b7d843f78cfae2f1",
+  "vm_callback_byte_gates": 22,
+  "workspace_tests": "pass",
+  "fmt": "pass",
+  "clippy": "pass",
+  "timing": "no new timing; frozen92d0be0 data retained",
+  "workload_byte_gates": 19
+}

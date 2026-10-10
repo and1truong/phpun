@@ -173,7 +173,7 @@ pub struct Frame {
     vars: crate::value::FxMap<String, Cell>,
     /// Actual call args for func_get_args().
     args: Vec<Cell>,
-    /// Read-only scalar direct-call args, promoted only when cells are observed.
+    /// Live direct-call args; slot writes update these, observation can promote.
     value_args: Vec<Value>,
     /// Enclosing function name (for `static`/`__FUNCTION__`).
     fn_name: Rc<str>,
