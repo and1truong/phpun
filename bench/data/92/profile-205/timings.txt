@@ -1,0 +1,31 @@
+# bench results
+
+- date: 2026-10-10T13:02:58.791802+00:00
+- source checkout: ef633928471a36c7f180b30fa1ff52fc0a4dcb97; dirty: False (not binary build provenance)
+- phpun: phpun 0.0.1 (php compat target: 8.5)
+- phpun binary: /home/ubuntu/repos/phpun/target/release/phpun; sha256: 41a6be6d9aa3341004e28c511047f451be2487aebe5ae957dfa9e51dafd572a4
+- php: 8.5.11; command: /home/linuxbrew/.linuxbrew/Cellar/php/8.5.11_1/bin/php -n
+- php binary sha256: db75babc9db02ce5ce86448e3caf5f1c152285366c570091dd146e3b87739152
+- php config: {"ini":false,"scanned":false,"extensions":["Core","date","lexbor","openssl","pcre","sqlite3","zlib","bcmath","bz2","calendar","ctype","curl","dba","uri","json","mbstring","SPL","FFI","fileinfo","filter","ftp","gd","gettext","gmp","hash","iconv","intl","session","ldap","standard","libxml","mysqlnd","mysqli","odbc","Zend OPcache","pcntl","PDO","pdo_dblib","pdo_mysql","PDO_ODBC","pdo_pgsql","pdo_sqlite","pgsql","Phar","posix","random","readline","Reflection","exif","shmop","SimpleXML","snmp","soap","sockets","sodium","sysvmsg","sysvsem","sysvshm","tidy","tokenizer","dom","xml","xmlreader","xmlwriter","xsl","zip"],"opcache.enable_cli":"0","opcache.jit":"disable","opcache.jit_buffer_size":"64M"}
+- host: Linux-6.8.0-1061-aws-x86_64-with-glibc2.35; 8 logical CPUs
+- build provenance: not supplied; set PHPUN_BUILD_INFO
+- metric: median wall-clock ms; 7 reps; alternating runtime order; timeout 300s
+- scope: cold process startup + parse + execution; min/max show observed dispersion
+- gates: zero exit, deterministic stdout and stderr, byte-identical to reference on every rep
+- ratio = phpun / php; below 1 means phpun faster; profiler disabled
+
+| bench | PHP median [min,max] ms | phpun median [min,max] ms | ratio | gate |
+|---|---:|---:|---:|---|
+<!-- commands: /home/linuxbrew/.linuxbrew/Cellar/php/8.5.11_1/bin/php -n bench/40-objects.php ; /home/ubuntu/repos/phpun/target/release/phpun bench/40-objects.php -->
+| 40-objects | 27.973 [25.773,48.104] | 293.950 [265.391,480.076] | 10.51× | ok |
+<!-- commands: /home/linuxbrew/.linuxbrew/Cellar/php/8.5.11_1/bin/php -n bench/30-arrays.php ; /home/ubuntu/repos/phpun/target/release/phpun bench/30-arrays.php -->
+| 30-arrays | 57.388 [36.314,73.307] | 187.487 [176.124,341.742] | 3.27× | ok |
+<!-- commands: /home/linuxbrew/.linuxbrew/Cellar/php/8.5.11_1/bin/php -n bench/60-json.php ; /home/ubuntu/repos/phpun/target/release/phpun bench/60-json.php -->
+| 60-json | 196.392 [138.952,233.544] | 1499.977 [859.384,1658.708] | 7.64× | ok |
+<!-- commands: /home/linuxbrew/.linuxbrew/Cellar/php/8.5.11_1/bin/php -n bench/10-fib.php ; /home/ubuntu/repos/phpun/target/release/phpun bench/10-fib.php -->
+| 10-fib | 58.846 [28.607,72.813] | 183.193 [129.896,250.495] | 3.11× | ok |
+<!-- commands: /home/linuxbrew/.linuxbrew/Cellar/php/8.5.11_1/bin/php -n bench/11-sieve.php ; /home/ubuntu/repos/phpun/target/release/phpun bench/11-sieve.php -->
+| 11-sieve | 41.701 [26.384,60.626] | 282.845 [176.761,323.804] | 6.78× | ok |
+
+valid benchmarks: 5/5
+geometric mean slowdown (valid benchmarks only): 5.61×

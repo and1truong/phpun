@@ -3625,6 +3625,7 @@ impl<'a> Interp<'a> {
         // The arena counter counts every shell too — a flat cost per
         // allocation (new_oom), decremented at Drop like zend's arena.
         crate::value::obj_charge();
+        alloc_hit(10);
         let rc = Rc::new(RefCell::new(o));
         self.mem_track(&rc, bytes);
         let id = self.next_obj_id(&rc);

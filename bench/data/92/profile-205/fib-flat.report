@@ -1,0 +1,153 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 3K of event 'cpu-clock:u'
+# Event count (approx.): 3666666663
+#
+# Overhead  Command  Shared Object         Symbol                                                                                                                                                                                                    
+# ........  .......  ....................  ..........................................................................................................................................................................................................
+#
+    38.52%  phpun    phpun                 [.] _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp7vm_exec
+    11.68%  phpun    phpun                 [.] _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp6vm_run
+     7.92%  phpun    phpun                 [.] _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp13vm_slot_value
+     7.43%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp5callsNtB4_6Interp15call_site_frame
+     4.37%  phpun    libc.so.6             [.] 0x00000000001a6853
+     2.62%  phpun    libc.so.6             [.] 0x00000000001a695d
+     2.32%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp9trace_pop
+     2.18%  phpun    phpun                 [.] _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp9vm_binary
+     1.88%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core5value5ValueEBF_
+     1.69%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp7vm_site
+     1.31%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp13vm_frame_free
+     1.15%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtCscdodAO9FK5_5alloc3vec3VecINtNtBG_2rc2RcINtNtB4_4cell7RefCellNtNtCsdREBRar76Nx_10phpun_core5value5ValueEEEEB1K_
+     1.06%  phpun    libc.so.6             [.] cfree
+     0.96%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core6interp8CallArgsEBF_
+     0.87%  phpun    libc.so.6             [.] malloc
+     0.76%  phpun    libc.so.6             [.] 0x00000000001a6920
+     0.71%  phpun    libc.so.6             [.] 0x00000000001a6840
+     0.66%  phpun    phpun                 [.] _RNvMs6_NtCsgQfI1edjipl_9hashbrown3rawINtB5_8RawTableTNtNtCscdodAO9FK5_5alloc6string6StringINtNtBT_2rc2RcINtNtCs4NRVxsYgnAr_4core4cell7RefCellNtNtCsdREBRar76Nx_10phpun_core5value5ValueEEEE5clearB2j_
+     0.55%  phpun    libc.so.6             [.] 0x00000000001a6919
+     0.52%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp19destruct_frame_objs
+     0.49%  phpun    phpun                 [.] _RNvXs4_NtCscdodAO9FK5_5alloc6stringNtB5_6StringNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+     0.46%  phpun    libc.so.6             [.] 0x00000000001a690b
+     0.41%  phpun    libc.so.6             [.] 0x00000000001a6928
+     0.41%  phpun    libc.so.6             [.] 0x00000000001a6930
+     0.41%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtCscdodAO9FK5_5alloc3vec3VecNtNtNtCsdREBRar76Nx_10phpun_core6interp2vm4SlotEEB1d_
+     0.41%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp5callsNtB4_6Interp9call_site
+     0.41%  phpun    phpun                 [.] _RNvMs4_NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsdREBRar76Nx_10phpun_core
+     0.35%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtNtCscdodAO9FK5_5alloc3vec5drain5DrainINtNtBI_2rc2RcINtNtB4_4cell7RefCellNtNtCsdREBRar76Nx_10phpun_core5value5ValueEEEEB1U_
+     0.35%  phpun    phpun                 [.] _RNvMs3_NtCscdodAO9FK5_5alloc7raw_vecINtB5_6RawVecINtNtB7_2rc2RcINtNtCs4NRVxsYgnAr_4core4cell7RefCellNtNtCsdREBRar76Nx_10phpun_core5value11PhpResourceEEE8grow_oneB1E_
+     0.30%  phpun    phpun                 [.] _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp11vm_backedge
+     0.30%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp14destruct_cells
+     0.30%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp15vm_call_reserve
+     0.30%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp16sweep_expr_temps
+     0.27%  phpun    libc.so.6             [.] 0x00000000001a694d
+     0.27%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtNtCscdodAO9FK5_5alloc3vec5drain5DrainNtNtCsdREBRar76Nx_10phpun_core5value5ValueEEB1l_
+     0.27%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtNtCscdodAO9FK5_5alloc3vec9into_iter8IntoIterTNtNtBI_6string6StringINtNtBI_2rc2RcINtNtB4_4cell7RefCellNtNtCsdREBRar76Nx_10phpun_core5value5ValueEEbEEEB2n_
+     0.25%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtNtCsdREBRar76Nx_10phpun_core6interp2vm8CachedFnEBH_
+     0.22%  phpun    libc.so.6             [.] 0x00000000000a29ed
+     0.22%  phpun    phpun                 [.] _RNvYNCNvMs_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB9_8Compiled14scalar_ty_gates1_0INtNtNtCs4NRVxsYgnAr_4core3ops8function6FnOnceTRNtNtBd_5value5ValueEE9call_onceBd_
+     0.16%  phpun    libc.so.6             [.] 0x00000000000a29e9
+     0.16%  phpun    phpun                 [.] _RNvNtCsdREBRar76Nx_10phpun_core5lexer7lex_php
+     0.14%  phpun    libc.so.6             [.] 0x00000000001a68fa
+     0.14%  phpun    libc.so.6             [.] 0x00000000001ae8a5
+     0.14%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtCscdodAO9FK5_5alloc3vec3VecTNtNtBG_6string6StringINtNtBG_2rc2RcINtNtB4_4cell7RefCellNtNtCsdREBRar76Nx_10phpun_core5value5ValueEEEEEB26_
+     0.11%  phpun    libc.so.6             [.] 0x00000000000a2660
+     0.11%  phpun    libc.so.6             [.] 0x00000000000a270b
+     0.11%  phpun    libc.so.6             [.] 0x00000000000a29dd
+     0.11%  phpun    libc.so.6             [.] 0x00000000000a29e1
+     0.11%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp3genNtB4_6Interp15expr_yield_kind
+     0.08%  phpun    libc.so.6             [.] 0x00000000000a26c9
+     0.08%  phpun    libc.so.6             [.] 0x00000000000a26ff
+     0.08%  phpun    libc.so.6             [.] 0x00000000000a2712
+     0.08%  phpun    libc.so.6             [.] 0x00000000000a2721
+     0.08%  phpun    libc.so.6             [.] 0x00000000000a27c2
+     0.08%  phpun    libc.so.6             [.] 0x00000000001a6913
+     0.08%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core3ast4ExprEBF_
+     0.08%  phpun    phpun                 [.] _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp9gate_expr
+     0.05%  phpun    ld-linux-x86-64.so.2  [.] 0x000000000000b247
+     0.05%  phpun    libc.so.6             [.] 0x00000000000a26fb
+     0.05%  phpun    libc.so.6             [.] 0x00000000000a2850
+     0.05%  phpun    libc.so.6             [.] 0x00000000000a288a
+     0.05%  phpun    libc.so.6             [.] 0x00000000000a3ca8
+     0.05%  phpun    libc.so.6             [.] 0x00000000000a3cbd
+     0.05%  phpun    libc.so.6             [.] 0x00000000001a6940
+     0.05%  phpun    libc.so.6             [.] 0x00000000001a6bd5
+     0.05%  phpun    libc.so.6             [.] 0x00000000001ae880
+     0.05%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4declNtB4_6Parser11method_decl
+     0.05%  phpun    phpun                 [.] _RNvMs_NtCscdodAO9FK5_5alloc3vecINtB4_3VecNtNtNtCsdREBRar76Nx_10phpun_core6interp2vm4SlotE8truncateBJ_
+     0.03%  bash     bash                  [.] set_signal_handler
+     0.03%  bash     bash                  [.] 0x00000000000834ca
+     0.03%  phpun    ld-linux-x86-64.so.2  [.] 0x000000000000b4db
+     0.03%  phpun    ld-linux-x86-64.so.2  [.] 0x000000000000b4e5
+     0.03%  phpun    ld-linux-x86-64.so.2  [.] 0x0000000000016458
+     0.03%  phpun    ld-linux-x86-64.so.2  [.] 0x0000000000027d60
+     0.03%  phpun    ld-linux-x86-64.so.2  [.] 0x00000000000282cf
+     0.03%  phpun    libc.so.6             [.] __libc_early_init
+     0.03%  phpun    libc.so.6             [.] __memmove_chk
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a2671
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a267e
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a2692
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a26df
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a26ed
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a26f1
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a2702
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a272b
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a27ad
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a27ca
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a29c0
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a29c7
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3970
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3c50
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3c5e
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3c6d
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3c86
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3d34
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3e03
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a3e85
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a4032
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a4236
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a4275
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a4421
+     0.03%  phpun    libc.so.6             [.] 0x00000000000a443a
+     0.03%  phpun    libc.so.6             [.] 0x00000000001a6844
+     0.03%  phpun    libc.so.6             [.] 0x00000000001a6847
+     0.03%  phpun    libc.so.6             [.] 0x00000000001a6902
+     0.03%  phpun    libc.so.6             [.] 0x00000000001a6947
+     0.03%  phpun    libc.so.6             [.] 0x00000000001a6956
+     0.03%  phpun    libc.so.6             [.] 0x00000000001a698c
+     0.03%  phpun    libc.so.6             [.] 0x00000000001ae8b8
+     0.03%  phpun    libm.so.6             [.] 0x000000000000e420
+     0.03%  phpun    phpun                 [.] _RINvMs1_NtCsgQfI1edjipl_9hashbrown3mapINtB6_7HashMapjINtNtCscdodAO9FK5_5alloc3vec3VecNtNtBU_6string6StringENtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateE6removejECsdREBRar76Nx_10phpun_core
+     0.03%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core3ast12FunctionDeclEBF_
+     0.03%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core3ast9ClassDeclEBF_
+     0.03%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core5lexer5TokenEBF_
+     0.03%  phpun    phpun                 [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueSNtNtCsdREBRar76Nx_10phpun_core3ast8AttrDeclEBG_
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp5callsNtB4_6Interp16decl_type_checks
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4declNtB4_6Parser10class_decl
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4declNtB4_6Parser9take_type
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser10comparison
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser10logical_or
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser15logical_xor_low
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser4term
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser5power
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser5shift
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser5unary
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser6concat
+     0.03%  phpun    phpun                 [.] _RNvMNtNtCsdREBRar76Nx_10phpun_core6parser4exprNtB4_6Parser8additive
+     0.03%  phpun    phpun                 [.] _RNvMs3_NtCscdodAO9FK5_5alloc3stre12to_lowercase
+     0.03%  phpun    phpun                 [.] _RNvMs_NtCsdREBRar76Nx_10phpun_core6parserNtB4_6Parser4body
+     0.03%  phpun    phpun                 [.] _RNvMs_NtNtCsdREBRar76Nx_10phpun_core6interp4flowNtB6_6Interp9flow_gate
+     0.03%  phpun    phpun                 [.] _RNvNtCsdREBRar76Nx_10phpun_core5lexer5ident
+     0.03%  phpun    phpun                 [.] _RNvNtCsdREBRar76Nx_10phpun_core5lexer6number
+     0.03%  phpun    phpun                 [.] _RNvXs2_NtCsdREBRar76Nx_10phpun_core3astNtB5_9ClassDeclNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+     0.03%  phpun    phpun                 [.] _RNvXsH_NtCsdREBRar76Nx_10phpun_core3astNtB5_12FunctionDeclNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+     0.03%  phpun    phpun                 [.] _RNvXsL_NtCscdodAO9FK5_5alloc2rcINtB5_2RceENtNtCs4NRVxsYgnAr_4core3fmt7Display3fmtCsdREBRar76Nx_10phpun_core
+     0.03%  phpun    phpun                 [.] _RNvXsL_NtCsdREBRar76Nx_10phpun_core3astNtB5_4ExprNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+     0.03%  phpun    phpun                 [.] _RNvXsa_NtCscdodAO9FK5_5alloc3vecINtB5_3VecNtNtB7_6string6StringENtNtCs4NRVxsYgnAr_4core5clone5Clone5cloneCsdREBRar76Nx_10phpun_core
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

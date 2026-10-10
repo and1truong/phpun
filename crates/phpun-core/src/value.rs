@@ -3,6 +3,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::interp::util::alloc_hit;
+
 /// rustc-hash-style multiply-rotate hasher — SipHash's 5x+ speed on the
 /// short keys that dominate our tables (var names, function names,
 /// array keys). Deterministic across runs: all table iteration already
@@ -316,6 +318,7 @@ impl PhpArray {
     pub fn push(&mut self, v: Value) {
         let k = ArrKey::Int(self.next);
         self.mem_note_key(&k);
+        alloc_hit(9);
         self.entries.push((k, Rc::new(RefCell::new(v))));
         self.next += 1;
         self.mem_note_append();
@@ -331,6 +334,7 @@ impl PhpArray {
     }
 
     pub fn set(&mut self, k: ArrKey, v: Value) {
+        alloc_hit(9);
         self.set_cell(k, Rc::new(RefCell::new(v)));
     }
 
@@ -351,7 +355,10 @@ impl PhpArray {
             let writable = slot.1.try_borrow_mut().is_ok();
             match (new_v, writable) {
                 (Ok(v), true) => *slot.1.borrow_mut() = v,
-                (Ok(v), false) => slot.1 = Rc::new(RefCell::new(v)),
+                (Ok(v), false) => {
+                    alloc_hit(9);
+                    slot.1 = Rc::new(RefCell::new(v))
+                }
                 (Err(_), _) => slot.1 = c,
             }
             return;
@@ -405,6 +412,7 @@ impl PhpArray {
                 STR_LIVE.fetch_sub(c, std::sync::atomic::Ordering::Relaxed);
             }
             slot.0 = ArrKey::Tomb;
+            alloc_hit(9);
             let old = std::mem::replace(&mut slot.1, Rc::new(RefCell::new(Value::Null)));
             if Rc::strong_count(&old) == 1 {
                 return Some(std::mem::replace(&mut *old.borrow_mut(), Value::Null));
@@ -573,7 +581,10 @@ impl Clone for PhpArray {
             entries: self
                 .entries
                 .iter()
-                .map(|(k, c)| (k.clone(), Rc::new(RefCell::new(c.borrow().clone()))))
+                .map(|(k, c)| {
+                    alloc_hit(9);
+                    (k.clone(), Rc::new(RefCell::new(c.borrow().clone())))
+                })
                 .collect(),
             mem_elems: 0,
             next: self.next,
@@ -2085,6 +2096,7 @@ impl PhpStr {
         // (24B header + 8B emalloc header; oracle: 8000032 for 8MB).
         let req = bytes.len() as i64 + 32;
         mem_charge(&STR_LIVE, str_charge(bytes.len()), req);
+        alloc_hit(7);
         PhpStr { rc: Rc::new(bytes) }
     }
 
