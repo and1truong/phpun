@@ -148,3 +148,22 @@ Validation: workspace tests/fmt/clippy/release, union order/mixed-case/by-ref/
 promoted args/introspection/object conversion check, 27 oracle probes; 709 binding
 PHPT636pass/62existingfail/2skip/9unsupported, all statuses unchanged, zero
 crashes/timeouts.
+
+## Fixed by-value promoted slot binder (#186)
+
+Runtime2077344 →f4a5c04: eligible fixed by-value constructors with literal defaults
+reuse the existing VM argument binder. Publish bound args/locals before canonical
+store_prop promotion so hooks can observe constructor context. Body, return/unwind
+and destructor passes use the existing VM shell. Named/reference/variadic/expression
+default calls retain canonical binding. Scalar raw-value ABI excludes promotion.
+
+Seven alternating PHP-gated release pairs: objects357.569→347.709ms (0.972×),
+ctor126.845→118.570 (0.935×), norm155.283→141.282 (0.910×), scaled276.082→248.459
+(0.900×). Whole workload improvement is small and ranges overlap; phase medians
+do not establish broad PHP parity. Fib/strings/app ranges also overlap.
+
+Validation: workspace tests/fmt/clippy/release; coercion/default/named/inherited/
+unpack/hooks/readonly/error regression; 28 oracle probes. 1,974 selected class/
+hooks/binding/lifetime PHPT unchanged (1,716pass/217existingfail/16skip/23unsupported/
+2existingGC30s timeouts), zero crashes. Existing by-ref promoted-property alias
+difference #197 is present on main too; those calls remain canonical, not fixed here.

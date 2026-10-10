@@ -1,0 +1,31 @@
+{
+  "runtime": "f4a5c04",
+  "checks": [
+    "workspace tests",
+    "fmt",
+    "clippy",
+    "release",
+    "promoted args/hooks/readonly/coercion/named/expr-default fallbacks",
+    "28 VM/standalone oracle probes"
+  ],
+  "phpt": {
+    "total": 1974,
+    "passed": 1716,
+    "failed": 217,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 16,
+    "unsupported": 23,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 2,
+    "applicable": 1935,
+    "compatibility_pct": 88.68
+  },
+  "status_changes": [],
+  "existing_timeouts": [
+    "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_2.phpt",
+    "/workspace/phpun/vendor/php-tests/Zend/tests/gc/gc_045.phpt"
+  ],
+  "baseline_byref_promotion_difference": "#197, remains canonical; no compatibility claim"
+}
