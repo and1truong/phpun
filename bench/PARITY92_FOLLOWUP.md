@@ -432,3 +432,10 @@ thresholds and range followups retained; no full PHP compatibility claim.
 #187 remains partial: bounded property-key cache, JSON shared sink and scalar CV
 array reads implemented. Actual packed inline storage/declared offset layouts
 remain pending evidence and ownership/lifetime gates, explicitly tracked in #92.
+
+After-read CPU profile946samples/zero lost: vm_refresh4.33%exclusive,
+vm_materialize6.87%,global_var_cell12.58%,assign_inner5.39%,
+assign_index_path3.59%; remaining writes still use canonical bridges.
+Malloc2.22%/cfree3.07%do not by themselves justify inline packed ownership
+rewrite on sieve. LLVM moved the main bucket into vm_exec_ops15.12%; this
+is not pure dispatch attribution or directly the old vm_exec symbol bucket.

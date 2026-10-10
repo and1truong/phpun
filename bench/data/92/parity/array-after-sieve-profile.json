@@ -1,0 +1,25 @@
+{
+  "runtime": "05804b7",
+  "binary_sha256": "52e3725e3967e8e262a975dac5d1dea4e0333027bec636ac2c7bc9c817f12a8d",
+  "samples": 946,
+  "lost": 0,
+  "event": "cpu-clock:u",
+  "frequency_hz": 199,
+  "callgraph": "DWARF8192",
+  "argv": [
+    "bench/11-sieve.php",
+    "10",
+    "200000"
+  ],
+  "exclusive_percent": {
+    "vm_exec_ops": 15.12,
+    "global_var_cell": 12.58,
+    "vm_materialize": 6.87,
+    "vm_refresh": 4.33,
+    "assign_inner": 5.39,
+    "assign_index_path": 3.59,
+    "malloc": 2.22,
+    "cfree": 3.07
+  },
+  "note": "symbol changed from vm_exec to vm_exec_ops due inlining, not comparable pure-dispatch bucket; remaining canonical writes not optimized here"
+}
