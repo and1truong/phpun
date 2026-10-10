@@ -29,3 +29,9 @@ echo scalar(1), scalar(2), fallback_body(), fallback_body(), foreach_body([8]), 
     assert int(counters['executed-body']) == 3, log
     assert int(counters['other']) >= 2 and int(counters['hybrid-body']) == 1, log
 print('VM coverage diagnostics: ok')
+
+# Root loops must actually use bytecode while preserving global scope.
+root = Path('crates/phpun-core/tests/fixtures/vm_top_level.php')
+prof = subprocess.run([binary, str(root)], env=dict(os.environ, PHPUN_VMPROF='1'), capture_output=True)
+assert prof.returncode == 0 and prof.stdout == root.with_suffix('.expect').read_bytes(), prof
+assert b'vm-coverage: top-level-entry=1\n' in prof.stderr, prof.stderr

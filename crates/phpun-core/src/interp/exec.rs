@@ -233,6 +233,11 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn exec(&mut self, s: &Stmt) -> Flow {
+        self.exec_at(s, None)
+    }
+
+    /// Bytecode copies statements but preserves early-bound declaration identity.
+    pub(in crate::interp) fn exec_at(&mut self, s: &Stmt, decl_site: Option<usize>) -> Flow {
         match s {
             Stmt::Line(l) => {
                 self.cur_line = *l;
@@ -570,7 +575,7 @@ impl<'a> Interp<'a> {
                     return self.err_flow(e);
                 }
                 let key = d.name.to_lowercase();
-                let site = std::ptr::from_ref(d) as usize;
+                let site = decl_site.unwrap_or_else(|| std::ptr::from_ref(d) as usize);
                 // The decl site early-bound at compile no-ops on
                 // execution; a DIFFERENT decl (a conditional decl in an
                 // if/loop, or a decl in another unit) claiming the

@@ -2679,7 +2679,9 @@ impl<'a> Interp<'a> {
             }
             return result;
         }
-        let flow = self.exec_block(stmts);
+        let flow = self
+            .vm_top_exec(stmts)
+            .unwrap_or_else(|| self.exec_block(stmts));
         // A generator destroyed by the unwind (last ref dropped as
         // the error propagated) replays its finally before the fatal
         // renders — Zend tears objects down between diagnosing and

@@ -1,17 +1,7 @@
-//! Spike bytecode VM (issue #39): a `FunctionDecl` whose body stays
-//! inside the supported subset compiles once to a flat `Vec<Op>` and
-//! runs on a value stack with locals in slots — no per-arg Cell, no
-//! binds vec, no vars-map insert per call. Any construct outside the
-//! subset bails the WHOLE body to the AST path. Oracle probes and
-//! regression checks are still required for every supported construct.
-//!
-//! ponytail: the subset is deliberately narrow (scalars, arith/compare,
-//! if/while/for, direct named calls, return). The known ceiling: frame
-//! args still materialize cells (dtor coverage via frame.args) and the
-//! call arena charge (`vm_sites`) is kept, so the win here is
-//! dispatch + locals, not yet arena accounting. Extend coverage by
-//! teaching `compile` more constructs — never by loosening runtime
-//! semantics.
+//! Bytecode control flow and scalar operations with canonical AST bridges.
+//! Unsupported bodies retain the AST path; hybrid functions retain binding
+//! and frame teardown. Top-level loops reuse globals without a synthetic frame.
+//! Oracle probes and regression gates are required for each extension.
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -47,6 +37,7 @@ pub(crate) struct Compiled {
     ops: Vec<Op>,
     /// Canonical expression operations retain AST semantics inside VM control flow.
     hybrid: bool,
+    top_level: bool,
     /// Slot count — params occupy the first `decl.params.len()` slots.
     nslots: usize,
     /// Param name → slot index — the bound (typed/variadic/named-arg)
@@ -109,7 +100,7 @@ macro_rules! padd {
 }
 
 // Opt-in diagnostics: cache lookups are not calls or elapsed-time shares.
-const COVERAGE_NAMES: [&str; 20] = [
+const COVERAGE_NAMES: [&str; 21] = [
     "compiled-lookup",
     "executed-body",
     "reference-return",
@@ -130,9 +121,10 @@ const COVERAGE_NAMES: [&str; 20] = [
     "other",
     "hybrid-lookup",
     "hybrid-body",
+    "top-level-entry",
 ];
-static COVERAGE: [std::sync::atomic::AtomicU64; 20] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+static COVERAGE: [std::sync::atomic::AtomicU64; 21] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 21];
 
 fn coverage_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -155,6 +147,7 @@ enum Op {
     Canonical(Box<Expr>),
     CanonicalStmt {
         stmt: Box<Stmt>,
+        decl_site: Option<usize>,
         depth: u32,
         normal: usize,
         breaks: Vec<usize>,
@@ -250,6 +243,7 @@ struct Compiler {
     /// model can't reproduce, so it bails.
     assigned: std::collections::HashSet<String>,
     fallback: &'static str,
+    top_level: bool,
 }
 
 impl Compiled {
@@ -284,7 +278,11 @@ impl Compiled {
         })
     }
 
-    pub(crate) fn compile(decl: &FunctionDecl) -> Result<Rc<Compiled>, &'static str> {
+    pub(crate) fn compile(
+        decl: &FunctionDecl,
+        body: &[Stmt],
+        top_level: bool,
+    ) -> Result<Rc<Compiled>, &'static str> {
         // A by-ref return needs cell plumbing on Flow::Return — AST
         // keeps it. Everything else still compiles: typed/variadic/
         // promoted params, declared returns and expr defaults get
@@ -292,7 +290,7 @@ impl Compiled {
         if decl.by_ref {
             return Err("reference-return");
         }
-        if Interp::decl_contains_yield(&decl.body) {
+        if Interp::decl_contains_yield(body) {
             return Err("generator");
         }
         let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
@@ -317,7 +315,7 @@ impl Compiled {
 
         let mut assigned: std::collections::HashSet<String> =
             decl.params.iter().map(|p| p.name.clone()).collect();
-        collect_assigned(&decl.body, &mut assigned);
+        collect_assigned(body, &mut assigned);
 
         let mut c = Compiler {
             ops: Vec::new(),
@@ -325,11 +323,12 @@ impl Compiled {
             loops: Vec::new(),
             assigned,
             fallback: "other",
+            top_level,
         };
         for (i, p) in decl.params.iter().enumerate() {
             c.slots.insert(p.name.clone(), i as u16);
         }
-        c.stmts(&decl.body).ok_or(c.fallback)?;
+        c.stmts(body).ok_or(c.fallback)?;
         // No trailing Const+Return: pc exhausting the stream is
         // Flow::Normal — the bound path's `Flow::Return` arm treats
         // an explicit `return` differently from fall-off-the-end.
@@ -354,6 +353,7 @@ impl Compiled {
             .any(|op| matches!(op, Op::Canonical(_) | Op::CanonicalStmt { .. }));
         Ok(Rc::new(Compiled {
             hybrid,
+            top_level,
             nslots: c.slots.len(),
             names: c.slots,
             ops: c.ops,
@@ -645,6 +645,7 @@ impl Compiler {
                 // surrounding bytecode loops retain their own jump targets.
                 let at = self.emit(Op::CanonicalStmt {
                     stmt: Box::new(s.clone()),
+                    decl_site: None,
                     depth: self.loops.len() as u32,
                     normal: usize::MAX,
                     breaks: Vec::new(),
@@ -672,6 +673,29 @@ impl Compiler {
                     *b = breaks;
                     *c = continues;
                 }
+            }
+            Stmt::Function(_)
+            | Stmt::Class(_)
+            | Stmt::Namespace(_)
+            | Stmt::Use(_)
+            | Stmt::Declare { .. }
+            | Stmt::ConstDecl(_)
+            | Stmt::Diag { .. }
+            | Stmt::Inline(_)
+                if self.top_level =>
+            {
+                let next = self.ops.len() + 1;
+                self.emit(Op::CanonicalStmt {
+                    stmt: Box::new(s.clone()),
+                    decl_site: match s {
+                        Stmt::Function(d) => Some(std::ptr::from_ref(d) as usize),
+                        _ => None,
+                    },
+                    depth: self.loops.len() as u32,
+                    normal: next,
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
             }
             _ => return None,
         }
@@ -732,6 +756,11 @@ impl Compiler {
                 }
                 let sl = self.slot(n);
                 self.emit(Op::Load(sl));
+            }
+            Expr::Assign {
+                op: "=&" | "??=", ..
+            } => {
+                self.emit(Op::Canonical(Box::new(e.clone())));
             }
             Expr::Assign {
                 target, op, value, ..
@@ -874,7 +903,16 @@ impl Compiler {
                     self.emit(Op::Canonical(Box::new(e.clone())));
                     return Some(());
                 };
-                if raw.contains("::") || raw.starts_with('\\') {
+                if !raw.starts_with('\u{1}')
+                    || raw.contains('\\')
+                    || raw.contains("::")
+                    || args.iter().any(|a| {
+                        matches!(
+                            Interp::unmark_arg(a),
+                            Expr::Unpack(_) | Expr::Binary { op: "named", .. }
+                        )
+                    })
+                {
                     self.emit(Op::Canonical(Box::new(e.clone())));
                     return Some(());
                 }
@@ -939,7 +977,8 @@ impl Compiler {
             | Expr::Clone(_)
             | Expr::Instanceof { .. }
             | Expr::Match { .. }
-            | Expr::Throw(_) => {
+            | Expr::Throw(_)
+            | Expr::Include { .. } => {
                 self.emit(Op::Canonical(Box::new(e.clone())));
             }
             _ => return None,
@@ -949,6 +988,39 @@ impl Compiler {
 }
 
 impl<'a> Interp<'a> {
+    pub(in crate::interp) fn vm_top_exec(&mut self, stmts: &[Stmt]) -> Option<Flow> {
+        fn has_loop(stmts: &[Stmt]) -> bool {
+            stmts.iter().any(|s| match s {
+                Stmt::For { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } => true,
+                Stmt::Block(b) => has_loop(b),
+                Stmt::If { then, else_, .. } => has_loop(then) || has_loop(else_),
+                _ => false,
+            })
+        }
+        // Avoid compilation overhead for short CLI entry files with no loops.
+        if !has_loop(stmts) {
+            return None;
+        }
+        let decl = FunctionDecl {
+            name: Rc::from("{main}"),
+            params: Vec::new(),
+            ret: None,
+            body: Vec::new(),
+            attrs: Vec::new(),
+            by_ref: false,
+            line: 0,
+            end_line: 0,
+            file: self.cur_file.clone(),
+            ns: String::new(),
+            decl_in: None,
+        };
+        let comp = Compiled::compile(&decl, stmts, true).ok()?;
+        Some(match self.vm_bound_exec(&comp) {
+            Ok(flow) => flow,
+            Err(err) => self.err_flow(err),
+        })
+    }
+
     /// CLI-only diagnostic report; profiling changes runtime overhead.
     pub fn dump_vm_coverage() {
         if coverage_on() {
@@ -973,7 +1045,7 @@ impl<'a> Interp<'a> {
         let entry = match self.compiled_fns.entry(Rc::as_ptr(decl) as usize) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let (compiled, reason) = match Compiled::compile(decl) {
+                let (compiled, reason) = match Compiled::compile(decl, &decl.body, false) {
                     Ok(c) => {
                         let reason = if c.hybrid {
                             "hybrid-lookup"
@@ -1228,8 +1300,12 @@ impl<'a> Interp<'a> {
         slots: &mut [Slot],
         tmark: usize,
     ) -> Result<Flow, PhpError> {
-        coverage_hit("executed-body");
-        if comp.hybrid {
+        if comp.top_level {
+            coverage_hit("top-level-entry");
+        } else {
+            coverage_hit("executed-body");
+        }
+        if comp.hybrid && !comp.top_level {
             coverage_hit("hybrid-body");
         }
         // Value-stack/argv vecs come from a per-Interp pool — a call
@@ -1365,6 +1441,17 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn vm_publish_global(&mut self, comp: &Compiled, slots: &mut [Slot], index: u16) {
+        if comp.top_level {
+            if let Slot::V(value) = &mut slots[index as usize] {
+                let c = cell(std::mem::replace(value, Value::Null));
+                let name = comp.names.iter().find(|(_, i)| **i == index).unwrap().0;
+                self.cur().vars.insert(name.clone(), c.clone());
+                slots[index as usize] = Slot::C(c);
+            }
+        }
+    }
+
     fn vm_materialize(&mut self, comp: &Compiled, slots: &mut [Slot]) {
         let frame = self.cur();
         for (name, index) in &comp.names {
@@ -1433,6 +1520,7 @@ impl<'a> Interp<'a> {
                 }
                 Op::CanonicalStmt {
                     stmt,
+                    decl_site,
                     depth,
                     normal,
                     breaks,
@@ -1440,7 +1528,7 @@ impl<'a> Interp<'a> {
                 } => {
                     self.vm_materialize(comp, slots);
                     let previous_depth = std::mem::replace(&mut self.loop_depth, *depth);
-                    let flow = self.exec(stmt);
+                    let flow = self.exec_at(stmt, *decl_site);
                     self.loop_depth = previous_depth;
                     self.vm_refresh(comp, slots);
                     pc = match flow {
@@ -1460,21 +1548,24 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
-                Op::Store(s) => match &mut slots[*s as usize] {
-                    Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
-                    Slot::V(v) => {
-                        let old = std::mem::replace(v, vs.last().unwrap().clone());
-                        self.destruct_dying_value(&old)?;
+                Op::Store(s) => {
+                    match &mut slots[*s as usize] {
+                        Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
+                        Slot::V(v) => {
+                            let old = std::mem::replace(v, vs.last().unwrap().clone());
+                            self.destruct_dying_value(&old)?;
+                        }
+                        Slot::C(c) => {
+                            // CV write: new zval lands, displaced decrefs —
+                            // same ordering as cell_store.
+                            let c = c.clone();
+                            let value = self.vm_cell_value(&c, vs.last().unwrap().clone())?;
+                            *vs.last_mut().unwrap() = value.clone();
+                            self.cell_store(&c, value)?;
+                        }
                     }
-                    Slot::C(c) => {
-                        // CV write: new zval lands, displaced decrefs —
-                        // same ordering as cell_store.
-                        let c = c.clone();
-                        let value = self.vm_cell_value(&c, vs.last().unwrap().clone())?;
-                        *vs.last_mut().unwrap() = value.clone();
-                        self.cell_store(&c, value)?;
-                    }
-                },
+                    self.vm_publish_global(comp, slots, *s);
+                }
                 Op::Pop => {
                     // Statement boundary like exec's Stmt::Expr entry:
                     // the ret-cell pin from the just-run call is stale
@@ -1546,6 +1637,7 @@ impl<'a> Interp<'a> {
                             self.cell_store(&c, value)?;
                         }
                     }
+                    self.vm_publish_global(comp, slots, *slot);
                     vs.push(if *post {
                         old
                     } else {
@@ -1558,7 +1650,7 @@ impl<'a> Interp<'a> {
                     self.emit_bytes(&s);
                 }
                 Op::Line(l) => {
-                    if comp.hybrid {
+                    if comp.hybrid || comp.top_level {
                         if let Some(flow) = self.statement_boundary() {
                             return Ok(flow);
                         }
@@ -1649,25 +1741,28 @@ impl<'a> Interp<'a> {
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
         slots.resize_with(comp.nslots, || Slot::Uninit);
-        if let Some(f) = self.stack.last() {
-            for (name, idx) in &comp.names {
-                if let Some(c) = f.vars.get(name) {
-                    slots[*idx as usize] = Slot::C(c.clone());
-                }
+        for (name, idx) in &comp.names {
+            if let Some(c) = self.cur().vars.get(name) {
+                slots[*idx as usize] = Slot::C(c.clone());
             }
         }
         let r = self.vm_exec(comp, &mut slots, self.expr_temps.len());
         // Slot-V objects die with the frame like a CV decref (Slot::C
         // cells are f.vars — bind's own frame teardown owns those).
-        let mut dying = Vec::new();
-        for sl in &mut slots {
-            if let Slot::V(v) = sl {
-                if matches!(v, Value::Object(_)) {
-                    dying.push(cell(std::mem::replace(v, Value::Null)));
+        let derr = if comp.top_level {
+            self.vm_materialize(comp, &mut slots);
+            None // Globals live until canonical request shutdown.
+        } else {
+            let mut dying = Vec::new();
+            for sl in &mut slots {
+                if let Slot::V(v) = sl {
+                    if matches!(v, Value::Object(_)) {
+                        dying.push(cell(std::mem::replace(v, Value::Null)));
+                    }
                 }
             }
-        }
-        let derr = self.destruct_cells(&dying).err();
+            self.destruct_cells(&dying).err()
+        };
         slots.clear();
         if self.vm_slot_pool.len() < 64 {
             self.vm_slot_pool.push(slots);
