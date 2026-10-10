@@ -1,0 +1,73 @@
+{
+  "runtime": "0fe4140814a3035396c52f654277d061ce5e29cf",
+  "before_runtime": "bbbd74d9b65d45033c4f3d831df62d7bdabb2628",
+  "profiler_runs": "separate from timing; canonical iterator + compiled body, not native CPU coverage",
+  "runs": [
+    {
+      "argv": [
+        "/workspace/perf-follow-through/array-bound/phpun",
+        "bench/profile/foreach.php",
+        "100000"
+      ],
+      "flag": "PHPUN_ALLOC",
+      "stdout": "RESULT 15000250000\n",
+      "stderr": "allocs: 424041 bytes: 30870577\n  cell: 100018\n  vm_site: 2\n  mem_track: 7\n  trace_frame: 1\n  vars_insert: 1\n  call_args: 1\n",
+      "binary_sha256": "800a018529ff33aa4a4ef076d101a8ab85c938a67f55089142543bd29a23d1eb"
+    },
+    {
+      "argv": [
+        "/workspace/perf-follow-through/array-bound/phpun",
+        "bench/profile/foreach.php",
+        "100000"
+      ],
+      "flag": "PHPUN_CALLPROF",
+      "stdout": "RESULT 15000250000\n",
+      "stderr": "",
+      "binary_sha256": "800a018529ff33aa4a4ef076d101a8ab85c938a67f55089142543bd29a23d1eb"
+    },
+    {
+      "argv": [
+        "/workspace/perf-follow-through/array-bound/phpun",
+        "bench/profile/foreach.php",
+        "100000"
+      ],
+      "flag": "PHPUN_VMPROF",
+      "stdout": "RESULT 15000250000\n",
+      "stderr": "vm-coverage: compiled-lookup=0\nvm-coverage: executed-body=1\nvm-coverage: reference-return=0\nvm-coverage: variable=0\nvm-coverage: assignment=0\nvm-coverage: call=0\nvm-coverage: array=0\nvm-coverage: property=0\nvm-coverage: closure=0\nvm-coverage: interpolation=0\nvm-coverage: foreach=0\nvm-coverage: switch=0\nvm-coverage: match=0\nvm-coverage: exception=0\nvm-coverage: static=0\nvm-coverage: scope=0\nvm-coverage: operator=0\nvm-coverage: other=0\nvm-coverage: hybrid-lookup=2\nvm-coverage: hybrid-body=1\nvm-coverage: top-level-entry=0\n",
+      "binary_sha256": "800a018529ff33aa4a4ef076d101a8ab85c938a67f55089142543bd29a23d1eb"
+    },
+    {
+      "argv": [
+        "/workspace/perf-follow-through/foreach/phpun",
+        "bench/profile/foreach.php",
+        "100000"
+      ],
+      "flag": "PHPUN_ALLOC",
+      "stdout": "RESULT 15000250000\n",
+      "stderr": "allocs: 224037 bytes: 30469726\n  cell: 100018\n  vm_site: 2\n  mem_track: 7\n  trace_frame: 1\n  vars_insert: 1\n  call_args: 1\n",
+      "binary_sha256": "4bb907eae4650bff637e5806aae238764d5c4a8fc05860c696da69b77cad1c24"
+    },
+    {
+      "argv": [
+        "/workspace/perf-follow-through/foreach/phpun",
+        "bench/profile/foreach.php",
+        "100000"
+      ],
+      "flag": "PHPUN_CALLPROF",
+      "stdout": "RESULT 15000250000\n",
+      "stderr": "",
+      "binary_sha256": "4bb907eae4650bff637e5806aae238764d5c4a8fc05860c696da69b77cad1c24"
+    },
+    {
+      "argv": [
+        "/workspace/perf-follow-through/foreach/phpun",
+        "bench/profile/foreach.php",
+        "100000"
+      ],
+      "flag": "PHPUN_VMPROF",
+      "stdout": "RESULT 15000250000\n",
+      "stderr": "vm-coverage: compiled-lookup=0\nvm-coverage: executed-body=1\nvm-coverage: reference-return=0\nvm-coverage: variable=0\nvm-coverage: assignment=0\nvm-coverage: call=0\nvm-coverage: array=0\nvm-coverage: property=0\nvm-coverage: closure=0\nvm-coverage: interpolation=0\nvm-coverage: foreach=0\nvm-coverage: switch=0\nvm-coverage: match=0\nvm-coverage: exception=0\nvm-coverage: static=0\nvm-coverage: scope=0\nvm-coverage: operator=0\nvm-coverage: other=0\nvm-coverage: hybrid-lookup=2\nvm-coverage: hybrid-body=1\nvm-coverage: top-level-entry=0\nvm-coverage: loop-body-entry=100000\n",
+      "binary_sha256": "4bb907eae4650bff637e5806aae238764d5c4a8fc05860c696da69b77cad1c24"
+    }
+  ]
+}

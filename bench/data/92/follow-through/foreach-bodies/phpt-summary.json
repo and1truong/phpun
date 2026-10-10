@@ -1,0 +1,1490 @@
+{
+  "baseline_runtime": "bbbd74d9b65d45033c4f3d831df62d7bdabb2628",
+  "candidate_runtime": "0fe4140814a3035396c52f654277d061ce5e29cf",
+  "before": {
+    "total": 1232,
+    "passed": 858,
+    "failed": 353,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 7,
+    "unsupported": 5,
+    "borked": 0,
+    "crashed": 7,
+    "timed_out": 2,
+    "applicable": 1220,
+    "compatibility_pct": 70.33
+  },
+  "after": {
+    "total": 1232,
+    "passed": 858,
+    "failed": 353,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 7,
+    "unsupported": 5,
+    "borked": 0,
+    "crashed": 7,
+    "timed_out": 2,
+    "applicable": 1220,
+    "compatibility_pct": 70.33
+  },
+  "status_changes": [],
+  "jobs": 4,
+  "timeout": 30,
+  "run_order": "baseline then candidate; same PHPT source, no concurrent runners",
+  "raw_sha256": {
+    "/workspace/perf-follow-through/array-bound/control-phpt.json": "f306c87228bbeab4ebca6df8a55c2af6a9f62966fed888f2b01953b12fdddea2",
+    "/workspace/perf-follow-through/foreach/control-phpt-final.json": "21928733ae618590361b3bf0ada25de1606d442cadbbdc70c1b7a5d6740e7c15"
+  },
+  "existing_failures": [
+    {
+      "file": "vendor/php-tests/Zend/tests/ArrayAccess/ArrayAccess_indirect_append.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/bug34310.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/bug34467.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/bug39036.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/bug73792.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/foreach_018.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/foreach_empty_loop_leak.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/foreach_list_003.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/foreach_list_004.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/foreach_reference.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/foreach_shadowed_dyn_property.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/foreach_shadowed_property.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/this_in_foreach_001.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/this_in_foreach_002.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/this_in_foreach_003.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/foreach/this_in_foreach_004.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/auto_incrementing_keys.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/backtrace_multi_yield_from.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/basic_yield_from_exception_handling.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug66041.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug69989_3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug70965.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug71013.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug71297.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug71980.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug74954.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug76427.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug79657.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/bug80240.phpt",
+      "status": "crash"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/clone.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/dynamic_properties.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/errors/generator_extend_error.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/errors/generator_instantiate_error.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/errors/non_ref_generator_iterated_by_ref_error.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/errors/serialize_unserialize_error.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/errors/yield_const_by_ref_error.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/errors/yield_non_ref_function_call_by_ref_error.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/fibonacci.phpt",
+      "status": "timeout"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gc_with_root_parent_mismatch.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/generator_closure_collection.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/generator_in_multipleiterator.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/generator_with_nonscalar_keys.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/generator_with_type_check.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/generator_with_type_check_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/get_return.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh11028_1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh11028_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh11028_3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh14387.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15275-001.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15275-002.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15275-006.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15330-001.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15330-002.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15330-003.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15330-004.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15330-005.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15330-006.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15375.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh15866.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh23301.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh8289.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-001.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-002.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-003.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-004.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-005.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-006.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-007.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-008.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-009.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-010.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9750-011.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/gh9801.phpt",
+      "status": "crash"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/multiple_yield_from_on_same_generator.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/mutli_yield_from_with_exception.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/repeated_yield_from_with_immediate_release.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_by_reference.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_by_reference_optimization.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_aborted_generator_with_children.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_already_running.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_backtrace.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_by_reference.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_deep_recursion.phpt",
+      "status": "crash"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_force_closed.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_multi_tree.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_multi_tree_exception.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_multi_tree_single_nodes.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_non_iterable.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_from_throw_with_throwing_exception.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_precedence.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_unary_precedence.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/generators/yield_without_value.phpt",
+      "status": "timeout"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/009_ast_export.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/027.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/028.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/038.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/041.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/043.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/048.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/049.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/match/unmatched_enum.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/switch/034.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/bug70228_3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/bug71604_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/bug71604_3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/bug72213.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/bug72215_1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/bug72215_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/bug72215_3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/catch_finally_004.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/catch_novar_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_002.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_004.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_017.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_019.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_020.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_022.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_023.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_024.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_026.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/Zend/tests/try/try_finally_027.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/005.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/007.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_all_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_any_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case_variation.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case_variation7.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_change_key_case_variation8.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_basic1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_basic2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation21.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation22.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation23.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation24.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation25.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_chunk_variation7.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_column_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_column_object_cast.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_column_property_visibility.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_column_scalar_index_strict_types.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_column_scalar_index_weak_types.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_column_variant.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_column_variant_objects.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_combine.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_combine_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_combine_error2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_combine_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_combine_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_combine_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_combine_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_count_values.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_count_values2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_count_values_variation.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_diff_key.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_fill_keys.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_fill_keys_variation1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_fill_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_filter_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_filter_variation10.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_find_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_find_key_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_find_types.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_first_last.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_first_last_errors.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_flip.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_flip_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_intersect_1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_intersect_key.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_key_exists.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_key_exists_variation1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_key_exists_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_map_variation16.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_map_variation2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_basic2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_object_leak.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation10.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation7.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation8.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_recursive_variation9.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_merge_variation2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_pop_variation.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_product_variation1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_product_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_product_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_push_error2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_rand.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_rand_basic1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_rand_basic2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_rand_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_rand_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_rand_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_rand_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_replace.phpt",
+      "status": "crash"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_slice_variation11.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_splice_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_splice_variation1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_sum.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_sum_on_reference.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_sum_variation7.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_sum_variation8.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_unique_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_unique_variation8.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_unshift_basic2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_unshift_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_unshift_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_unshift_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_values_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_values_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_values_variation_64bit.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_closure.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_object1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_objects.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_rec_objects.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_basic1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_basic2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_error2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_object1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_object2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_variation7.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_variation8.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/array_walk_recursive_variation9.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug34066_1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug34982.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug39576.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug42850.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug52719.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug61730.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug61967.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug62607.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug69068.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug69068_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug70713.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/array_walk/bug79839.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug24198.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug25708.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug26458.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug28739.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug29493.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug30074.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug31213.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug33989.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug38464.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug42177.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug42233.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug43495.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug44181.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug44182.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug45312.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug48224.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug61058.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug65304.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug68553.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug69299.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug70808.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug71220.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug72031.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug72369.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug74345.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug74361_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug76505.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug77135.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug77669.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug77793.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug77931.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/bug79930.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/compact_no_this.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/count_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/count_invalid_mode.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/count_recursive.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/count_recursive_stack_limit.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/count_symbol_table.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/count_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/end_64bit.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_error.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_error_variation1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_safety.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_typed_ref.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation10.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation11.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation6.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation7.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation8.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/extract_variation9.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh14140.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh14775.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh15982.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16053.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_normal_destructor.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_uaf_add_elements.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_uaf_array_deallocated.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_uaf_complex_modification.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_uaf_multiple_destructors.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_uaf_original_case.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_uaf_packed_to_hash.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16649/array_splice_with_replacement.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh16905.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh17977.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh18480.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh19300_2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh19926.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh20043.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh23111.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/gh23113.phpt",
+      "status": "crash"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/negative_index.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/negative_index_empty_array.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/bug24220.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/bug32021.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/bug54459.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "status": "crash"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "status": "crash"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_bug72017.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_float_NAN_values.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_float_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_int_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_null_variations.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_numeric_basic.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_string_digits.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_string_digits_float_step.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_string_invalid.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_inputs_string_numeric.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/range/range_step_errors.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sizeof_basic2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sizeof_object1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sizeof_object2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sizeof_variation2.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sizeof_variation3.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/array_multisort_variation1.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/array_multisort_variation7.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/array_multisort_variation8.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/array_multisort_variation9.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/locale_sort.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/natcasesort_variation4.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/shuffle_variation5.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/sort/usort_variation11.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/var_export.phpt",
+      "status": "fail"
+    },
+    {
+      "file": "vendor/php-tests/ext/standard/tests/array/var_export2.phpt",
+      "status": "fail"
+    }
+  ]
+}
