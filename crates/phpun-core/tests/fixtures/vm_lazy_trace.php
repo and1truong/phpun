@@ -25,3 +25,11 @@ $o = native_identity(new TraceLifetime());
 echo "alive\n";
 unset($o);
 echo "done\n";
+function lazy_date_interval(int $n): void { DateInterval::createFromDateString('bad'); }
+try { lazy_date_interval(77); } catch (Throwable $e) {
+    $saved = $e->getTrace();
+    native_trace(88);
+    foreach ($saved as $frame) {
+        if (($frame['function'] ?? '') === 'lazy_date_interval') { echo 'date-args:', $frame['args'][0], "\n"; }
+    }
+}
