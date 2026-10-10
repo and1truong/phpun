@@ -206,22 +206,35 @@ impl Esc {
     }
 }
 
+/// Per-call encode context: flag table, container-recursion stack, depth
+/// ceiling, and PARTIAL's last-seen error code.
+struct Enc<'x> {
+    esc: &'x Esc,
+    seen: Vec<usize>,
+    max: i64,
+    err: i64,
+}
+
 /// Returns (output, zend error code) — under PARTIAL_OUTPUT_ON_ERROR the
 /// string still ships and `code` reports the LAST substituted error.
 fn json_encode(it: &mut Interp, v: &Value, flags: i64, max_depth: i64) -> (String, i64) {
     let esc = Esc::new(flags);
     // ponytail: fixed 4KB head start — not sized to the payload.
     let mut out = String::with_capacity(4096);
-    let mut seen = Vec::new();
-    let mut err = 0;
-    if let Err(code) = json_enc(it, v, &esc, &mut seen, &mut out, 0, max_depth, &mut err) {
-        err = code;
+    let mut cx = Enc {
+        esc: &esc,
+        seen: Vec::new(),
+        max: max_depth,
+        err: 0,
+    };
+    if let Err(code) = json_enc(it, v, &mut cx, &mut out, 0) {
+        cx.err = code;
         if flags & F_PARTIAL != 0 {
-            out.truncate(0);
+            out.clear();
             out.push_str(json_subst(code));
         }
     }
-    (out, err)
+    (out, cx.err)
 }
 
 /// zend's PARTIAL placeholder: `0` for the one error that is a value.
@@ -236,12 +249,9 @@ fn json_subst(code: i64) -> &'static str {
 fn json_enc(
     it: &mut Interp,
     v: &Value,
-    esc: &Esc,
-    seen: &mut Vec<usize>,
+    cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-    max: i64,
-    err: &mut i64,
 ) -> Result<(), i64> {
     use std::fmt::Write;
     match v {
@@ -252,48 +262,48 @@ fn json_enc(
             if f.is_nan() || f.is_infinite() {
                 return Err(J_INF_NAN);
             }
-            json_f64(*f, esc.flags, out);
+            json_f64(*f, cx.esc.flags, out);
         }
         Value::Str(s) => {
-            if esc.flags & F_NUMERIC != 0 {
+            if cx.esc.flags & F_NUMERIC != 0 {
                 match numeric(s) {
                     Numeric::Int(i) => {
                         write!(out, "{i}").unwrap();
                         return Ok(());
                     }
                     Numeric::Float(f) if f.is_finite() => {
-                        json_f64(f, esc.flags, out);
+                        json_f64(f, cx.esc.flags, out);
                         return Ok(());
                     }
                     _ => {}
                 }
             }
-            json_str(s, esc, out)?
+            json_str(s, cx.esc, out)?
         }
         Value::Array(a) => {
             let lvl = lvl + 1;
-            if lvl > max {
+            if lvl > cx.max {
                 return Err(J_DEPTH);
             }
             let key = Rc::as_ptr(a) as usize;
-            if seen.contains(&key) {
+            if cx.seen.contains(&key) {
                 return Err(J_RECURSION);
             }
-            seen.push(key);
-            let r = json_arr(it, a, esc, seen, out, lvl, max, err);
-            seen.pop();
+            cx.seen.push(key);
+            let r = json_arr(it, a, cx, out, lvl);
+            cx.seen.pop();
             return r;
         }
         Value::Object(o) => {
             let lvl = lvl + 1;
-            if lvl > max {
+            if lvl > cx.max {
                 return Err(J_DEPTH);
             }
             let key = Rc::as_ptr(o) as usize;
-            if seen.contains(&key) {
+            if cx.seen.contains(&key) {
                 return Err(J_RECURSION);
             }
-            seen.push(key);
+            cx.seen.push(key);
             let r = if it
                 .find_method_in(&o.borrow().class, "jsonserialize")
                 .is_some()
@@ -305,14 +315,14 @@ fn json_enc(
                     // gh10519: serialize() returning $this encodes the
                     // property view, once. Anything else containing $this
                     // hits the stack check above.
-                    json_obj(it, o, esc, seen, out, lvl, max, err)
+                    json_obj(it, o, cx, out, lvl)
                 } else {
-                    json_enc(it, &v, esc, seen, out, lvl, max, err)
+                    json_enc(it, &v, cx, out, lvl)
                 }
             } else {
-                json_obj(it, o, esc, seen, out, lvl, max, err)
+                json_obj(it, o, cx, out, lvl)
             };
-            seen.pop();
+            cx.seen.pop();
             return r;
         }
         Value::Callable(_) => out.push_str("{}"),
@@ -326,17 +336,14 @@ fn json_enc(
 fn json_child(
     it: &mut Interp,
     v: &Value,
-    esc: &Esc,
-    seen: &mut Vec<usize>,
+    cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-    max: i64,
-    err: &mut i64,
 ) -> Result<(), i64> {
     let start = out.len();
-    match json_enc(it, v, esc, seen, out, lvl, max, err) {
-        Err(code) if esc.flags & F_PARTIAL != 0 => {
-            *err = code;
+    match json_enc(it, v, cx, out, lvl) {
+        Err(code) if cx.esc.flags & F_PARTIAL != 0 => {
+            cx.err = code;
             out.truncate(start);
             out.push_str(json_subst(code));
             Ok(())
@@ -346,23 +353,19 @@ fn json_child(
 }
 
 fn indent(out: &mut String, lvl: i64) {
-    out.extend(std::iter::repeat(' ').take(4 * lvl.max(0) as usize));
+    out.extend(std::iter::repeat_n(' ', 4 * lvl.max(0) as usize));
 }
 
 fn json_arr(
     it: &mut Interp,
     a: &Rc<RefCell<PhpArray>>,
-    esc: &Esc,
-    seen: &mut Vec<usize>,
+    cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-    max: i64,
-    err: &mut i64,
 ) -> Result<(), i64> {
     let a = a.borrow();
-    let is_list = esc.flags & F_FORCE_OBJECT == 0
-        && a
-            .entries
+    let is_list = cx.esc.flags & F_FORCE_OBJECT == 0
+        && a.entries
             .iter()
             .enumerate()
             .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64));
@@ -373,20 +376,20 @@ fn json_arr(
             out.push(',');
         }
         first = false;
-        if esc.pretty() {
+        if cx.esc.pretty() {
             out.push('\n');
             indent(out, lvl);
         }
         if !is_list {
-            json_key(k, esc, out)?;
+            json_key(k, cx.esc, out)?;
             out.push(':');
-            if esc.pretty() {
+            if cx.esc.pretty() {
                 out.push(' ');
             }
         }
-        json_child(it, &c.borrow(), esc, seen, out, lvl, max, err)?;
+        json_child(it, &c.borrow(), cx, out, lvl)?;
     }
-    if esc.pretty() && !a.entries.is_empty() {
+    if cx.esc.pretty() && !a.entries.is_empty() {
         out.push('\n');
         indent(out, lvl - 1);
     }
@@ -399,12 +402,9 @@ fn json_arr(
 fn json_obj(
     it: &mut Interp,
     o: &Rc<RefCell<PhpObject>>,
-    esc: &Esc,
-    seen: &mut Vec<usize>,
+    cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-    max: i64,
-    err: &mut i64,
 ) -> Result<(), i64> {
     let ao_arr = if matches!(
         o.borrow().internal,
@@ -427,16 +427,16 @@ fn json_obj(
                 out.push(',');
             }
             first = false;
-            if esc.pretty() {
+            if cx.esc.pretty() {
                 out.push('\n');
                 indent(out, lvl);
             }
-            json_key(k, esc, out)?;
+            json_key(k, cx.esc, out)?;
             out.push(':');
-            if esc.pretty() {
+            if cx.esc.pretty() {
                 out.push(' ');
             }
-            json_child(it, &c.borrow(), esc, seen, out, lvl, max, err)?;
+            json_child(it, &c.borrow(), cx, out, lvl)?;
         }
     } else if let Some(dtp) = dtp {
         for (k, v) in dtp.iter() {
@@ -444,16 +444,16 @@ fn json_obj(
                 out.push(',');
             }
             first = false;
-            if esc.pretty() {
+            if cx.esc.pretty() {
                 out.push('\n');
                 indent(out, lvl);
             }
-            json_str(k.as_bytes(), esc, out)?;
+            json_str(k.as_bytes(), cx.esc, out)?;
             out.push(':');
-            if esc.pretty() {
+            if cx.esc.pretty() {
                 out.push(' ');
             }
-            json_child(it, v, esc, seen, out, lvl, max, err)?;
+            json_child(it, v, cx, out, lvl)?;
         }
     } else {
         let entries = it.object_serial_entries(o);
@@ -478,20 +478,20 @@ fn json_obj(
                     out.push(',');
                 }
                 first = false;
-                if esc.pretty() {
+                if cx.esc.pretty() {
                     out.push('\n');
                     indent(out, lvl);
                 }
-                json_str(name.as_bytes(), esc, out)?;
+                json_str(name.as_bytes(), cx.esc, out)?;
                 out.push(':');
-                if esc.pretty() {
+                if cx.esc.pretty() {
                     out.push(' ');
                 }
-                json_child(it, &v, esc, seen, out, lvl, max, err)?;
+                json_child(it, &v, cx, out, lvl)?;
             }
         }
     }
-    if esc.pretty() && !first {
+    if cx.esc.pretty() && !first {
         out.push('\n');
         indent(out, lvl - 1);
     }
@@ -585,7 +585,7 @@ fn json_str(s: &[u8], esc: &Esc, out: &mut String) -> Result<(), i64> {
                     // The substitute is a real U+FFFD — it goes out raw
                     // under UNESCAPED_UNICODE like any other char.
                     if esc.flags & F_UNESC_UNI != 0 {
-                        out.push_str("\u{fffd}");
+                        out.push('\u{fffd}');
                     } else {
                         out.push_str("\\ufffd");
                     }
@@ -752,8 +752,8 @@ fn json_value(
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let k = String::from_utf8(jstr(b, pos, flags)?.into_owned())
-                        .map_err(|_| J_UTF8)?;
+                    let k =
+                        String::from_utf8(jstr(b, pos, flags)?.into_owned()).map_err(|_| J_UTF8)?;
                     json_ws(b, pos)?;
                     if b.get(*pos) != Some(&b':') {
                         return Err(J_SYNTAX);
