@@ -2399,7 +2399,7 @@ impl<'a> Interp<'a> {
         let mut frame = self
             .vm_frame_pool
             .pop()
-            .unwrap_or_else(|| super::Frame::new(String::new()));
+            .unwrap_or_else(|| Box::new(super::Frame::new(String::new())));
         frame.fn_name = decl.name.clone();
         frame.decl_site = decl_site.unwrap_or(Rc::as_ptr(decl) as usize);
         frame.fn_line = decl.line;

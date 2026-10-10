@@ -611,7 +611,7 @@ impl<'a> Interp<'a> {
         self.exception_handler = self.exception_handler_stack.pop();
     }
     pub fn cur_frame(&mut self) -> Option<&Frame> {
-        self.stack.last()
+        self.stack.last().map(Box::as_ref)
     }
     /// Args of the currently-executing function.
     /// True while executing inside a function/method call frame.
@@ -753,6 +753,22 @@ impl<'a> Interp<'a> {
         let mut snapshot = frame.clone();
         if let Some(index) = snapshot.args_frame.take() {
             let f = &self.stack[index];
+            snapshot.class = f
+                .scope_class
+                .as_ref()
+                .map(|c| c.name().to_string())
+                .or_else(|| {
+                    (f.fn_name.starts_with("{closure:") && f.this_obj.is_some())
+                        .then(|| "Closure".to_string())
+                });
+            snapshot.ty = if f.this_obj.is_some() {
+                "->"
+            } else if f.scope_class.is_some() {
+                "::"
+            } else {
+                ""
+            }
+            .to_string();
             snapshot.args = if f.value_args.is_empty() {
                 f.args.clone()
             } else {
