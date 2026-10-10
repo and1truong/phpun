@@ -503,6 +503,11 @@ pub struct Interp<'a> {
     pub resp_code: i64,
     /// Set by json_encode/json_decode for json_last_error().
     pub last_json_error: i64,
+    /// json_encode's in-flight container Rc keys — shared across nested
+    /// calls (a JsonSerializable body encoding $this hits zend's
+    /// recursion guard through it). Empties again once the outermost
+    /// encode returns.
+    pub(crate) json_enc_stack: Vec<usize>,
     /// Set by the preg_* builtins for preg_last_error().
     pub last_preg_error: i64,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
@@ -1717,6 +1722,8 @@ impl<'a> Interp<'a> {
         constants.insert("JSON_ERROR_RECURSION".into(), Value::Int(6));
         constants.insert("JSON_ERROR_INF_OR_NAN".into(), Value::Int(7));
         constants.insert("JSON_ERROR_UNSUPPORTED_TYPE".into(), Value::Int(8));
+        constants.insert("JSON_ERROR_INVALID_PROPERTY_NAME".into(), Value::Int(9));
+        constants.insert("JSON_ERROR_UTF16".into(), Value::Int(10));
         constants.insert("JSON_HEX_TAG".into(), Value::Int(1));
         constants.insert("JSON_HEX_AMP".into(), Value::Int(2));
         constants.insert("JSON_HEX_APOS".into(), Value::Int(4));
@@ -1836,6 +1843,7 @@ impl<'a> Interp<'a> {
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
+            json_enc_stack: Vec::new(),
             last_preg_error: 0,
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
@@ -7476,6 +7484,18 @@ impl<'a> Interp<'a> {
             }
         }
         obj
+    }
+
+    /// exception() with a real error code — internal throwables like
+    /// JsonException carry their domain code (zend sets it).
+    pub fn exception_code(&mut self, class: &str, msg: &str, code: i64) -> Value {
+        let v = self.exception(class, msg);
+        if let Value::Object(o) = &v {
+            o.borrow_mut()
+                .props
+                .insert("code".into(), cell(Value::Int(code)));
+        }
+        v
     }
 
     /// Raise `throw $v` as an error result.
