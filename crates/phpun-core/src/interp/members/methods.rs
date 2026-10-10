@@ -51,7 +51,7 @@ impl<'a> Interp<'a> {
             gen_body: false,
         });
         let r = self.array_iter_body(obj, name, args);
-        self.call_trace.pop();
+        self.trace_pop();
         r
     }
 
@@ -751,16 +751,16 @@ impl<'a> Interp<'a> {
                 if deep {
                     let e =
                         self.spl_throw("Error", "Nesting level too deep - recursive dependency?");
-                    self.call_trace.pop();
+                    self.trace_pop();
                     nr?;
                     return self.fail(e);
                 }
                 if let Some(e) = conv_err {
-                    self.call_trace.pop();
+                    self.trace_pop();
                     nr?;
                     return self.fail(e);
                 }
-                self.call_trace.pop();
+                self.trace_pop();
                 nr?;
                 Value::Bool(true)
             }
@@ -813,11 +813,11 @@ impl<'a> Interp<'a> {
                 arr.borrow_mut().entries = sorted;
                 let nr = self.emit_cmp_notices();
                 if let Some(e) = cb_err {
-                    self.call_trace.pop();
+                    self.trace_pop();
                     nr?;
                     return self.fail(e);
                 }
-                self.call_trace.pop();
+                self.trace_pop();
                 nr?;
                 Value::Bool(true)
             }
@@ -2398,7 +2398,7 @@ impl<'a> Interp<'a> {
                     gen_body: false,
                 });
                 let r = self.reflection_method(&obj, name, &args);
-                self.call_trace.pop();
+                self.trace_pop();
                 if let Some(v) = r? {
                     return Ok(v);
                 }
@@ -2497,6 +2497,38 @@ impl<'a> Interp<'a> {
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null));
                 }
+                "getoffset" => {
+                    let name = obj
+                        .borrow()
+                        .props
+                        .get("\0tz\0name")
+                        .map(|c| c.borrow().clone())
+                        .map(|v| match v {
+                            Value::Str(s) => crate::value::lossy(&s).to_string(),
+                            _ => String::new(),
+                        })
+                        .unwrap_or_default();
+                    let ts = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .and_then(|v| match v {
+                            Value::Object(o) => match o
+                                .borrow()
+                                .props
+                                .get("\0dt\0ts")
+                                .map(|c| c.borrow().clone())
+                                .unwrap_or(Value::Int(0))
+                            {
+                                Value::Int(t) => Some(t),
+                                _ => Some(0),
+                            },
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    return Ok(Value::Int(crate::builtins::datetime::tz_offset_at(
+                        &name, ts,
+                    )));
+                }
                 _ => {}
             }
         }
@@ -2511,6 +2543,18 @@ impl<'a> Interp<'a> {
                     .borrow()
                     .props
                     .get("\0dt\0ts")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Int(0))
+                {
+                    Value::Int(t) => t,
+                    _ => 0,
+                }
+            };
+            let dt_off = |o: &Rc<RefCell<PhpObject>>| -> i64 {
+                match o
+                    .borrow()
+                    .props
+                    .get("\0dt\0off")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Int(0))
                 {
@@ -2590,9 +2634,17 @@ impl<'a> Interp<'a> {
                             .unwrap_or(0),
                         _ => 0,
                     };
-                    obj.borrow_mut()
-                        .props
-                        .insert("\0dt\0ts".into(), cell(Value::Int(ts)));
+                    {
+                        let mut ob = obj.borrow_mut();
+                        for (k, v) in [
+                            ("\0dt\0ts", Value::Int(ts)),
+                            ("\0dt\0off", Value::Int(0)),
+                            ("\0dt\0tzty", Value::Int(3)),
+                            ("\0dt\0tz", Value::str("UTC")),
+                        ] {
+                            ob.props.insert(k.into(), cell(v));
+                        }
+                    }
                     return Ok(Value::Null);
                 }
                 "gettimestamp" => {
@@ -2607,9 +2659,43 @@ impl<'a> Interp<'a> {
                         Value::Str(s) => crate::value::lossy(&s).to_string(),
                         _ => String::new(),
                     };
-                    return Ok(Value::str(crate::builtins::datetime::date_format(
+                    let ts = dt_ts(&obj);
+                    let off = dt_off(&obj);
+                    let (e_name, t_name) = {
+                        let ob = obj.borrow();
+                        let name = ob
+                            .props
+                            .get("\0dt\0tz")
+                            .map(|c| c.borrow().clone())
+                            .and_then(|v| match v {
+                                Value::Str(b) => Some(crate::value::lossy(&b).to_string()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "UTC".to_string());
+                        let ty = match ob
+                            .props
+                            .get("\0dt\0tzty")
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Int(3))
+                        {
+                            Value::Int(t) => t,
+                            _ => 3,
+                        };
+                        (name, ty)
+                    };
+                    // named zones abbreviate via tzname(3); offset
+                    // zones print the `±HH:MM` string for T as well
+                    let t_name = if t_name == 3 {
+                        crate::builtins::datetime::tz_abbr_at(&e_name, ts)
+                    } else {
+                        e_name.clone()
+                    };
+                    return Ok(Value::str(crate::builtins::datetime::date_format_tz(
                         &fmt,
-                        dt_ts(&obj),
+                        ts + off,
+                        off,
+                        &e_name,
+                        &t_name,
                     )));
                 }
                 "modify" => {
@@ -2712,11 +2798,120 @@ impl<'a> Interp<'a> {
                     let ts = nd * 86400 + cur.rem_euclid(86400) + sc * sign;
                     return self.dt_store(&obj, ts, immutable);
                 }
+                "settimestamp" => {
+                    let ts = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .map(|v| match v {
+                            Value::Int(n) => n,
+                            Value::Float(f) => f as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    return self.dt_store(&obj, ts, immutable);
+                }
+                "setdate" => {
+                    let arg = |i: usize| {
+                        args.get(i)
+                            .map(|c| c.borrow().clone())
+                            .map(|v| match v {
+                                Value::Int(n) => n,
+                                _ => 0,
+                            })
+                            .unwrap_or(0)
+                    };
+                    let (y, m, d) = (arg(0), arg(1), arg(2));
+                    // zend wraps out-of-range months/days instead of
+                    // clamping: normalise the month into the year,
+                    // then count (d-1) days from the 1st.
+                    let t = m - 1;
+                    let nd = crate::builtins::datetime::days_from_civil(
+                        y + t.div_euclid(12),
+                        t.rem_euclid(12) + 1,
+                        1,
+                    ) + d
+                        - 1;
+                    let cur = dt_ts(&obj);
+                    return self.dt_store(&obj, nd * 86400 + cur.rem_euclid(86400), immutable);
+                }
+                "settime" => {
+                    let arg = |i: usize| {
+                        args.get(i)
+                            .map(|c| c.borrow().clone())
+                            .map(|v| match v {
+                                Value::Int(n) => n,
+                                _ => 0,
+                            })
+                            .unwrap_or(0)
+                    };
+                    let secs = arg(0) * 3600 + arg(1) * 60 + arg(2);
+                    let cur = dt_ts(&obj);
+                    let day = cur.div_euclid(86400) + secs.div_euclid(86400);
+                    return self.dt_store(&obj, day * 86400 + secs.rem_euclid(86400), immutable);
+                }
+                "setisodate" => {
+                    let arg = |i: usize| {
+                        args.get(i)
+                            .map(|c| c.borrow().clone())
+                            .map(|v| match v {
+                                Value::Int(n) => n,
+                                _ => 0,
+                            })
+                            .unwrap_or(0)
+                    };
+                    let (y, w, mut d) = (arg(0), arg(1), arg(2));
+                    if d == 0 {
+                        d = 1;
+                    }
+                    // ISO week 1 = the week containing Jan 4; Monday
+                    // of it is jan4 minus its own weekday. dow is
+                    // Mon=1..Sun=7 off the 1970-01-01 (Thu=4) epoch.
+                    let jan4 = crate::builtins::datetime::days_from_civil(y, 1, 4);
+                    let dow = (jan4 + 3).rem_euclid(7) + 1;
+                    let nd = jan4 - dow + 1 + (w - 1) * 7 + (d - 1);
+                    let cur = dt_ts(&obj);
+                    return self.dt_store(&obj, nd * 86400 + cur.rem_euclid(86400), immutable);
+                }
+                "settimezone" => {
+                    // the instant stays; only the render offset + the
+                    // var_dump name swap to the new zone
+                    let tzv = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .and_then(|v| match v {
+                            Value::Object(o) => Some(o),
+                            _ => None,
+                        });
+                    if let Some(zo) = tzv {
+                        let name = zo
+                            .borrow()
+                            .props
+                            .get("\0tz\0name")
+                            .map(|c| c.borrow().clone())
+                            .and_then(|v| match v {
+                                Value::Str(s) => Some(crate::value::lossy(&s).to_string()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "UTC".to_string());
+                        let off = crate::builtins::datetime::tz_offset_at(&name, dt_ts(&obj));
+                        // write through dt_store so immutable swaps
+                        // the props on the clone, not the original
+                        let v = self.dt_store(&obj, dt_ts(&obj), immutable)?;
+                        if let Value::Object(no) = &v {
+                            let mut nb = no.borrow_mut();
+                            nb.props.insert("\0dt\0off".into(), cell(Value::Int(off)));
+                            nb.props.insert("\0dt\0tz".into(), cell(Value::str(&name)));
+                            nb.props.insert("\0dt\0tzty".into(), cell(Value::Int(3)));
+                        }
+                        return Ok(v);
+                    }
+                    return Ok(Value::Null);
+                }
                 _ => {}
             }
         }
         // DateInterval: the ctor parses `P[nY][nM][nW][nD][T[nH][nM][nS]]`
-        // into public fields + the derived  di  slots add/sub read.
+        // into public fields + the derived \0di\0 slots add/sub read.
         if cls.name().eq_ignore_ascii_case("dateinterval") && name.eq_ignore_ascii_case("format") {
             let fmt = match args
                 .first()
@@ -2934,7 +3129,7 @@ impl<'a> Interp<'a> {
             gen_body: false,
         });
         let bound = self.ctor_zpp_bind(&dc, &m, args, &defaults)?;
-        self.call_trace.pop();
+        self.trace_pop();
         // zend 8.5 deprecates the one-positional-arg ReflectionMethod
         // ctor form (the named form is exempt).
         if dc.name().eq_ignore_ascii_case("reflectionmethod")
@@ -3076,7 +3271,7 @@ impl<'a> Interp<'a> {
 
     /// Build a DateInterval object from computed fields — used by
     /// diff(), which yields a real interval, not a spec-parsed one.
-    fn make_date_interval(&mut self, fields: Vec<(&str, i64)>) -> Value {
+    pub(in crate::interp) fn make_date_interval(&mut self, fields: Vec<(&str, i64)>) -> Value {
         let Some(dc) = self.classes.get("dateinterval").cloned() else {
             return Value::Null;
         };
@@ -3174,7 +3369,7 @@ impl<'a> Interp<'a> {
             gen_body: false,
         });
         let r = self.throwable_method_inner(obj, name, args, ctor_bound);
-        self.call_trace.pop();
+        self.trace_pop();
         r
     }
 
