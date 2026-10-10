@@ -1,0 +1,63 @@
+{
+  "baseline_runtime": "744d302",
+  "candidate_runtime": "55d8646",
+  "build": "cargo build --offline --release; rustc 1.99.0; LTO/codegen-units=1",
+  "properties": {
+    "before": {
+      "total": 1775,
+      "passed": 1594,
+      "failed": 149,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 14,
+      "unsupported": 18,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 1743,
+      "compatibility_pct": 91.45
+    },
+    "after": {
+      "total": 1775,
+      "passed": 1595,
+      "failed": 148,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 14,
+      "unsupported": 18,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 1743,
+      "compatibility_pct": 91.51
+    },
+    "status_changes": [
+      [
+        "vendor/php-tests/Zend/tests/magic_methods/bug26166.phpt",
+        "fail",
+        "pass"
+      ]
+    ],
+    "jobs": 4,
+    "timeout": 30
+  },
+  "lifetime": {
+    "after": {
+      "total": 190,
+      "passed": 116,
+      "failed": 68,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 1,
+      "unsupported": 5,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 184,
+      "compatibility_pct": 63.04
+    },
+    "status_changes": [],
+    "jobs": 1,
+    "timeout": 60
+  }
+}

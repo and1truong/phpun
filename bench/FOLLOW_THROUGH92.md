@@ -82,3 +82,39 @@ Raw samples/ranges/hashes and diagnostics:
 [data/92/follow-through/closure-dispatch](data/92/follow-through/closure-dispatch).
 The capture-free benchmark mode was added after the runtime change; its source
 revision is recorded separately in the PHPT/provenance summary.
+
+## Plain method property reads — runtime 55d8646 vs 744d302
+
+A `$this->literalProperty` opcode shares a positive backing-slot proof with
+canonical property reads. Visible initialized slots need no expression walk or
+scope bridge; hooks, magic getters, uninitialized properties and missing `$this`
+retain full handlers and scope synchronization. Functions needing canonical
+binding still use it; plain reads can use the existing scalar VM binder.
+`__toString` retains the binder's implicit return contract, fixing bug26166.
+
+Seven alternating unprofiled release repetitions with PHP 8.5.11 byte/exit gates;
+cold CLI median [min,max] ms:
+
+| Workload | Before | After | Change |
+|---|---:|---:|---:|
+| `bench/40-objects.php` | 499.817 [468.429, 510.091] | 463.964 [448.560, 497.755] | -7.2% |
+| `bench/profile/objects.php norm 5000` | 104.160 [100.027, 107.153] | 99.766 [98.019, 105.267] | -4.2% |
+| `bench/profile/objects.php scaled 5000` | 145.296 [139.190, 156.170] | 146.510 [138.148, 153.502] | +0.8% |
+| `bench/30-arrays.php` | 474.265 [463.860, 514.397] | 475.378 [452.605, 500.729] | +0.2% |
+| `examples/composer/run.php` | 6.589 [6.323, 7.351] | 6.940 [6.281, 7.142] | +5.3% |
+
+The objects median improves 7.2%; ranges and all samples are retained. Small
+changes for other cases are not treated as established wins. Separate ALLOC,
+CALLPROF and VMPROF logs show the new entry path; those diagnostics do not claim
+native CPU coverage or total call overhead.
+
+Tests/clippy pass and the new oracle fixture covers inheritance/private/readonly
+reads, bound closures, hooks and receiver destruction, magic getter side effects,
+uninitialized/static `$this` errors and `__toString` return enforcement.
+1,775 core/property/scope PHPT cases improve 1,594 -> 1,595 pass, fixing
+magic_methods/bug26166, no new failures (148 existing fail). A separate 190
+GC/exception/backtrace gate keeps all parent statuses at the same 60s cutoff:
+116 pass, 68 existing fail, 1 skip, 5 unsupported, no crash/timeout.
+
+Raw samples/ranges/hashes and diagnostics:
+[data/92/follow-through/method-properties](data/92/follow-through/method-properties).
