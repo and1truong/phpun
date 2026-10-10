@@ -2126,7 +2126,7 @@ impl Drop for PhpStr {
 }
 
 // Byte-payload adapters so `PhpStr` stays a drop-in for the old
-// `Rc<Vec<u8>>` payload at comparison/AsRef/From sites.
+// `Rc<[u8]>` payload at comparison/AsRef/From sites.
 impl AsRef<[u8]> for PhpStr {
     fn as_ref(&self) -> &[u8] {
         &self.rc

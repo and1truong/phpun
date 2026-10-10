@@ -5259,6 +5259,8 @@ impl<'a> Interp<'a> {
     fn append_unique_string(&mut self, s: &mut PhpStr, suffix: &[u8]) -> Value {
         self.mem_sweep();
         let old_key = Rc::as_ptr(&s.rc) as usize;
+        // ponytail: weak-handle invalidation allocates a new Rc shell per append;
+        // payload capacity is reused. Stable identities need cache generations.
         let old_handle = Rc::downgrade(&s.rc);
         s.append_unique(suffix);
         debug_assert_ne!(old_key, Rc::as_ptr(&s.rc) as usize);
