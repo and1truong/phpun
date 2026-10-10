@@ -649,15 +649,18 @@ pub(crate) fn dispatch(
         "array_unshift" => {
             if let Some(rc) = it.arr_mut(&args[0]) {
                 let mut arr = rc.borrow_mut();
-                // Renumber existing int keys up by arg count.
+                // Numeric keys are renumbered from the prepended count,
+                // regardless of their old sign/gaps; strings keep their keys.
                 let add = args.len() - 1;
                 arr.foreach_unshifted(add);
+                let mut next = add as i64;
                 for (k, _) in arr.entries.iter_mut() {
                     if let ArrKey::Int(i) = k {
-                        *i += add as i64;
+                        *i = next;
+                        next += 1;
                     }
                 }
-                arr.next += add as i64;
+                arr.next = next;
                 let mut new_entries: Vec<(ArrKey, Cell)> = Vec::new();
                 for (i, a) in args[1..].iter().enumerate() {
                     // zval_copy_ctor: a reference arg lands as its cell.
