@@ -1293,6 +1293,12 @@ fn mb_len(b: &[u8], i: usize) -> i32 {
 /// invalid-UTF8 byte dropping.
 fn escape_shell_arg(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     let s = arg_bs(it, args, 0);
+    if s.contains(&0) {
+        return err(
+            "ValueError",
+            "escapeshellarg(): Argument #1 ($arg) must not contain any null bytes",
+        );
+    }
     let mut out = Vec::with_capacity(s.len() + 2);
     out.push(b'\'');
     let mut x = 0;
@@ -1322,6 +1328,12 @@ fn escape_shell_arg(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
 /// paired-quote logic and invalid-UTF8 dropping.
 fn escape_shell_cmd(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     let s = arg_bs(it, args, 0);
+    if s.contains(&0) {
+        return err(
+            "ValueError",
+            "escapeshellcmd(): Argument #1 ($command) must not contain any null bytes",
+        );
+    }
     let l = s.len();
     let mut out = Vec::with_capacity(l + 8);
     let mut pair: Option<u8> = None; // quote byte zend's `p` is tracking

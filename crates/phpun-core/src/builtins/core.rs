@@ -786,10 +786,6 @@ pub(crate) fn dispatch(
                 line: 0,
             });
         }
-        "escapeshellarg" | "escapeshellcmd" => {
-            let s = arg_str(it, args, 0);
-            Value::str(format!("'{}'", s.replace('\'', "'\\''")))
-        }
         "get_include_path" => Value::str(it.ini.get("include_path").cloned().unwrap_or_default()),
         "set_include_path" => {
             // Returns the OLD path; the new one stores into the ini

@@ -173,6 +173,8 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
 pub(crate) fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
     let ps: &[(&str, bool)] = match n {
         "strlen" | "strrev" | "strtoupper" | "strtolower" | "md5" | "sha1" => &[("string", true)],
+        "escapeshellarg" => &[("arg", true)],
+        "escapeshellcmd" => &[("command", true)],
         "sprintf" | "printf" => &[("format", true), ("values", false)],
         "vsprintf" | "vprintf" => &[("format", true), ("values", true)],
         "fprintf" => &[("stream", true), ("format", true), ("values", false)],
@@ -1150,7 +1152,8 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "exec" => bp!(("command", Req), ("output", Null), ("result_code", Null)),
         "system" | "passthru" => bp!(("command", Req), ("result_code", Null)),
         "shell_exec" => bp!(("command", Req)),
-        "escapeshellarg" | "escapeshellcmd" => bp!(("arg", Req)),
+        "escapeshellarg" => bp!(("arg", Req)),
+        "escapeshellcmd" => bp!(("command", Req)),
         "md5" | "sha1" => bp!(("string", Req), ("binary", Bool(false))),
         "file_get_contents" => bp!(
             ("filename", Req),
@@ -1569,6 +1572,8 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
             ("rest_index", "mixed"),
         ],
         "ord" => &[("character", "string")],
+        "escapeshellarg" => &[("arg", "string")],
+        "escapeshellcmd" => &[("command", "string")],
         "defined" => &[("constant_name", "string")],
         "fwrite" | "fputs" => &[
             ("stream", "resource"),
