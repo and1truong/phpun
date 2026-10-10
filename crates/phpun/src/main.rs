@@ -2,6 +2,7 @@ mod install;
 mod semver_lite;
 
 use phpun_core::Interp;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 /// Dev-only alloc counter: `PHPUN_ALLOC=1 phpun x.php` prints
@@ -57,10 +58,18 @@ fn dispatch(args: Vec<String>) -> ExitCode {
         Some("test") => run_tests(&args[1..]),
         Some("fmt") => fmt(&args[1..]),
         Some("--version") | Some("-v") => {
-            println!("phpun 0.0.1 (php compat target: 8.5)");
+            print_version();
             ExitCode::SUCCESS
         }
-        Some("--help") | Some("-h") | None => {
+        Some("--help") | Some("-h") => {
+            print!("{}", ZEND_USAGE);
+            ExitCode::SUCCESS
+        }
+        // Bare `php` reads piped stdin ("Standard input code"); on a TTY
+        // zend drops into the `-a` interactive shell, which phpun does
+        // not implement — keep the local usage there.
+        None if !std::io::stdin().is_terminal() => run_script(&[]),
+        None => {
             eprintln!("Usage:");
             eprintln!("  phpun <file.php> [args...]   run a PHP script");
             eprintln!("  phpun serve <file.php>       dev HTTP server (default :8000)");
@@ -126,8 +135,40 @@ Usage: php [options] [-f] <file> [--] [args...]
 
 ";
 
+/// `php -m`: phpun's advertised extension set (same names as
+/// get_loaded_extensions) in zend's two-section format. phpun has no
+/// Zend extensions, so the second section is the bare header.
+fn print_modules() {
+    println!("[PHP Modules]");
+    for e in [
+        "Core",
+        "standard",
+        "SPL",
+        "pcre",
+        "hash",
+        "json",
+        "ctype",
+        "random",
+        "date",
+        "Reflection",
+        "mbstring",
+        "openssl",
+    ] {
+        println!("{e}");
+    }
+    println!();
+    println!("[Zend Modules]");
+    println!();
+}
+
 fn print_version() {
-    println!("phpun 0.0.1 (php compat target: 8.5)");
+    // Compat-target banner, pinned to the oracle build string like the
+    // pear include_path default — a different PHP build prints its own.
+    println!("PHP 8.5.11 (cli) (built: Sep 22 2026 13:32:06) (NTS)");
+    println!("Copyright (c) The PHP Group");
+    println!("Built by Homebrew");
+    println!("Zend Engine v4.5.11, Copyright (c) Zend Technologies");
+    println!("    with Zend OPcache v8.5.11, Copyright (c), by Zend Technologies");
 }
 
 /// Zend getopt error: `Error in argument N, char C: <msg>` on stderr
@@ -237,8 +278,12 @@ fn run_script(args: &[String]) -> ExitCode {
                     }
                 },
                 // Real php options phpun doesn't implement yet.
-                "modules" | "info" | "phpinfo" | "ini" | "rf" | "rc" | "re" | "rz" | "ri"
-                | "repeat" | "process-title" => return opt_unimpl(&a),
+                "modules" => {
+                    print_modules();
+                    return ExitCode::SUCCESS;
+                }
+                "info" | "phpinfo" | "ini" | "rf" | "rc" | "re" | "rz" | "ri" | "repeat"
+                | "process-title" => return opt_unimpl(&a),
                 _ => return opt_err(i + 1, 1, "no argument for option -".to_string()),
             }
             continue;
@@ -261,7 +306,11 @@ fn run_script(args: &[String]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             // Real php options phpun doesn't implement yet.
-            "-m" | "-i" | "-l" | "-s" | "-w" | "-a" | "-B" | "-R" | "-F" | "-E" | "-S" | "-t" => {
+            "-m" => {
+                print_modules();
+                return ExitCode::SUCCESS;
+            }
+            "-i" | "-l" | "-s" | "-w" | "-a" | "-B" | "-R" | "-F" | "-E" | "-S" | "-t" => {
                 return opt_unimpl(&a)
             }
             _ if a.starts_with("-r") => {

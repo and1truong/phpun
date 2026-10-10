@@ -5342,6 +5342,8 @@ pub(in crate::interp) fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "passthru" | "system" => &[false, true],
         "proc_open" => &[false, false, true],
         "stream_select" => &[true, true, true, false, false],
+        "stream_socket_client" | "stream_socket_server" => &[false, true, true],
+        "stream_socket_accept" => &[false, false, true],
         "flock" => &[false, false, true],
         "preg_grep" => &[false],
         _ => return None,

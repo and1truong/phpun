@@ -3385,6 +3385,128 @@ impl<'a> Parser<'a> {
                             .unwrap_or_else(|| self.line()),
                     ));
                 }
+                // A semi-reserved keyword that can't lead an expression is
+                // shifted as a named-arg LABEL in zend's grammar
+                // (`identifier ':' expr`) — `f(echo "s")` and
+                // `new X(echo "SIDE")` report `expecting ":"`, same state
+                // as the `unset` case above.
+                let label_kw = match self.peek() {
+                    Some(Token::Ident(k)) => Some(k.clone()),
+                    _ => None,
+                };
+                if let Some(kw) = label_kw {
+                    const LABEL_KW: &[&str] = &[
+                        "echo",
+                        "and",
+                        "or",
+                        "xor",
+                        "instanceof",
+                        "global",
+                        "return",
+                        "if",
+                        "elseif",
+                        "else",
+                        "endif",
+                        "for",
+                        "endfor",
+                        "foreach",
+                        "endforeach",
+                        "while",
+                        "endwhile",
+                        "do",
+                        "switch",
+                        "endswitch",
+                        "case",
+                        "default",
+                        "break",
+                        "continue",
+                        "goto",
+                        "try",
+                        "catch",
+                        "finally",
+                        "class",
+                        "interface",
+                        "trait",
+                        "abstract",
+                        "final",
+                        "private",
+                        "protected",
+                        "public",
+                        "readonly",
+                        "extends",
+                        "implements",
+                        "namespace",
+                        "use",
+                        "const",
+                        "var",
+                        "declare",
+                        "enddeclare",
+                        "as",
+                        "insteadof",
+                        "callable",
+                    ];
+                    // Operand-requiring keywords (`print $x`, `include $p`,
+                    // `clone $o`) are labels only when no operand can
+                    // follow — `f(print)`/`f(print, 1)` → `expecting ":"`,
+                    // while `f(print "s")` stays an expr.
+                    const PARTIAL_KW: &[&str] = &[
+                        "print",
+                        "include",
+                        "include_once",
+                        "require",
+                        "require_once",
+                        "clone",
+                    ];
+                    // `(`-continuation keywords are labels unless their
+                    // required `(` follows (`f(isset($x))` is an expr).
+                    const PAREN_KW: &[&str] = &["isset", "empty", "eval", "array", "match", "list"];
+                    let peek2 = self.peek2().cloned();
+                    let partial = match kw.as_str() {
+                        "new" => !matches!(
+                            peek2,
+                            Some(Token::Ident(_))
+                                | Some(Token::Variable(_))
+                                | Some(Token::Op("\\"))
+                        ),
+                        "static" => {
+                            !matches!(peek2, Some(Token::Op("::")))
+                                && !matches!(
+                                    &peek2,
+                                    Some(Token::Ident(k))
+                                        if k == "function" || k == "fn"
+                                )
+                        }
+                        k if PARTIAL_KW.contains(&k) => {
+                            matches!(peek2, None | Some(Token::Op(")")) | Some(Token::Op(",")))
+                        }
+                        k if PAREN_KW.contains(&k) => !matches!(peek2, Some(Token::Op("("))),
+                        _ => false,
+                    };
+                    // `(array)` immediately closed (`f(array)`) lexes as
+                    // the cast token — unexpected with no expecting clause.
+                    let arraycast = kw == "array" && matches!(self.peek2(), Some(Token::Op(")")));
+                    if arraycast {
+                        return Err(PhpError::parse(
+                            "syntax error, unexpected token \"(array)\"".to_string(),
+                            self.toks
+                                .get(self.pos + 1)
+                                .map(|l| l.line)
+                                .unwrap_or_else(|| self.line()),
+                        ));
+                    }
+                    if LABEL_KW.contains(&kw.as_str()) || partial {
+                        return Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected {}, expecting \":\"",
+                                desc_t(self.peek2())
+                            ),
+                            self.toks
+                                .get(self.pos + 1)
+                                .map(|l| l.line)
+                                .unwrap_or_else(|| self.line()),
+                        ));
+                    }
+                }
                 if seen_named {
                     return Err(PhpError::compile_fatal(
                         "Cannot use positional argument after named argument",
@@ -3991,6 +4113,11 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Print(Box::new(Self::markline(e, el))))
                 } else if self.ident_is("exit") || self.ident_is("die") {
                     self.pos += 1;
+                    // zend's exit operand is only the parenthesized
+                    // `exit(expr)` — a bare `exit "s"`/`exit 1` is a
+                    // parse error (no expecting clause at stmt level;
+                    // `expecting ")"` inside call args where the arg
+                    // already completed).
                     let arg = if self.eat_op("(") {
                         let a = if self.at_op(")") {
                             None
@@ -4000,14 +4127,8 @@ impl<'a> Parser<'a> {
                         };
                         self.expect_op(")")?;
                         a
-                    } else if matches!(
-                        self.peek(),
-                        Some(Token::Op(";")) | Some(Token::Op(")")) | None
-                    ) {
-                        None
                     } else {
-                        let al = self.line();
-                        Some(Box::new(Self::markline(self.expr()?, al)))
+                        None
                     };
                     Ok(Expr::Exit(arg))
                 } else if self.ident_is("array") && matches!(self.peek2(), Some(Token::Op("("))) {
