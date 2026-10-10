@@ -199,6 +199,7 @@ enum Op {
     /// value, bound at op-exec — zend binds the left CV of a binary
     /// when the op runs, so `$a . ($a = 'B')` yields "BB" not "AB".
     BinaryCv(&'static str, u16),
+    AppendCv(u16),
     /// Direct slot + immediate: no RHS value-stack push/pop or separate dispatch.
     BinaryCvConst(&'static str, u16, Value),
     Jump(usize),
@@ -949,7 +950,10 @@ impl Compiler {
                     // zend binds the lhs CV when the op runs — rhs
                     // first, then BinaryCv reads the slot's CURRENT
                     // value (`$a .= ($a = 'B')` → 'BB').
-                    if let Some(rhs) = const_val(value) {
+                    if bop == "." {
+                        self.expr(value)?;
+                        self.emit(Op::AppendCv(slot));
+                    } else if let Some(rhs) = const_val(value) {
                         self.emit(Op::BinaryCvConst(bop, slot, rhs));
                     } else {
                         self.expr(value)?;
@@ -1944,6 +1948,26 @@ impl<'a> Interp<'a> {
                     let lv = self.vm_slot_value(comp, slots, *sl)?;
                     let v = self.vm_binary(op, lv, rv)?;
                     vs.push(v);
+                }
+                Op::AppendCv(sl) => {
+                    let rhs = vs.pop().unwrap();
+                    let fast = match (&rhs, &mut slots[*sl as usize]) {
+                        (Value::Str(rhs), Slot::V(Value::Str(s)))
+                            if Rc::strong_count(&s.rc) == 1 =>
+                        {
+                            Some(self.append_unique_string(s, rhs))
+                        }
+                        (_, Slot::C(c)) => self.append_string_cell(c, &rhs),
+                        _ => None,
+                    };
+                    let value = match fast {
+                        Some(v) => v,
+                        None => {
+                            let lv = self.vm_slot_value(comp, slots, *sl)?;
+                            self.vm_binary(".", lv, rhs)?
+                        }
+                    };
+                    vs.push(value);
                 }
                 Op::BinaryCvConst(op, sl, rhs) => {
                     let lv = self.vm_slot_value(comp, slots, *sl)?;

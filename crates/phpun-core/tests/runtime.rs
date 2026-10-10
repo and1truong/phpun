@@ -865,3 +865,41 @@ cc ab
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn capacity_strings_preserve_aliases_binary_data_and_weak_utf8_guards() {
+    let (out, err, code) = eval(
+        "capacity.php",
+        r#"<?php
+function grow_bytes($n) { $s = ''; for ($i=0; $i<$n; $i++) $s .= "\xff\0"; return $s; }
+$s = grow_bytes(4000); $alias = $s; $s .= 'z'; echo strlen($s), ' ', strlen($alias), ' ', bin2hex(substr($s, -5)), "\n";
+$a = ['x' => 'a']; $r =& $a['x']; for ($i=0; $i<5; $i++) $r .= 'b'; echo "$r ", $a['x'], "\n";
+class TypedString { public string $x = 'v'; }
+$o = new TypedString; $t =& $o->x; $t .= '!'; echo "$t $o->x\n";
+$u = 'A'; $u .= ($u = 'B'); echo "$u\n";
+function canon_growth($s) { foreach ([1,2,3] as $unused) { $s .= 'x'; } return $s; }
+echo canon_growth(s: 'c'), "\n";
+$v = 'a'; var_dump(preg_match('/\A[ab]+\z/u', $v)); $v .= "\xff"; var_dump(preg_match('/\A[ab]+\z/u', $v)); echo preg_last_error(), "\n";
+$v .= 'b'; var_dump(preg_match('/\A[ab]+\z/u', $v)); echo preg_last_error(), "\n";
+$b = str_repeat('x', 300000); $copy=$b; for ($i=0; $i<8; $i++) $b .= str_repeat('x',300000); echo strlen($b), ' ', strlen($copy), "\n";
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"8001 8000 ff00ff007a
+abbbbb abbbbb
+v! v!
+BB
+cxxx
+int(1)
+bool(false)
+4
+bool(false)
+4
+2700000 300000
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}

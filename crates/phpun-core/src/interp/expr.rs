@@ -117,7 +117,7 @@ enum UnsetKey {
 enum DimPre {
     Arr(std::rc::Weak<RefCell<PhpArray>>),
     Obj(std::rc::Weak<RefCell<PhpObject>>),
-    Str(std::rc::Weak<[u8]>),
+    Str(std::rc::Weak<Vec<u8>>),
     Callable(std::rc::Weak<PhpCallable>),
     Res(std::rc::Weak<RefCell<PhpResource>>),
     Scalar(Value),
@@ -1753,8 +1753,7 @@ impl<'a> Interp<'a> {
 
     /// Borrow existing bytes and allocate only the combined output. Keep
     /// non-string conversions left-to-right through the canonical helper.
-    /// ponytail: Rc<[u8]> still copies growing prefixes; capacity append needs
-    /// a measured unique-owner/storage change, not just accounting "grow".
+    /// Shared/string-conversion fallback; proven CV appends reuse capacity.
     pub(in crate::interp) fn concat_bytes(
         &mut self,
         left: &Value,
@@ -3043,6 +3042,16 @@ impl<'a> Interp<'a> {
             };
         }
         let dim_det = det.as_ref().is_some_and(|d| self.dim_detached(d));
+        if op == ".=" && self.dim_throw.is_none() {
+            if let Expr::Var(name) = target {
+                if let Some(c) = self.var_lookup(name) {
+                    if let Some(value) = self.append_string_cell(&c, &rhs) {
+                        self.store(target, value.clone())?;
+                        return Ok(value);
+                    }
+                }
+            }
+        }
         let cur = if needs_read {
             if op == "??=" {
                 // Reaching here means the isset read found null/missing.
@@ -6120,7 +6129,7 @@ impl<'a> Interp<'a> {
                     OffWrite::Skipped => return Ok(v),
                     OffWrite::Stored(byte) => {
                         let n = bytes.len() as u64 + 25;
-                        let rc: Rc<[u8]> = bytes.into();
+                        let rc = Rc::new(bytes);
                         self.mem_track(&rc, n);
                         let mut b = c.borrow_mut();
                         if let Value::Str(s) = &mut *b {

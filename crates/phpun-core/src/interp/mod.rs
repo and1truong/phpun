@@ -510,7 +510,7 @@ pub struct Interp<'a> {
     /// re-validating it (bug72685). Weak keys drop when the storage
     /// dies — a recycled pointer then fails upgrade() and re-validates,
     /// so nothing stays pinned and the map can't grow without bound.
-    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<[u8]>>,
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<Vec<u8>>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -5063,14 +5063,20 @@ impl<'a> Interp<'a> {
     /// zend checks whether the pages immediately after the old run
     /// are free, which needs the real page map PR #88 owns; without
     /// it the boundary can land one growth step off.
-    pub(crate) fn mem_grow_str(&mut self, old: &Rc<[u8]>, new: &Rc<[u8]>, req: u64) {
+    pub(crate) fn mem_grow_str<T: ?Sized + 'static>(&mut self, old: &Rc<T>, new: &Rc<T>, req: u64) {
         // zend frees dead allocs before sizing the grow — sweep
         // unconditionally so freed runs feed the extend test.
         self.mem_sweep();
+        self.mem_grow_str_key(Rc::as_ptr(old) as *const u8 as usize, new, req);
+    }
+
+    // Called after sweeping while the old owner was still live. A unique append
+    // may detach its weak handles, so carry the old charge by key across mutation.
+    fn mem_grow_str_key<T: ?Sized + 'static>(&mut self, old_key: usize, new: &Rc<T>, req: u64) {
         let fp = Self::mem_fp(req);
         let (old_inner, old_huge, old_chunk) = self
             .mem_tracked
-            .get(&(Rc::as_ptr(old) as *const u8 as usize))
+            .get(&(old_key))
             .map(|c| (c.inner, c.huge, c.chunk))
             .unwrap_or((0, 0, usize::MAX));
         // In-place growth: the grown run fits the same chunk once the
@@ -5086,15 +5092,10 @@ impl<'a> Interp<'a> {
         // new segment while the old one is still held (the stricter
         // check). Otherwise the old segment unmaps and only the
         // growth delta is checked. Untracked/dead olds relocate.
-        let old_key = Rc::as_ptr(old) as *const u8 as usize;
         // The extendable bound is the seg's own extent plus the free
         // space still directly above it — recomputed, so a span a
         // temp reoccupied meanwhile never counts.
-        let old_seg = self
-            .mem_tracked
-            .get(&old_key)
-            .filter(|c| (c.probe)())
-            .map(|c| c.seg_cap);
+        let old_seg = self.mem_tracked.get(&old_key).map(|c| c.seg_cap);
         // ponytail: slot spans approximate the freed region each seg
         // leaves (extent + its own tail); slack between slots (head
         // frags, neighbor tails) isn't tracked, so the boundary can
@@ -5144,12 +5145,11 @@ impl<'a> Interp<'a> {
                 }
                 self.mem_in_chunk = self.mem_in_chunk.saturating_sub(old_inner);
                 self.mem_used = self.mem_used.saturating_sub(old_inner);
-                self.mem_tracked
-                    .remove(&(Rc::as_ptr(old) as *const u8 as usize));
+                self.mem_tracked.remove(&(old_key));
                 new_chunk = old_chunk;
             } else {
                 new_chunk = self.chunk_place(fp);
-                self.mem_retire(old);
+                self.mem_retire_key(old_key, true);
             }
         }
         if self.mem_used > self.mem_peak {
@@ -5222,6 +5222,33 @@ impl<'a> Interp<'a> {
                 probe: Box::new(move || weak.strong_count() > 0),
             },
         );
+    }
+
+    fn append_unique_string(&mut self, s: &mut PhpStr, suffix: &[u8]) -> Value {
+        self.mem_sweep();
+        let old_key = Rc::as_ptr(&s.rc) as usize;
+        let old_handle = Rc::downgrade(&s.rc);
+        s.append_unique(suffix);
+        debug_assert_ne!(old_key, Rc::as_ptr(&s.rc) as usize);
+        drop(old_handle);
+        self.mem_grow_str_key(old_key, &s.rc, s.len() as u64 + 25);
+        Value::Str(s.clone())
+    }
+
+    fn append_string_cell(&mut self, c: &Cell, rhs: &Value) -> Option<Value> {
+        let Value::Str(rhs) = rhs else { return None };
+        // Typed-reference owners keep their canonical write/coercion gates.
+        let ptr = Rc::as_ptr(c) as usize;
+        if self.typed_slots.contains_key(&ptr) || self.slot_merged.contains_key(&ptr) {
+            return None;
+        }
+        let mut value = c.borrow_mut();
+        match &mut *value {
+            Value::Str(s) if Rc::strong_count(&s.rc) == 1 => {
+                Some(self.append_unique_string(s, rhs))
+            }
+            _ => None,
+        }
     }
 
     /// Reconcile then report the live usage — memory_get_usage()
