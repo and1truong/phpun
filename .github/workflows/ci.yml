@@ -15,10 +15,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: python3 bench/check-measure.py
+      - run: python3 bench/check-http-load.py
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - run: python3 bench/check-vm-profile.py
 
   phpt:
     runs-on: ubuntu-latest

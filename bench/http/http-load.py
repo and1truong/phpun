@@ -1,65 +1,69 @@
 #!/usr/bin/env python3
-"""Minimal concurrent HTTP load driver (stdlib only).
-
-Each of C threads issues requests sequentially over fresh connections
-(these dev servers close the connection per response). Reports total
-requests, wall time, req/s, error count, and whether every response
-contained the expected marker.
-
-usage: http-load.py <port> <total_requests> <concurrency> [path]
-prints one line: <total> <wall_s> <rps> <errors> <ok_marker>
-"""
+"""Fresh-connection load with full response gates and latency samples."""
+import argparse
+import concurrent.futures
 import http.client
-import sys
-import threading
+import json
 import time
 
 
-def main() -> int:
-    port = int(sys.argv[1])
-    total = int(sys.argv[2])
-    conc = int(sys.argv[3])
-    path = sys.argv[4] if len(sys.argv) > 4 else "/?name=bench"
-    marker = b"bench-ok"
-
-    counters = {"done": 0, "errors": 0, "bad_body": 0}
-    lock = threading.Lock()
-
-    def worker() -> None:
-        while True:
-            with lock:
-                if counters["done"] >= total:
-                    return
-                counters["done"] += 1
-            try:
-                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-                conn.request("GET", path)
-                resp = conn.getresponse()
-                body = resp.read()
-                conn.close()
-                if resp.status != 200:
-                    with lock:
-                        counters["errors"] += 1
-                elif marker not in body:
-                    with lock:
-                        counters["bad_body"] += 1
-            except Exception:
-                with lock:
-                    counters["errors"] += 1
-
-    threads = [threading.Thread(target=worker) for _ in range(conc)]
-    t0 = time.monotonic()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    wall = time.monotonic() - t0
-
-    bad = counters["errors"] + counters["bad_body"]
-    rps = total / wall if wall > 0 else 0.0
-    print(f"{total} {wall:.3f} {rps:.1f} {bad} {'ok' if bad == 0 else 'BAD'}")
-    return 0
+def request(port, path, timeout=10):
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=timeout)
+    try:
+        conn.request('GET', path)
+        response = conn.getresponse()
+        return response.status, response.getheader('Content-Type'), response.read()
+    finally:
+        conn.close()
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def percentile(samples, fraction):
+    ordered = sorted(samples)
+    index = (len(ordered) - 1) * fraction
+    lo = int(index)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (index - lo)
+
+
+def load(port, total, concurrency, expected, path='/?name=bench', timeout=10):
+    if total < 1 or concurrency < 1:
+        raise ValueError('requests and concurrency must be positive')
+
+    def sample(_):
+        start = time.perf_counter()
+        try:
+            valid = request(port, path, timeout) == expected
+        except (OSError, http.client.HTTPException):
+            valid = False
+        return (time.perf_counter() - start) * 1000, valid
+
+    start = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        samples = list(pool.map(sample, range(total)))
+    wall = time.perf_counter() - start
+    latency = [ms for ms, _ in samples]
+    errors = sum(not valid for _, valid in samples)
+    return {'requests': total, 'wall_s': wall, 'rps': total / wall,
+            'errors': errors, 'valid': errors == 0,
+            'p50_ms': percentile(latency, .5), 'p95_ms': percentile(latency, .95),
+            'p99_ms': percentile(latency, .99)}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('port', type=int)
+    parser.add_argument('requests', type=int)
+    parser.add_argument('concurrency', type=int)
+    parser.add_argument('--expected-body', required=True)
+    parser.add_argument('--content-type', default='application/json')
+    parser.add_argument('--path', default='/?name=bench')
+    args = parser.parse_args()
+    with open(args.expected_body, 'rb') as stream:
+        expected = (200, args.content_type, stream.read())
+    result = load(args.port, args.requests, args.concurrency, expected, args.path)
+    print(json.dumps(result))
+    return 0 if result['valid'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
