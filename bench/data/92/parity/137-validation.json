@@ -1,0 +1,50 @@
+{
+  "baseline_commit": "5b227c05c5521cbb0f8ecd800d38ed8ca0d7b952",
+  "runtime_commit": "8688c2a",
+  "oracle": "PHP 8.5.11 -n",
+  "oracle_probe": "dynamic_builtin_reference_sends_and_zpp_types in crates/phpun-core/tests/runtime.rs",
+  "oracle_gate": "exit/stdout/stderr matched on standalone release probe",
+  "build": "Rust 1.99.0; release; LTO=true/codegen-units=1",
+  "binary_sha256": {
+    "main": "dfcd70196686ff67c414a276e97e92c415d46001f0dc9bb2b1d4e734e6dba04b",
+    "137": "038f92aa67997204fb5e059d1afb337d6423e0d149f1ebb27d9e5f35a27fb8be"
+  },
+  "phpt_before": {
+    "total": 74,
+    "passed": 67,
+    "failed": 7,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 0,
+    "unsupported": 0,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 74,
+    "compatibility_pct": 90.54
+  },
+  "phpt_after": {
+    "total": 74,
+    "passed": 67,
+    "failed": 7,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 0,
+    "unsupported": 0,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 74,
+    "compatibility_pct": 90.54
+  },
+  "status_changes": [],
+  "existing_failures": [
+    "/workspace/php-8.5.11/Zend/tests/first_class_callable/first_class_callable_assert.phpt",
+    "/workspace/php-8.5.11/Zend/tests/first_class_callable/first_class_callable_assert3.phpt",
+    "/workspace/php-8.5.11/Zend/tests/first_class_callable/first_class_callable_signature.phpt",
+    "/workspace/php-8.5.11/Zend/tests/named_params/call_user_func.phpt",
+    "/workspace/php-8.5.11/ext/standard/tests/strings/parse_str_basic2.phpt",
+    "/workspace/php-8.5.11/ext/standard/tests/strings/parse_str_basic3.phpt",
+    "/workspace/php-8.5.11/ext/standard/tests/strings/parse_str_basic4.phpt"
+  ]
+}
