@@ -249,7 +249,7 @@ impl<'a> Interp<'a> {
         )
     }
 
-    pub(in crate::interp) fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
+    pub(crate) fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.isset_quiet > 0 {
             return Ok(());
         }
@@ -275,7 +275,7 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    pub(in crate::interp) fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
+    pub(crate) fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.isset_quiet > 0 {
             return Ok(());
         }

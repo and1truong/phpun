@@ -389,6 +389,9 @@ pub(crate) fn dispatch(
                     id: it.next_res_id(),
                     which,
                     pos: 0,
+                    eof: false,
+                    rbuf: std::collections::VecDeque::new(),
+                    rcap: 0,
                 }))));
                 return match write_resource(it, Some(&res), data.as_bytes())? {
                     StreamWrite::Written => Ok(Some(Value::Int(data.len() as i64))),
@@ -802,6 +805,9 @@ pub(crate) fn dispatch(
                     id,
                     which,
                     pos: 0,
+                    eof: false,
+                    rbuf: std::collections::VecDeque::new(),
+                    rcap: 0,
                 })))
             } else if path.to_lowercase().starts_with("php://fd/") {
                 // zend's fd scheme — strtol the suffix, dup() the fd.
@@ -1093,6 +1099,9 @@ pub(crate) fn dispatch(
                         PhpResource::Input { eof, srbuf, .. } => {
                             Value::Bool(*eof && srbuf.is_empty())
                         }
+                        PhpResource::Stdio {
+                            which, eof, rbuf, ..
+                        } => Value::Bool(*which != 0 || (*eof && rbuf.is_empty())),
                         _ => Value::Bool(true),
                     },
                     _ => Value::Bool(true),
@@ -4085,11 +4094,26 @@ fn read_resource_inner(
                 read_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), n)
             }
         }
-        PhpResource::Stdio { which, .. } => match *which {
-            // STDIN reads are not modeled; php://output has no
-            // read op at all (silent false); STDOUT/STDERR are
-            // write-only fds → read(2) EBADF.
-            0 => Ok(StreamRead::Data(Vec::new())),
+        PhpResource::Stdio {
+            which,
+            pos,
+            eof,
+            rbuf,
+            rcap,
+            id,
+            ..
+        } => match *which {
+            // fd 0 reads go through the shared buffered reader so
+            // fgets leaves the post-newline remainder buffered.
+            0 => Ok(fd_stream_read(
+                0,
+                pos,
+                eof,
+                rbuf,
+                rcap,
+                stream_chunk(it, *id),
+                n,
+            )),
             _ if *which > 2 => Ok(StreamRead::FailSilent),
             _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
         },
@@ -4307,8 +4331,24 @@ fn read_line_resource_inner(
                 )
             }
         }
-        PhpResource::Stdio { which, .. } => match *which {
-            0 => Ok(StreamRead::Data(Vec::new())),
+        PhpResource::Stdio {
+            which,
+            pos,
+            eof,
+            rbuf,
+            rcap,
+            id,
+            ..
+        } => match *which {
+            0 => Ok(fd_line_read(
+                0,
+                pos,
+                eof,
+                rbuf,
+                rcap,
+                stream_chunk(it, *id),
+                limit,
+            )),
             _ if *which > 2 => Ok(StreamRead::FailSilent),
             _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
         },
@@ -6677,6 +6717,9 @@ fn stream_filter_standin(res: &PhpResource) -> Option<PhpResource> {
             id: *id,
             which: *which,
             pos: 0,
+            eof: false,
+            rbuf: Default::default(),
+            rcap: 0,
         },
         _ => return None,
     })

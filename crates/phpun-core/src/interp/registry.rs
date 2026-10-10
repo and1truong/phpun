@@ -2503,7 +2503,13 @@ impl<'a> Interp<'a> {
             .iter()
             .map(|(p, vis)| PropDecl {
                 name: p.to_string(),
-                default: None,
+                // zend's defaults table: message="", code=0 — the rest
+                // fill from the exception's internal payload.
+                default: match *p {
+                    "message" => Some(Expr::Str("".into())),
+                    "code" => Some(Expr::Int(0)),
+                    _ => None,
+                },
                 is_static: false,
                 visibility: *vis,
                 readonly: false,

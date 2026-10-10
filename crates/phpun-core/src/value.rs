@@ -2910,7 +2910,14 @@ pub enum PhpResource {
     /// STDIN/STDOUT/STDERR — php:// and the CLI-SAPI constants.
     /// `which` > 2 is php://output: a write-only stream whose ftell
     /// counts bytes written (zend tracks them on the stream struct).
-    Stdio { id: u64, which: u8, pos: u64 },
+    Stdio {
+        id: u64,
+        which: u8,
+        pos: u64,
+        eof: bool,
+        rbuf: std::collections::VecDeque<u8>,
+        rcap: usize,
+    },
     /// php://input — the request body, readable like a file.
     Input {
         id: u64,
