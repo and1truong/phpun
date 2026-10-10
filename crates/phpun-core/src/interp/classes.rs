@@ -148,14 +148,12 @@ impl<'a> Interp<'a> {
             }
         }
         for i in &decl.implements {
-            if !self.interfaces.contains_key(&i.to_lowercase())
-                && !self.classes.contains_key(&i.to_lowercase())
-            {
+            if !lkey_get(&self.interfaces, i).is_some() && !lkey_get(&self.classes, i).is_some() {
                 self.run_autoload(i.trim_start_matches('\\'))?;
             }
         }
         for t in &decl.traits {
-            if !self.traits.contains_key(&t.to_lowercase()) {
+            if !lkey_get(&self.traits, t).is_some() {
                 self.run_autoload(t.trim_start_matches('\\'))?;
             }
         }
@@ -247,9 +245,9 @@ impl<'a> Interp<'a> {
                 // trait's name via decl_in.
                 if !d.traits.is_empty() {
                     for t in &d.traits {
-                        if !self.traits.contains_key(&t.to_lowercase()) {
+                        if !lkey_get(&self.traits, t).is_some() {
                             let msg = if self.lookup_class(t).is_some()
-                                || self.interfaces.contains_key(&t.to_lowercase())
+                                || lkey_get(&self.interfaces, t).is_some()
                             {
                                 format!("{} cannot use {} - it is not a trait", d.name, t)
                             } else {
@@ -287,9 +285,9 @@ impl<'a> Interp<'a> {
                 if !d.traits.is_empty() {
                     // Missing trait → catchable Error (gh17959).
                     for t in &d.traits {
-                        if !self.traits.contains_key(&t.to_lowercase()) {
+                        if !lkey_get(&self.traits, t).is_some() {
                             let msg = if self.lookup_class(t).is_some()
-                                || self.interfaces.contains_key(&t.to_lowercase())
+                                || lkey_get(&self.interfaces, t).is_some()
                             {
                                 format!("{} cannot use {} - it is not a trait", d.name, t)
                             } else {
@@ -336,9 +334,9 @@ impl<'a> Interp<'a> {
                 }
                 // `implements <non-interface>` → fatal (error_008).
                 for i in &d.implements {
-                    if !self.interfaces.contains_key(&i.to_lowercase()) {
+                    if !lkey_get(&self.interfaces, i).is_some() {
                         let missing = !(self.lookup_class(i).is_some()
-                            || self.traits.contains_key(&i.to_lowercase()));
+                            || lkey_get(&self.traits, i).is_some());
                         if missing {
                             // Catchable Error like a missing trait
                             // (variance/unlinked_parent_2).
@@ -409,6 +407,8 @@ impl<'a> Interp<'a> {
                     lname.clone(),
                     Rc::new(PhpClass {
                         decl: Rc::new(d),
+                        parent_rc: RefCell::new(None),
+                        throwable: std::cell::Cell::new(None),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     }),
@@ -770,7 +770,7 @@ impl<'a> Interp<'a> {
                         }
                         // A class name in `as`/`insteadof` is its own
                         // error (bug64235).
-                        if !is_used(n) && self.classes.contains_key(&n.to_lowercase()) {
+                        if !is_used(n) && lkey_get(&self.classes, n).is_some() {
                             return Err(PhpError::fatal(
                                 format!(
                                     "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
@@ -785,7 +785,7 @@ impl<'a> Interp<'a> {
                     }
                     // `T::m insteadof ...` — the method must exist in T
                     // (bug60165d).
-                    if let Some(td) = self.traits.get(&trait_name.to_lowercase()) {
+                    if let Some(td) = lkey_get(&self.traits, trait_name) {
                         if !td
                             .methods
                             .iter()
@@ -820,7 +820,7 @@ impl<'a> Interp<'a> {
                     ..
                 } => {
                     if !is_used(tn) {
-                        if self.classes.contains_key(&tn.to_lowercase()) {
+                        if lkey_get(&self.classes, tn).is_some() {
                             return Err(PhpError::fatal(
                                 format!(
                                     "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
@@ -1018,7 +1018,7 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 if !is_used(tn) {
-                    if self.classes.contains_key(&tn.to_lowercase()) {
+                    if lkey_get(&self.classes, tn).is_some() {
                         return Err(PhpError::fatal(
                             format!(
                                 "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
@@ -1031,7 +1031,7 @@ impl<'a> Interp<'a> {
                 }
             }
             let src: Option<Rc<MethodDecl>> = match trait_name {
-                Some(tn) => self.traits.get(&tn.to_lowercase()).and_then(|td| {
+                Some(tn) => lkey_get(&self.traits, tn).and_then(|td| {
                     td.methods
                         .iter()
                         .find(|m| m.decl.name.eq_ignore_ascii_case(method))
@@ -1389,7 +1389,7 @@ impl<'a> Interp<'a> {
     fn ancestor_concrete(&self, d: &ClassDecl, lname: &str) -> Option<(String, Rc<MethodDecl>)> {
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
-            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+            let Some(pc) = lkey_get(&self.classes, p).cloned() else {
                 break;
             };
             if let Some(m) = pc
@@ -1609,14 +1609,14 @@ impl<'a> Interp<'a> {
         // (bug62358).
         let mut ifaces: Vec<(Rc<ClassDecl>, String)> = Vec::new();
         for iname in &d.implements {
-            if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+            if let Some(f) = lkey_get(&self.interfaces, iname).cloned() {
                 ifaces.push((f, String::new()));
             }
         }
         let mut chain: Vec<Rc<ClassDecl>> = Vec::new();
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
-            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+            let Some(pc) = lkey_get(&self.classes, p) else {
                 break;
             };
             chain.push(pc.decl.clone());
@@ -1624,7 +1624,7 @@ impl<'a> Interp<'a> {
         }
         for c in &chain {
             for iname in &c.implements {
-                if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                if let Some(f) = lkey_get(&self.interfaces, iname).cloned() {
                     ifaces.push((f, c.name.clone()));
                 }
             }
@@ -1664,7 +1664,7 @@ impl<'a> Interp<'a> {
                 }
             }
             for p2 in &f.implements {
-                if let Some(pp) = self.interfaces.get(&p2.to_lowercase()).cloned() {
+                if let Some(pp) = lkey_get(&self.interfaces, p2).cloned() {
                     ifaces.push((pp, String::new()));
                 }
             }
@@ -1732,7 +1732,7 @@ impl<'a> Interp<'a> {
         let mut chain: Vec<Rc<ClassDecl>> = Vec::new();
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
-            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+            let Some(pc) = lkey_get(&self.classes, p) else {
                 break;
             };
             chain.push(pc.decl.clone());
@@ -1812,7 +1812,7 @@ impl<'a> Interp<'a> {
             .iter()
             .chain(chain.iter().flat_map(|c| c.implements.iter()))
         {
-            if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+            if let Some(f) = lkey_get(&self.interfaces, iname).cloned() {
                 ifaces.push(f);
             }
         }
@@ -1832,7 +1832,7 @@ impl<'a> Interp<'a> {
                 }
             }
             for p2 in &f.implements {
-                if let Some(pp) = self.interfaces.get(&p2.to_lowercase()).cloned() {
+                if let Some(pp) = lkey_get(&self.interfaces, p2).cloned() {
                     ifaces.push(pp);
                 }
             }
@@ -1928,7 +1928,7 @@ impl<'a> Interp<'a> {
     fn check_final_override(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         let mut an = d.parent.clone();
         while let Some(pname) = an {
-            let Some(pc) = self.classes.get(&pname.to_lowercase()).cloned() else {
+            let Some(pc) = lkey_get(&self.classes, pname).cloned() else {
                 break;
             };
             for cm in &d.methods {
@@ -2191,7 +2191,7 @@ impl<'a> Interp<'a> {
         // signatures (get_by_ref_implemented_by_val: `&get;` in the
         // interface requires `&get` in the class).
         for iname in &d.implements {
-            let Some(iface) = self.interfaces.get(&iname.to_lowercase()).cloned() else {
+            let Some(iface) = lkey_get(&self.interfaces, iname).cloned() else {
                 continue;
             };
             for cp in &d.props {
@@ -2413,7 +2413,7 @@ impl<'a> Interp<'a> {
                 let mut par = d.parent.clone();
                 let mut found = false;
                 while let Some(pname) = par {
-                    let Some(pc) = self.classes.get(&pname.to_lowercase()) else {
+                    let Some(pc) = lkey_get(&self.classes, pname) else {
                         break;
                     };
                     if pc.decl.props.iter().any(|p2| {
@@ -2798,7 +2798,7 @@ impl<'a> Interp<'a> {
                     if p.eq_ignore_ascii_case(s) {
                         return true;
                     }
-                    if let Some(ff) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                    if let Some(ff) = lkey_get(&self.interfaces, p).cloned() {
                         stack.push(ff);
                     }
                 }
@@ -2935,7 +2935,7 @@ impl<'a> Interp<'a> {
         let mut supers: Vec<(String, crate::ast::ConstDecl)> = Vec::new();
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
-            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+            let Some(pc) = lkey_get(&self.classes, p).cloned() else {
                 break;
             };
             for cd in &pc.decl.consts {
@@ -2946,7 +2946,7 @@ impl<'a> Interp<'a> {
             pn = pc.decl.parent.clone();
         }
         for i in &d.implements {
-            if let Some(id) = self.interfaces.get(&i.to_lowercase()).cloned() {
+            if let Some(id) = lkey_get(&self.interfaces, i).cloned() {
                 for cd in &id.consts {
                     supers.push((id.name.clone(), cd.clone()));
                 }
@@ -3047,7 +3047,7 @@ impl<'a> Interp<'a> {
         let mut chain = vec![cls.clone()];
         let mut pn = cls.decl.parent.clone();
         while let Some(p) = pn {
-            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+            let Some(pc) = lkey_get(&self.classes, p).cloned() else {
                 break;
             };
             if !self.consts_linked.insert(pc.decl.name.to_lowercase()) {
@@ -3093,7 +3093,7 @@ impl<'a> Interp<'a> {
         props.insert("name".to_string(), Value::str(case));
         let is_unit = matches!(cd.value, Expr::Null);
         if !is_unit {
-            let ecls = self.classes.get(&cls.to_lowercase()).cloned();
+            let ecls = lkey_get(&self.classes, cls).cloned();
             let file = ecls
                 .as_ref()
                 .map(|c| c.decl.file.clone())
@@ -3162,7 +3162,7 @@ impl<'a> Interp<'a> {
         let mut chain: Vec<(String, Rc<ClassDecl>)> = Vec::new();
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
-            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+            let Some(pc) = lkey_get(&self.classes, p) else {
                 break;
             };
             chain.push((pc.decl.name.clone(), pc.decl.clone()));
@@ -3277,7 +3277,7 @@ impl<'a> Interp<'a> {
         let mut chain: Vec<&ClassDecl> = vec![d];
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
-            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+            let Some(pc) = lkey_get(&self.classes, p) else {
                 break;
             };
             chain.push(pc.decl.as_ref());
@@ -3308,7 +3308,7 @@ impl<'a> Interp<'a> {
         for c in &chain {
             sources.push(*c);
             for i in &c.implements {
-                if let Some(f) = self.interfaces.get(&i.to_lowercase()) {
+                if let Some(f) = lkey_get(&self.interfaces, i) {
                     sources.push(f.as_ref());
                 }
             }
@@ -3516,17 +3516,13 @@ impl<'a> Interp<'a> {
     /// once (FCC string args, class_exists).
     pub(in crate::interp) fn resolve_class(&mut self, name: &str) -> Option<String> {
         let n = name.trim_start_matches('\\');
-        if !self.classes.contains_key(&n.to_lowercase())
-            && !self.interfaces.contains_key(&n.to_lowercase())
-        {
+        if !lkey_get(&self.classes, n).is_some() && !lkey_get(&self.interfaces, n).is_some() {
             // Option-typed: a throwing autoloader can't surface here —
             // PHP propagates it, but callers of resolve_class (e.g.
             // class_exists) mostly can't throw either; keep the swallow.
             let _ = self.run_autoload(n);
         }
-        if self.classes.contains_key(&n.to_lowercase())
-            || self.interfaces.contains_key(&n.to_lowercase())
-        {
+        if lkey_get(&self.classes, n).is_some() || lkey_get(&self.interfaces, n).is_some() {
             Some(n.to_string())
         } else {
             None
@@ -3692,7 +3688,7 @@ impl<'a> Interp<'a> {
             Some(c) => c.clone(),
             None => {
                 let t = name.trim_start_matches('\\');
-                if self.traits.contains_key(&t.to_lowercase()) {
+                if lkey_get(&self.traits, t).is_some() {
                     return self.fail(PhpError::uncaught(
                         "Error",
                         format!("Cannot instantiate trait {}", t),
@@ -3780,7 +3776,7 @@ impl<'a> Interp<'a> {
 
     /// Build the object shell: init props along the whole parent chain.
     pub fn instantiate(&mut self, lname: &str, _args: &[Value]) -> Result<Value, PhpError> {
-        let cls = self.classes.get(&lname.to_lowercase()).cloned();
+        let cls = lkey_get(&self.classes, lname).cloned();
         let cls = match cls {
             Some(c) => c,
             None => {
@@ -3803,6 +3799,8 @@ impl<'a> Interp<'a> {
                             file: String::new(),
                             line: 0,
                         }),
+                        parent_rc: RefCell::new(None),
+                        throwable: std::cell::Cell::new(None),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
                     }),
@@ -3818,7 +3816,7 @@ impl<'a> Interp<'a> {
         let mut chain = vec![cls.clone()];
         let mut cur = cls.clone();
         while let Some(p) = cur.decl.parent.clone() {
-            if let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() {
+            if let Some(pc) = lkey_get(&self.classes, p).cloned() {
                 chain.push(pc.clone());
                 cur = pc;
             } else {
@@ -3910,7 +3908,7 @@ impl<'a> Interp<'a> {
                 props.insert(key, cell(default));
             }
         }
-        let internal = if self.is_throwable_name(&cls.decl.name) {
+        let internal = if self.is_throwable_cls(&cls) {
             // A throwable's file/line attribute to the executing code
             // unit — inside a call frame that's the frame's own file
             // (an error handler declared in the caller's file reports
@@ -3954,8 +3952,7 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn is_throwable_name(&mut self, name: &str) -> bool {
-        let ln = name.to_lowercase();
-        let mut cur = self.classes.get(&ln).cloned();
+        let mut cur = lkey_get(&self.classes, name).cloned();
         while let Some(c) = cur {
             if c.decl
                 .implements
@@ -3967,11 +3964,7 @@ impl<'a> Interp<'a> {
             if c.name().eq_ignore_ascii_case("throwable") {
                 return true;
             }
-            cur = c
-                .decl
-                .parent
-                .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = self.parent_of(&c);
         }
         false
     }

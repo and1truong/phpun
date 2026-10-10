@@ -1319,7 +1319,7 @@ impl<'a> Interp<'a> {
                         if let Some(v) = self.call_builtin(&n.to_lowercase(), &args, true)? {
                             return Ok(v);
                         }
-                        let decl = match self.functions.get(&n.to_lowercase()) {
+                        let decl = match lkey_get(&self.functions, n) {
                             Some(d) => d.clone(),
                             None => {
                                 return self.fail(PhpError::uncaught(
@@ -1368,7 +1368,7 @@ impl<'a> Interp<'a> {
                         Err(SiteErr::Thrown(e)) => return Err(e),
                         Err(SiteErr::Msg(detail)) => {
                             if let Some(c) = self.resolve_class(cls) {
-                                if let Some(cls) = self.classes.get(&c.to_lowercase()).cloned() {
+                                if let Some(cls) = lkey_get(&self.classes, c).cloned() {
                                     return self.static_invoke_vis(cls, m, args, None, true);
                                 }
                             }
@@ -1381,7 +1381,7 @@ impl<'a> Interp<'a> {
                 if let Some(v) = self.call_builtin(&name.to_lowercase(), &args, true)? {
                     return Ok(v);
                 }
-                let decl = match self.functions.get(&name.to_lowercase()) {
+                let decl = match lkey_get(&self.functions, &name) {
                     Some(d) => d.clone(),
                     None => {
                         return self.fail(PhpError::uncaught(
@@ -1471,10 +1471,9 @@ impl<'a> Interp<'a> {
                                     }
                                     Err(SiteErr::Thrown(e)) => Err(e),
                                     Err(SiteErr::Msg(detail)) => {
-                                        let cls =
-                                            self.resolve_class(&crate::value::lossy(&cn)).and_then(
-                                                |c| self.classes.get(&c.to_lowercase()).cloned(),
-                                            );
+                                        let cls = self
+                                            .resolve_class(&crate::value::lossy(&cn))
+                                            .and_then(|c| lkey_get(&self.classes, c).cloned());
                                         if let Some(cls) = cls {
                                             return self
                                                 .static_invoke_vis(cls, &mname, args, None, true);
@@ -1580,12 +1579,14 @@ impl<'a> Interp<'a> {
     fn fcc_class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
         if let Expr::Const(n) | Expr::Str(n) = e {
             let rn = self.resolve_class_name(n);
-            if let Some(t) = self.traits.get(&rn.to_lowercase()).cloned() {
+            if let Some(t) = lkey_get(&self.traits, rn).cloned() {
                 // Traits aren't PhpClass-registered; wrap the decl so
                 // find_method_in/late-static binding see the trait's
                 // own methods (constexpr/error_static_call_trait_method).
                 return Ok(Rc::new(PhpClass {
                     decl: t,
+                    parent_rc: RefCell::new(None),
+                    throwable: std::cell::Cell::new(None),
                     statics: std::cell::RefCell::new(std::collections::HashMap::new()),
                     statics_init: std::cell::RefCell::new(false),
                 }));
@@ -1743,7 +1744,7 @@ impl<'a> Interp<'a> {
                 } else {
                     match self
                         .resolve_class(&sn)
-                        .and_then(|c| self.classes.get(&c.to_lowercase()).cloned())
+                        .and_then(|c| lkey_get(&self.classes, c).cloned())
                     {
                         Some(c) => Some(c),
                         None => {
@@ -2023,7 +2024,7 @@ impl<'a> Interp<'a> {
                         0,
                     ));
                 }
-                if self.functions.contains_key(&name.to_lowercase())
+                if lkey_get(&self.functions, name).is_some()
                     || builtins::is_builtin(&name.to_lowercase())
                 {
                     Ok(Value::Callable(self.new_callable(PhpCallable {
@@ -2249,7 +2250,7 @@ impl<'a> Interp<'a> {
                 // `Foo::m(...)` where Foo is a trait: allowed but
                 // deprecated outside a using class (8.4+;
                 // constexpr/error_static_call_trait_method).
-                if self.traits.contains_key(&dc.name().to_lowercase()) {
+                if lkey_get(&self.traits, dc.name()).is_some() {
                     self.deprecated(&format!(
                         "Calling static trait method {}::{} is deprecated, it should only be called on a class using the trait",
                         dc.name(),
@@ -2512,7 +2513,7 @@ impl<'a> Interp<'a> {
                 res = Err(e);
                 break;
             }
-            if self.classes.contains_key(&name.to_lowercase()) {
+            if lkey_get(&self.classes, name).is_some() {
                 break;
             }
         }
@@ -3743,7 +3744,7 @@ impl<'a> Interp<'a> {
                     .decl
                     .parent
                     .as_deref()
-                    .and_then(|p| self.classes.get(&p.to_lowercase()).cloned())
+                    .and_then(|p| lkey_get(&self.classes, p).cloned())
                 {
                     // Callable validation (`is_callable`, cuf arginfo)
                     // reports this as a not-callable detail — zend's
@@ -4010,7 +4011,7 @@ impl<'a> Interp<'a> {
             Value::Callable(_) => Ok(true),
             Value::Str(s) => {
                 let s = String::from_utf8_lossy(s).to_string();
-                if self.functions.contains_key(&s.to_lowercase())
+                if lkey_get(&self.functions, &s).is_some()
                     || builtins::is_builtin(&s.to_lowercase())
                     || builtins::builtin_params(&s.to_lowercase()).is_some()
                 {
@@ -4035,7 +4036,7 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 let cn = o.borrow().class.decl.name.clone();
-                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
+                let Some(c) = lkey_get(&self.classes, cn).cloned() else {
                     return Ok(false);
                 };
                 Ok(self.find_method_in(&c, "__invoke").is_some())

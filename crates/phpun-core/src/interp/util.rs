@@ -48,6 +48,30 @@ pub fn alloc_hit(i: usize) {
     }
 }
 
+/// Lookup in a lowercase-keyed table (classes, functions, interfaces)
+/// without the per-call `to_lowercase()`: probe `n` verbatim first —
+/// engine callers already pass folded names (`"__construct"`, the
+/// `lname` instantiate carries) — and only allocate when `n` carries
+/// ASCII-uppercase or non-ASCII bytes whose fold differs, preserving
+/// the table's `n.to_lowercase()` key semantics.
+pub(in crate::interp) fn lkey_get<V, S, N>(
+    map: &std::collections::HashMap<String, V, S>,
+    n: N,
+) -> Option<&V>
+where
+    S: std::hash::BuildHasher,
+    N: AsRef<str>,
+{
+    let n = n.as_ref();
+    map.get(n).or_else(|| {
+        if n.bytes().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
+            map.get(&n.to_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
 pub(in crate::interp) fn cell(v: Value) -> Cell {
     alloc_hit(0);
     Rc::new(RefCell::new(v))

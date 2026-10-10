@@ -8605,14 +8605,14 @@ impl<'a> Interp<'a> {
                 if i.eq_ignore_ascii_case(&lname) {
                     return true;
                 }
-                if let Some(iface) = self.interfaces.get(&i.to_lowercase()) {
+                if let Some(iface) = lkey_get(&self.interfaces, i) {
                     let mut stack = vec![iface.clone()];
                     while let Some(f) = stack.pop() {
                         if f.name.eq_ignore_ascii_case(&lname) {
                             return true;
                         }
                         for p in &f.implements {
-                            if let Some(ff) = self.interfaces.get(&p.to_lowercase()) {
+                            if let Some(ff) = lkey_get(&self.interfaces, p) {
                                 stack.push(ff.clone());
                             }
                         }
@@ -8623,7 +8623,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
             cur = nxt;
         }
         false

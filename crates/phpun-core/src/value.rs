@@ -1988,6 +1988,15 @@ impl fmt::Display for Value {
 #[derive(Debug)]
 pub struct PhpClass {
     pub decl: Rc<crate::ast::ClassDecl>,
+    /// Resolved `extends` link, filled on the first chain walk — a
+    /// bound parent never changes, so the hit needs no map lookup or
+    /// lowercase alloc. Only `Some` is cached: a miss re-probes so a
+    /// parent registered later still resolves.
+    pub parent_rc: RefCell<Option<Rc<PhpClass>>>,
+    /// `is_a(Throwable)` verdict, memoized like `parent_rc` — object
+    /// construction asks it for the internal Exception payload on
+    /// every `new`.
+    pub throwable: std::cell::Cell<Option<bool>>,
     /// `self::$prop` storage, initialized lazily from declared defaults.
     pub statics: RefCell<HashMap<String, Cell>>,
     pub statics_init: RefCell<bool>,
@@ -2012,8 +2021,7 @@ impl PhpClass {
 
     /// Method lookup walking the parent chain.
     pub fn find_method(&self, name: &str) -> Option<Rc<crate::ast::MethodDecl>> {
-        let lname = name.to_lowercase();
-        self.decl.find_method(&lname)
+        self.decl.find_method(name)
     }
 }
 

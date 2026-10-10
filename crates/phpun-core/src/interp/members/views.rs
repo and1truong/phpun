@@ -27,7 +27,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         chain.reverse();
         let scope = self.stack.last().and_then(|f| {
@@ -146,7 +146,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         chain.reverse();
         for c in &chain {
@@ -227,7 +227,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         chain.reverse();
         let scope = self.caller_scope_name();
@@ -1176,7 +1176,7 @@ impl<'a> Interp<'a> {
                     ),
                     None if is_method => {
                         let cn = self.conv_str(&stored)?.to_string();
-                        let mc = self.classes.get(&cn.to_lowercase()).cloned();
+                        let mc = lkey_get(&self.classes, cn).cloned();
                         (mc.clone(), mc, None)
                     }
                     None => (None, None, None),
@@ -1232,7 +1232,7 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?.to_string();
-                let cls = self.classes.get(&cn.to_lowercase()).cloned();
+                let cls = lkey_get(&self.classes, &cn).cloned();
                 let found = cls.as_ref().and_then(|c| self.find_prop_decl(c, &pn));
                 match found {
                     Some((_, dcls)) => {
@@ -1387,7 +1387,7 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mut arr = PhpArray::default();
-                if let Some(cls) = self.classes.get(&cn.to_lowercase()).cloned() {
+                if let Some(cls) = lkey_get(&self.classes, cn).cloned() {
                     let mut chain: Vec<Rc<PhpClass>> = Vec::new();
                     let mut cur = Some(cls);
                     while let Some(c) = cur {
@@ -1396,7 +1396,7 @@ impl<'a> Interp<'a> {
                             .decl
                             .parent
                             .as_ref()
-                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                            .and_then(|p| lkey_get(&self.classes, p).cloned());
                     }
                     for c in chain.iter().rev() {
                         for p in &c.decl.props {
@@ -1461,7 +1461,7 @@ impl<'a> Interp<'a> {
                         }
                     } else {
                         let cn = self.conv_str(&cn)?.to_string();
-                        let c = self.classes.get(&cn.to_lowercase()).cloned();
+                        let c = lkey_get(&self.classes, cn).cloned();
                         match c {
                             Some(c) => self.find_method_in(&c, &mn).map(|(m, sc)| {
                                 scope_cls = Some(sc);
@@ -2490,7 +2490,7 @@ impl<'a> Interp<'a> {
                     // ReflectionProperty: visibility/static/readonly off
                     // the PropDecl.
                     "reflectionclass" | "reflectionobject" | "reflectionenum" => {
-                        match self.classes.get(&cn.to_lowercase()) {
+                        match lkey_get(&self.classes, cn) {
                             Some(c) => match lname.as_str() {
                                 "isfinal" => c.decl.is_final,
                                 "isabstract" => c.decl.is_abstract,
@@ -2596,7 +2596,7 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
-                let decl = self.classes.get(&cn.to_lowercase()).map(|c| c.decl.clone());
+                let decl = lkey_get(&self.classes, cn).map(|c| c.decl.clone());
                 let b = decl
                     .map(|d| match lname.as_str() {
                         "isinterface" => d.kind == crate::ast::ClassKind::Interface,
@@ -2638,7 +2638,7 @@ impl<'a> Interp<'a> {
                 };
                 let tname = self.conv_str(&tname)?.to_string().to_lowercase();
                 let mut hit = false;
-                let mut cur = self.classes.get(&cn.to_lowercase()).cloned();
+                let mut cur = lkey_get(&self.classes, cn).cloned();
                 let mut seen = std::collections::HashSet::new();
                 while let Some(c) = cur {
                     if lname == "issubclassof" {
@@ -2646,7 +2646,7 @@ impl<'a> Interp<'a> {
                             .decl
                             .parent
                             .as_ref()
-                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                            .and_then(|p| lkey_get(&self.classes, p).cloned());
                         if let Some(n) = cur.as_ref().map(|c| c.decl.name.to_lowercase()) {
                             if n == tname {
                                 hit = true;
@@ -2662,7 +2662,7 @@ impl<'a> Interp<'a> {
                             if i.to_lowercase() == tname {
                                 hit = true;
                             }
-                            if let Some(ic) = self.classes.get(&i.to_lowercase()).cloned() {
+                            if let Some(ic) = lkey_get(&self.classes, i).cloned() {
                                 for pp in ic.decl.parent.iter().chain(ic.decl.implements.iter()) {
                                     if pp.to_lowercase() == tname {
                                         hit = true;
@@ -2674,7 +2674,7 @@ impl<'a> Interp<'a> {
                             .decl
                             .parent
                             .as_ref()
-                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                            .and_then(|p| lkey_get(&self.classes, p).cloned());
                     }
                     let k = cur.as_ref().map(|c| c.decl.name.to_lowercase());
                     if k.is_none() || !seen.insert(k.unwrap()) {
@@ -2696,7 +2696,7 @@ impl<'a> Interp<'a> {
                 let filter = args.first().map(|c| c.borrow().to_int()).unwrap_or(0);
                 let mut arr = PhpArray::default();
                 let mut seen = std::collections::HashSet::new();
-                let mut cur = self.classes.get(&cn.to_lowercase()).cloned();
+                let mut cur = lkey_get(&self.classes, cn).cloned();
                 while let Some(c) = cur {
                     for m in &c.decl.methods {
                         let key = m.decl.name.to_lowercase();
@@ -2736,7 +2736,7 @@ impl<'a> Interp<'a> {
                         .decl
                         .parent
                         .as_ref()
-                        .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                        .and_then(|p| lkey_get(&self.classes, p).cloned());
                 }
                 Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
             }
@@ -2753,7 +2753,7 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
-                let cls = self.classes.get(&cn.to_lowercase()).cloned();
+                let cls = lkey_get(&self.classes, &cn).cloned();
                 let found = cls.as_ref().and_then(|c| self.find_method_in(c, &mn));
                 match (lname.as_str(), found) {
                     ("hasmethod", f) => Ok(Some(Value::Bool(f.is_some()))),
@@ -2881,7 +2881,7 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mut arr = PhpArray::default();
-                if let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() {
+                if let Some(c) = lkey_get(&self.classes, cn).cloned() {
                     for m in &c.decl.methods {
                         if let Some(orig) = &m.trait_alias_of {
                             let v =
@@ -3240,6 +3240,35 @@ impl<'a> Interp<'a> {
     }
 
     /// is-a check between two class-name strings.
+    /// `extends` hop resolved through the class table, memoized on the
+    /// class — every chain walk (methods, props, consts, is_a) shares
+    /// it instead of re-lowercasing the parent name per hop.
+    pub(in crate::interp) fn parent_of(&self, c: &Rc<PhpClass>) -> Option<Rc<PhpClass>> {
+        if let Some(p) = c.parent_rc.borrow().as_ref() {
+            return Some(p.clone());
+        }
+        let p = c
+            .decl
+            .parent
+            .as_ref()
+            .and_then(|n| lkey_get(&self.classes, n).cloned());
+        if let Some(p) = &p {
+            *c.parent_rc.borrow_mut() = Some(p.clone());
+        }
+        p
+    }
+
+    /// `is_a(obj-class, Throwable)` memoized on the class — every
+    /// `new` asks it for the internal Exception payload.
+    pub(in crate::interp) fn is_throwable_cls(&mut self, c: &Rc<PhpClass>) -> bool {
+        if let Some(t) = c.throwable.get() {
+            return t;
+        }
+        let t = self.is_throwable_name(&c.decl.name);
+        c.throwable.set(Some(t));
+        t
+    }
+
     pub(in crate::interp) fn is_a_str(&mut self, a: &str, b: &str) -> bool {
         // Type-member checks during signature verification autoload the
         // compared classes — Zend verifies covariance with the real
@@ -3247,7 +3276,7 @@ impl<'a> Interp<'a> {
         // even when it is declared later (abstract_method_9). A name
         // mid-link counts as resolvable without loading
         // (infinite_recursion — `class C extends Z implements C`).
-        if !self.classes.contains_key(&a.to_lowercase())
+        if !lkey_get(&self.classes, a).is_some()
             && !self.linking.iter().any(|c| c.name.eq_ignore_ascii_case(a))
         {
             // The check creates a delayed variance dependency either
@@ -3273,12 +3302,10 @@ impl<'a> Interp<'a> {
         }
         // Aliases canonicalize through the class table: `Bar` (an
         // alias of Foo) compares as `Foo` (typed_properties_084).
-        let canon_b = self
-            .classes
-            .get(&b.trim_start_matches('\\').to_lowercase())
-            .map(|c| c.name().to_string());
+        let canon_b =
+            lkey_get(&self.classes, b.trim_start_matches('\\')).map(|c| c.name().to_string());
         let b = canon_b.as_deref().unwrap_or(b);
-        match self.classes.get(&a.to_lowercase()).cloned() {
+        match lkey_get(&self.classes, a).cloned() {
             Some(c) => self.is_a(&c, b),
             None => self.is_a_unresolved(a, b, 0),
         }
@@ -3315,7 +3342,7 @@ impl<'a> Interp<'a> {
                 self.interfaces
                     .get(&a.to_lowercase())
                     .cloned()
-                    .or_else(|| self.traits.get(&a.to_lowercase()).cloned())
+                    .or_else(|| lkey_get(&self.traits, a).cloned())
             });
         let Some(d) = d else {
             return false;
@@ -3338,17 +3365,12 @@ impl<'a> Interp<'a> {
         cls: &Rc<PhpClass>,
         name: &str,
     ) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
-        let lname = name.to_lowercase();
         let mut cur = Some(cls.clone());
         while let Some(c) = cur {
-            if let Some(m) = c.decl.find_method(&lname) {
+            if let Some(m) = c.decl.find_method(name) {
                 return Some((m, c));
             }
-            cur = c
-                .decl
-                .parent
-                .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = self.parent_of(&c);
         }
         None
     }
@@ -3371,7 +3393,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         out
     }
@@ -3437,7 +3459,7 @@ impl Interp<'_> {
                 return Some(reflect_decl_arity(&m.decl));
             }
             for p in &id.implements {
-                if let Some(pd) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                if let Some(pd) = lkey_get(&self.interfaces, p).cloned() {
                     todo.push(pd);
                 }
             }

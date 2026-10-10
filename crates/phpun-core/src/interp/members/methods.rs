@@ -632,7 +632,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 .unwrap_or_else(|| "ArrayIterator".into());
-                match self.classes.get(&icname.to_lowercase()).cloned() {
+                match lkey_get(&self.classes, icname).cloned() {
                     Some(icls) => {
                         let store = self.ao_store(obj);
                         let it = self.alloc_obj(PhpObject {
@@ -668,7 +668,7 @@ impl<'a> Interp<'a> {
                     }
                 };
                 match ic {
-                    Some(n) => match self.classes.get(&n.to_lowercase()) {
+                    Some(n) => match lkey_get(&self.classes, &n) {
                         Some(c) => Value::str(c.name()),
                         None => Value::str(&n),
                     },
@@ -1063,7 +1063,7 @@ impl<'a> Interp<'a> {
                     Err(e) => return Err(e),
                 };
                 let cls_name = obj.borrow().class.name().to_string();
-                let icls = self.classes.get(&cls_name.to_lowercase()).cloned();
+                let icls = lkey_get(&self.classes, cls_name).cloned();
                 match icls {
                     Some(icls) => {
                         let src_obj = match &el {
@@ -2048,7 +2048,7 @@ impl<'a> Interp<'a> {
             .last()
             .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
             .or_else(|| self.const_self.clone())?;
-        let m = scope.decl.find_method(&name.to_lowercase())?;
+        let m = scope.decl.find_method(name)?;
         (m.visibility == crate::ast::Visibility::Private).then_some((m, scope))
     }
 
@@ -2228,7 +2228,7 @@ impl<'a> Interp<'a> {
         let mut owner = cls.name().to_string();
         let mut cur = cls.decl.parent.clone();
         while let Some(p) = cur {
-            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+            let Some(pc) = lkey_get(&self.classes, p).cloned() else {
                 break;
             };
             if pc.decl.methods.iter().any(|m| {
@@ -3790,7 +3790,7 @@ impl<'a> Interp<'a> {
                             .decl
                             .parent
                             .as_ref()
-                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                            .and_then(|p| lkey_get(&self.classes, p).cloned());
                     }
                     if ee {
                         cls_name = "ErrorException".into();
@@ -4055,7 +4055,7 @@ impl<'a> Interp<'a> {
         class: &Expr,
     ) -> Result<(Rc<PhpClass>, Option<String>), PhpError> {
         let name = self.class_name_of(class)?;
-        if let Some(td) = self.traits.get(&name.to_lowercase()).cloned() {
+        if let Some(td) = lkey_get(&self.traits, name).cloned() {
             let key = td.name.to_lowercase();
             let cls = self
                 .trait_statics
@@ -4063,6 +4063,8 @@ impl<'a> Interp<'a> {
                 .or_insert_with(|| {
                     Rc::new(PhpClass {
                         decl: td.clone(),
+                        parent_rc: RefCell::new(None),
+                        throwable: std::cell::Cell::new(None),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     })
@@ -4088,7 +4090,7 @@ impl<'a> Interp<'a> {
                         let Some(scope) = self.caller_scope_name() else {
                             return false;
                         };
-                        let Some(sc) = self.classes.get(&scope.to_lowercase()).cloned() else {
+                        let Some(sc) = lkey_get(&self.classes, scope).cloned() else {
                             return false;
                         };
                         let target = match ln.as_str() {
@@ -4096,7 +4098,7 @@ impl<'a> Interp<'a> {
                                 .decl
                                 .parent
                                 .as_ref()
-                                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned()),
+                                .and_then(|p| lkey_get(&self.classes, p).cloned()),
                             "static" => self
                                 .stack
                                 .last()

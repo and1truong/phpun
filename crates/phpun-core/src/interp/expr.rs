@@ -5165,7 +5165,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                     SlotAnchor::Statics(ccn, ppn) => {
-                        if let Some(cc) = self.classes.get(&ccn.to_lowercase()) {
+                        if let Some(cc) = lkey_get(&self.classes, ccn) {
                             cc.statics.borrow_mut().remove(&ppn);
                         }
                     }

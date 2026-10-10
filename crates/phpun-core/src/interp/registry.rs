@@ -117,6 +117,8 @@ impl<'a> Interp<'a> {
         let mut reg = |d: ClassDecl, is_iface: bool| {
             let c = Rc::new(PhpClass {
                 decl: Rc::new(d),
+                parent_rc: RefCell::new(None),
+                throwable: std::cell::Cell::new(None),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });
@@ -2759,6 +2761,8 @@ impl<'a> Interp<'a> {
                     file: String::new(),
                     line: 0,
                 }),
+                parent_rc: RefCell::new(None),
+                throwable: std::cell::Cell::new(None),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });

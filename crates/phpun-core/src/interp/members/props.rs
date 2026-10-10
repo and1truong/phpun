@@ -39,7 +39,7 @@ impl<'a> Interp<'a> {
                 break;
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         None
     }
@@ -89,7 +89,7 @@ impl<'a> Interp<'a> {
                 }
             }
             let parent = c.decl.parent.clone();
-            cur = parent.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = parent.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         let (index, owner) = nearest?;
         if hooks.is_empty() {
@@ -107,7 +107,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         if let Some(r) = key.strip_prefix('\0') {
             let mut it = r.split('\0');
@@ -151,7 +151,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         None
     }
@@ -172,7 +172,7 @@ impl<'a> Interp<'a> {
                 }
             }
             let parent = c.decl.parent.clone();
-            cur = parent.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = parent.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         None
     }
@@ -230,7 +230,7 @@ impl<'a> Interp<'a> {
                 return true;
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         false
     }
@@ -241,7 +241,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn chain_prop_backed(&self, d: &ClassDecl, name: &str) -> bool {
         let mut an = d.parent.clone();
         while let Some(pn) = an {
-            let Some(pc) = self.classes.get(&pn.to_lowercase()) else {
+            let Some(pc) = lkey_get(&self.classes, pn) else {
                 break;
             };
             if let Some(ap) = pc.decl.props.iter().find(|x| x.name == name) {
@@ -465,7 +465,7 @@ impl<'a> Interp<'a> {
                 found = Some(c.clone());
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         found
     }
@@ -1176,7 +1176,7 @@ impl<'a> Interp<'a> {
                         .decl
                         .parent
                         .as_ref()
-                        .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                        .and_then(|p| lkey_get(&self.classes, p).cloned());
                 }
                 // zend's visibility resolution only applies to the
                 // object's own class (and `*`, handled above).
@@ -1230,7 +1230,7 @@ impl<'a> Interp<'a> {
                 0,
             ));
         };
-        let Some(parent) = self.classes.get(&parent_name.to_lowercase()).cloned() else {
+        let Some(parent) = lkey_get(&self.classes, &parent_name).cloned() else {
             return self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot use \"parent\" when current class scope has no parent",
@@ -1258,7 +1258,7 @@ impl<'a> Interp<'a> {
                 }
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         let Some((pd, pcls)) = nearest else {
             return self.fail(PhpError::uncaught(
@@ -2324,7 +2324,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         (crate::ast::Visibility::Public, String::new())
     }
