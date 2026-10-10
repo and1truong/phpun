@@ -7458,6 +7458,14 @@ impl<'a> Interp<'a> {
                 })
                 .unwrap_or(0);
             let arg_checks = cells.len() >= min;
+            if !arg_checks
+                || builtins::builtin_params(name).is_some_and(|ps| {
+                    !ps.iter().any(|(_, d)| matches!(d, builtins::BDef::Var))
+                        && cells.len() > ps.len()
+                })
+            {
+                return Ok(()); // Canonical arity errors precede every ZPP type check.
+            }
             for (i, (pname, pty)) in sig.iter().enumerate() {
                 if i >= cells.len() {
                     break;
