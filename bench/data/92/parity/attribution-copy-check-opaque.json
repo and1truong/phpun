@@ -1,0 +1,38 @@
+{
+  "runtime": "self-check",
+  "binary": "/workspace/byte-attribution/copy-check-final",
+  "sha256": "1fc6cca5c709461c4379a120a9cff8c309a114cc6987d073be4fd317e189eb4a",
+  "argv": [],
+  "gate": "oracle exit/stdout/stderr exact after collector records removed",
+  "coverage": "out-of-line memcpy/memmove only; inline/hidden/realloc movement unobserved; cold startup/parse included",
+  "overflow": {
+    "calls": 0,
+    "bytes": 0
+  },
+  "observed_copy_bytes": 384,
+  "observed_copy_calls": 2,
+  "callers": [
+    {
+      "caller": "main",
+      "calls": 2,
+      "bytes": 384,
+      "percent_observed_bytes": 100.0
+    }
+  ],
+  "sites": [
+    {
+      "dso": "/workspace/byte-attribution/copy-check-final",
+      "pc": 4247,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "main"
+    },
+    {
+      "dso": "/workspace/byte-attribution/copy-check-final",
+      "pc": 4272,
+      "calls": 1,
+      "bytes": 128,
+      "caller": "main"
+    }
+  ]
+}
