@@ -2152,6 +2152,145 @@ pub(crate) fn dispatch(
             }
         }
         "stream_select" => return stream_select(it, name, args),
+        "stream_socket_client" => {
+            // tcp://host:port connect; &errno/&errstr written back
+            // like zend's php_stream_xport_create error out-args.
+            let addr = arg_str(it, args, 0);
+            let timeout_ms = if args.len() > 3 {
+                (arg(args, 3).to_float() * 1000.0) as i32
+            } else {
+                60000
+            };
+            let set_err = |args: &[Cell], n: i32, m: &str| {
+                if let Some(c) = args.get(1) {
+                    *c.borrow_mut() = Value::Int(n as i64);
+                }
+                if let Some(c) = args.get(2) {
+                    *c.borrow_mut() = Value::str(m.to_string());
+                }
+            };
+            match tcp_connect(&addr, timeout_ms) {
+                Ok(fd) => sock_resource(it, fd),
+                Err((n, m)) => {
+                    set_err(args, n, &m);
+                    it.warn_pub(&format!(
+                        "stream_socket_client(): Unable to connect to {} ({})",
+                        addr, m
+                    ))?;
+                    Value::Bool(false)
+                }
+            }
+        }
+        "stream_socket_server" => {
+            let addr = arg_str(it, args, 0);
+            let set_err = |args: &[Cell], n: i32, m: &str| {
+                if let Some(c) = args.get(1) {
+                    *c.borrow_mut() = Value::Int(n as i64);
+                }
+                if let Some(c) = args.get(2) {
+                    *c.borrow_mut() = Value::str(m.to_string());
+                }
+            };
+            match tcp_listen(&addr) {
+                Ok(fd) => sock_resource(it, fd),
+                Err((_n, m)) => {
+                    // zend's server path reports errno 0 with just the
+                    // strerror/getaddrinfo text, same warning as client.
+                    set_err(args, 0, &m);
+                    it.warn_pub(&format!(
+                        "stream_socket_server(): Unable to connect to {} ({})",
+                        addr, m
+                    ))?;
+                    Value::Bool(false)
+                }
+            }
+        }
+        "stream_socket_accept" => {
+            let timeout_ms = if args.len() > 1 {
+                (arg(args, 1).to_float() * 1000.0) as i32
+            } else {
+                -1
+            };
+            match arg(args, 0) {
+                Value::Resource(r) => {
+                    let fd = res_fd(&r);
+                    match fd {
+                        Some(fd) => {
+                            let mut pfd = libc::pollfd {
+                                fd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let pr = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                            if pr <= 0 {
+                                Value::Bool(false)
+                            } else {
+                                let mut pa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                                let mut pl = std::mem::size_of::<libc::sockaddr_storage>()
+                                    as libc::socklen_t;
+                                let cfd = unsafe {
+                                    libc::accept(
+                                        fd,
+                                        &mut pa as *mut _ as *mut libc::sockaddr,
+                                        &mut pl,
+                                    )
+                                };
+                                if cfd < 0 {
+                                    Value::Bool(false)
+                                } else {
+                                    if let Some(c) = args.get(2) {
+                                        *c.borrow_mut() = match sockname_str(&pa) {
+                                            Some(s) => Value::str(s),
+                                            None => Value::Bool(false),
+                                        };
+                                    }
+                                    sock_resource(it, cfd)
+                                }
+                            }
+                        }
+                        None => Value::Bool(false),
+                    }
+                }
+                _ => Value::Bool(false),
+            }
+        }
+        "stream_socket_get_name" => {
+            let peer = arg(args, 1).is_truthy();
+            match arg(args, 0) {
+                Value::Resource(r) => match res_fd(&r) {
+                    Some(fd) => {
+                        let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                        let mut sl =
+                            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                        let rc = unsafe {
+                            if peer {
+                                libc::getpeername(
+                                    fd,
+                                    &mut sa as *mut _ as *mut libc::sockaddr,
+                                    &mut sl,
+                                )
+                            } else {
+                                libc::getsockname(
+                                    fd,
+                                    &mut sa as *mut _ as *mut libc::sockaddr,
+                                    &mut sl,
+                                )
+                            }
+                        };
+                        if rc < 0 {
+                            Value::Bool(false)
+                        } else {
+                            match sockname_str(&sa) {
+                                Some(s) => Value::str(s),
+                                None => Value::Bool(false),
+                            }
+                        }
+                    }
+                    None => Value::Bool(false),
+                },
+                _ => Value::Bool(false),
+            }
+        }
         "stream_socket_pair" => {
             let domain = arg(args, 0).to_int() as libc::c_int;
             let typ = arg(args, 1).to_int() as libc::c_int;
@@ -3640,6 +3779,145 @@ fn fd_fill(
 /// (temp/memory ops are exempt from zend's single-fill break, so the
 /// loop is greedy). A chunk_size of 1 flips zend's NO_BUFFER flag —
 /// reads then bypass the readbuf entirely (stale bytes just sit).
+/// tcp://host:port (or bare host:port) → (host, port); host may be
+/// empty (server wildcard). Returns None when there's no ':' at all.
+fn parse_tcp_addr(addr: &str) -> Option<(String, u16)> {
+    let a = addr.strip_prefix("tcp://").unwrap_or(addr);
+    let (h, p) = a.rsplit_once(':')?;
+    Some((h.to_string(), p.parse().unwrap_or(0)))
+}
+
+fn tcp_sockaddr(host: &str, port: u16) -> Result<libc::sockaddr_in, (i32, String)> {
+    unsafe {
+        let mut hints: libc::addrinfo = std::mem::zeroed();
+        hints.ai_family = libc::AF_INET;
+        hints.ai_socktype = libc::SOCK_STREAM;
+        let host_c =
+            std::ffi::CString::new(if host.is_empty() { "0.0.0.0" } else { host }).unwrap();
+        let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+        let rc = libc::getaddrinfo(host_c.as_ptr(), std::ptr::null(), &hints, &mut res);
+        if rc != 0 || res.is_null() {
+            let msg = std::ffi::CStr::from_ptr(libc::gai_strerror(rc))
+                .to_string_lossy()
+                .into_owned();
+            return Err((
+                0,
+                format!(
+                    "php_network_getaddresses: getaddrinfo for {} failed: {}",
+                    host, msg
+                ),
+            ));
+        }
+        let mut sa: libc::sockaddr_in = std::mem::zeroed();
+        std::ptr::copy((*res).ai_addr as *const libc::sockaddr_in, &mut sa, 1);
+        libc::freeaddrinfo(res);
+        sa.sin_port = port.to_be();
+        Ok(sa)
+    }
+}
+
+fn tcp_connect(addr: &str, _timeout_ms: i32) -> Result<libc::c_int, (i32, String)> {
+    let (host, port) = parse_tcp_addr(addr).ok_or((
+        0,
+        "php_network_getaddresses: getaddrinfo failed".to_string(),
+    ))?;
+    let sa = tcp_sockaddr(&host, port)?;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io_errno_str(&std::io::Error::last_os_error()));
+    }
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let e = io_errno_str(&std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+fn tcp_listen(addr: &str) -> Result<libc::c_int, (i32, String)> {
+    let (host, port) = parse_tcp_addr(addr).ok_or((
+        0,
+        "php_network_getaddresses: getaddrinfo failed".to_string(),
+    ))?;
+    let sa = tcp_sockaddr(&host, port)?;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io_errno_str(&std::io::Error::last_os_error()));
+    }
+    let one: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 || unsafe { libc::listen(fd, 128) } < 0 {
+        let e = io_errno_str(&std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+/// "a.b.c.d:port" from a sockaddr_in; anything else → None.
+fn sockname_str(sa: &libc::sockaddr_storage) -> Option<String> {
+    if sa.ss_family as i32 != libc::AF_INET {
+        return None;
+    }
+    let in4: &libc::sockaddr_in = unsafe { &*(sa as *const _ as *const libc::sockaddr_in) };
+    let b = in4.sin_addr.s_addr.to_ne_bytes();
+    Some(format!(
+        "{}.{}.{}.{}:{}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        u16::from_be(in4.sin_port)
+    ))
+}
+
+/// The fd behind a stream resource (Pipe-backed: proc, socket, fd,
+/// php://fd, socketpair ends).
+fn res_fd(r: &Rc<RefCell<PhpResource>>) -> Option<libc::c_int> {
+    use std::os::unix::io::AsRawFd;
+    match &*r.borrow() {
+        PhpResource::Pipe { file, .. } => Some(file.as_raw_fd()),
+        _ => None,
+    }
+}
+
+fn sock_resource(it: &mut Interp, fd: libc::c_int) -> Value {
+    use std::os::unix::io::FromRawFd;
+    Value::Resource(Rc::new(RefCell::new(PhpResource::Pipe {
+        id: it.next_res_id(),
+        file: unsafe { std::fs::File::from_raw_fd(fd) },
+        write: true,
+        socket: true,
+        pty: false,
+        nonblock: false,
+        pos: 0,
+        eof: false,
+        rbuf: std::collections::VecDeque::new(),
+    })))
+}
+
 /// file()/readfile()-style whole-fd0 slurp: raw read(2) loop until
 /// EOF (no buffered remainder to preserve — these drains are
 /// one-shot).
