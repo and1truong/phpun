@@ -1997,9 +1997,30 @@ pub struct PhpClass {
     /// construction asks it for the internal Exception payload on
     /// every `new`.
     pub throwable: std::cell::Cell<Option<bool>>,
+    /// Chain-flattened declared props (non-static, backed) in final
+    /// prop_order — built once on first `new`: the seen/backed/order
+    /// machinery is class-fixed so it needn't rerun per object.
+    /// ponytail: keys still clone per object into props/prop_order;
+    /// killing that alloc needs Rc<str> keys (the #187 slot layout).
+    pub flat_props: std::cell::OnceCell<Rc<Vec<FlatProp>>>,
     /// `self::$prop` storage, initialized lazily from declared defaults.
     pub statics: RefCell<HashMap<String, Cell>>,
     pub statics_init: RefCell<bool>,
+}
+
+/// One entry of the flattened declared-prop layout: the storage key
+/// (mangled `\0Cls\0name` for private slots, else the plain name)
+/// plus enough to re-run the per-object default evaluation.
+#[derive(Debug)]
+pub struct FlatProp {
+    pub key: String,
+    /// The class whose `decl.props[prop_idx]` this slot came from —
+    /// also the const-self context for default evaluation.
+    pub declaring: Rc<PhpClass>,
+    pub prop_idx: usize,
+    /// Typed prop without a default: reserves its order slot but
+    /// starts *uninitialized* (no cell).
+    pub uninit: bool,
 }
 
 impl PhpClass {

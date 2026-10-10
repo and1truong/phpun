@@ -119,6 +119,7 @@ impl<'a> Interp<'a> {
                 decl: Rc::new(d),
                 parent_rc: RefCell::new(None),
                 throwable: std::cell::Cell::new(None),
+                flat_props: std::cell::OnceCell::new(),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });
@@ -2763,6 +2764,7 @@ impl<'a> Interp<'a> {
                 }),
                 parent_rc: RefCell::new(None),
                 throwable: std::cell::Cell::new(None),
+                flat_props: std::cell::OnceCell::new(),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });

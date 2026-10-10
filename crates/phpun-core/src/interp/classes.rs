@@ -409,6 +409,7 @@ impl<'a> Interp<'a> {
                         decl: Rc::new(d),
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
+                        flat_props: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     }),
@@ -3801,6 +3802,7 @@ impl<'a> Interp<'a> {
                         }),
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
+                        flat_props: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
                     }),
@@ -3812,101 +3814,41 @@ impl<'a> Interp<'a> {
                 })))
             }
         };
-        // Collect decl chain (self + parents, parent-first for prop order).
-        let mut chain = vec![cls.clone()];
-        let mut cur = cls.clone();
-        while let Some(p) = cur.decl.parent.clone() {
-            if let Some(pc) = lkey_get(&self.classes, p).cloned() {
-                chain.push(pc.clone());
-                cur = pc;
-            } else {
-                break;
+        // Declared props come from the class's flattened layout —
+        // the chain walk, redecl-position and hooked-backing rules
+        // are class-fixed, computed once in flat_props_of.
+        let flat = self.flat_props_of(&cls);
+        let mut props = HashMap::with_capacity(flat.len());
+        let mut prop_order = Vec::with_capacity(flat.len());
+        for fp in flat.iter() {
+            prop_order.push(fp.key.clone());
+            if fp.uninit {
+                continue;
             }
-        }
-        chain.reverse();
-        let mut props = HashMap::new();
-        let mut prop_order = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (ci, c) in chain.iter().enumerate() {
-            for p in &c.decl.props {
-                if p.is_static {
-                    continue;
+            let c = &fp.declaring;
+            let p = &c.decl.props[fp.prop_idx];
+            let mut default = match &p.default {
+                Some(d) => {
+                    let old = self.const_self.replace(c.clone());
+                    self.class_const_ctx += 1;
+                    let r = self.eval_decl_const(
+                        d,
+                        &c.decl.file,
+                        if p.dline > 0 { p.dline } else { p.line },
+                    );
+                    self.class_const_ctx -= 1;
+                    self.const_self = old;
+                    r?
                 }
-                let is_priv = p.visibility == crate::ast::Visibility::Private;
-                if !is_priv {
-                    // The NEAREST redecl is authoritative — defaults are
-                    // never inherited (default_value_inheritance): a later
-                    // decl replaces any slot a grandparent already made,
-                    // but keeps the first declaration's slot position
-                    // (foreachLoopObjects.002).
-                    if !seen.insert(p.name.clone()) {
-                        props.remove(&p.name);
-                    }
-                }
-                let backed = if p.hooks.is_some() {
-                    Self::prop_is_backed(p)
-                        || chain[..=ci].iter().any(|c2| {
-                            c2.decl.props.iter().any(|p2| {
-                                p2.name == p.name
-                                    && p2.hooks.is_none()
-                                    && p2.visibility != crate::ast::Visibility::Private
-                            })
-                        })
-                } else {
-                    true
-                };
-                // A virtual hooked prop has no backing slot at all.
-                if !backed {
-                    continue;
-                }
-                // A typed prop without a default starts *uninitialized* —
-                // no cell, but Zend still reserves its table position, so
-                // a later write lands in declaration order
-                // (property_hooks/foreach's backedUninitialized).
-                if p.ty.is_some() && p.default.is_none() {
-                    let key = if is_priv {
-                        format!("\0{}\0{}", c.decl.name, p.name)
-                    } else {
-                        p.name.clone()
-                    };
-                    if !prop_order.contains(&key) {
-                        prop_order.push(key);
-                    }
-                    continue;
-                }
-                let mut default = match &p.default {
-                    Some(d) => {
-                        let old = self.const_self.replace(c.clone());
-                        self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(
-                            d,
-                            &c.decl.file,
-                            if p.dline > 0 { p.dline } else { p.line },
-                        );
-                        self.class_const_ctx -= 1;
-                        self.const_self = old;
-                        r?
-                    }
-                    None => Value::Null,
-                };
-                // Runtime defaults (define()'d consts etc.) go through
-                // the same write check as assignments — strict files
-                // TypeError here (typed_properties_058).
-                if p.ty.is_some() {
-                    default = self.prop_typed_write_check(p, c, default)?;
-                }
-                // Private props live in a per-declaring-class slot
-                // ("\0Cls\0name"), so C::$e and E::$e are distinct.
-                let key = if is_priv {
-                    format!("\0{}\0{}", c.decl.name, p.name)
-                } else {
-                    p.name.clone()
-                };
-                if !prop_order.contains(&key) {
-                    prop_order.push(key.clone());
-                }
-                props.insert(key, cell(default));
+                None => Value::Null,
+            };
+            // Runtime defaults (define()'d consts etc.) go through
+            // the same write check as assignments — strict files
+            // TypeError here (typed_properties_058).
+            if p.ty.is_some() {
+                default = self.prop_typed_write_check(p, c, default)?;
             }
+            props.insert(fp.key.clone(), cell(default));
         }
         let internal = if self.is_throwable_cls(&cls) {
             // A throwable's file/line attribute to the executing code
@@ -3949,6 +3891,76 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(v)
+    }
+
+    /// The class's declared-prop layout: walk the parent chain once
+    /// (parent-first for order), applying the redecl/hooked-backing
+    /// rules, then memoize — `new` then only evals defaults.
+    fn flat_props_of(&mut self, cls: &Rc<PhpClass>) -> Rc<Vec<FlatProp>> {
+        if let Some(f) = cls.flat_props.get() {
+            return f.clone();
+        }
+        let mut chain = vec![cls.clone()];
+        let mut cur = cls.clone();
+        while let Some(p) = self.parent_of(&cur) {
+            chain.push(p.clone());
+            cur = p;
+        }
+        chain.reverse();
+        let mut flat: Vec<FlatProp> = Vec::new();
+        // Non-private redecls keep the FIRST declaration's slot
+        // position but the NEAREST decl's metadata.
+        let mut pos: HashMap<String, usize> = HashMap::new();
+        for (ci, c) in chain.iter().enumerate() {
+            for (pi, p) in c.decl.props.iter().enumerate() {
+                if p.is_static {
+                    continue;
+                }
+                let is_priv = p.visibility == crate::ast::Visibility::Private;
+                let backed = if p.hooks.is_some() {
+                    Self::prop_is_backed(p)
+                        || chain[..=ci].iter().any(|c2| {
+                            c2.decl.props.iter().any(|p2| {
+                                p2.name == p.name
+                                    && p2.hooks.is_none()
+                                    && p2.visibility != crate::ast::Visibility::Private
+                            })
+                        })
+                } else {
+                    true
+                };
+                // A virtual hooked prop has no backing slot at all.
+                if !backed {
+                    continue;
+                }
+                // A typed prop without a default starts *uninitialized* —
+                // no cell, but Zend still reserves its table position, so
+                // a later write lands in declaration order
+                // (property_hooks/foreach's backedUninitialized).
+                let uninit = p.ty.is_some() && p.default.is_none();
+                let entry = FlatProp {
+                    key: if is_priv {
+                        format!("\0{}\0{}", c.decl.name, p.name)
+                    } else {
+                        p.name.clone()
+                    },
+                    declaring: c.clone(),
+                    prop_idx: pi,
+                    uninit,
+                };
+                if is_priv {
+                    flat.push(entry);
+                } else if let Some(&i) = pos.get(&p.name) {
+                    flat[i] = entry;
+                } else {
+                    pos.insert(p.name.clone(), flat.len());
+                    flat.push(entry);
+                }
+            }
+        }
+        let flat = Rc::new(flat);
+        let _ = cls.flat_props.set(flat.clone());
+        flat
     }
 
     pub(in crate::interp) fn is_throwable_name(&mut self, name: &str) -> bool {

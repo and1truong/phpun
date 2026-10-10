@@ -11,8 +11,8 @@ use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
     compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
-    trace_arg, ArrKey, CallableKind, Cell, GenSetup, GenState, Numeric, ObjectInternal, PhpArray,
-    PhpCallable, PhpClass, PhpObject, PhpResource, PhpStr, TraceFrame, Value,
+    trace_arg, ArrKey, CallableKind, Cell, FlatProp, GenSetup, GenState, Numeric, ObjectInternal,
+    PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, PhpStr, TraceFrame, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;

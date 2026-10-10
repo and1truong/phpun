@@ -1587,6 +1587,7 @@ impl<'a> Interp<'a> {
                     decl: t,
                     parent_rc: RefCell::new(None),
                     throwable: std::cell::Cell::new(None),
+                    flat_props: std::cell::OnceCell::new(),
                     statics: std::cell::RefCell::new(std::collections::HashMap::new()),
                     statics_init: std::cell::RefCell::new(false),
                 }));
@@ -4890,6 +4891,7 @@ impl<'a> Interp<'a> {
             // (error_2_exception_001).
             let is_ctor = decl.name.eq_ignore_ascii_case("__construct");
             let this_obj = frame.this_obj.clone();
+            let promo_dc = frame.decl_class.clone();
             let mut promoted_writes = Vec::new();
             for (i, p) in decl.params.iter().enumerate() {
                 if p.promoted && is_ctor {
@@ -4926,7 +4928,7 @@ impl<'a> Interp<'a> {
                     )?;
                 } else {
                     // Hooked by-value promotion still runs the set hook.
-                    self.store_prop(Value::Object(obj), &pname, v)?;
+                    self.promoted_prop_write(&obj, promo_dc.as_ref(), &pname, v)?;
                 }
             }
         }

@@ -50,6 +50,50 @@ impl<'a> Interp<'a> {
     /// child redecl still inherits parent hooks; per-hook origin class
     /// drives `__METHOD__` and decl_class). Private props of other
     /// scopes are skipped — they are different properties entirely.
+    /// Promoted-ctor write `$this->{pname} = $v` on a freshly
+    /// instantiated object: the promoted param always synthesizes a
+    /// PropDecl on the ctor's declaring class, so when that decl is
+    /// unhooked, non-readonly and non-private-protected-ambiguous the
+    /// write provably lands in its own slot — skip store_prop's
+    /// scope/visibility/undeclared machinery. Anything else falls
+    /// back to the full path (readonly double-init errors, hooks,
+    /// exotic decls).
+    pub(in crate::interp) fn promoted_prop_write(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        dc: Option<&Rc<PhpClass>>,
+        pname: &str,
+        v: Value,
+    ) -> Result<(), PhpError> {
+        let p = dc.and_then(|c| c.decl.props.iter().find(|p| p.name == pname));
+        match (dc, p) {
+            (Some(dc), Some(p)) if p.hooks.is_none() && !p.readonly => {
+                let key = if p.visibility == crate::ast::Visibility::Private {
+                    format!("\0{}\0{}", dc.name(), pname)
+                } else {
+                    pname.to_string()
+                };
+                let mut o = obj.borrow_mut();
+                match o.props.get(&key) {
+                    Some(c) => *c.borrow_mut() = v,
+                    None => {
+                        // Typed-uninit slot: order was reserved at
+                        // instantiate, the cell lands now.
+                        o.props.insert(key.clone(), cell(v));
+                        if !o.prop_order.contains(&key) {
+                            o.prop_order.push(key.clone());
+                        }
+                    }
+                }
+                o.unset_props.remove(&key);
+                Ok(())
+            }
+            _ => self
+                .store_prop(Value::Object(obj.clone()), pname, v)
+                .map(|_| ()),
+        }
+    }
+
     pub(in crate::interp) fn hooked_prop(
         &self,
         o: &Rc<RefCell<PhpObject>>,
