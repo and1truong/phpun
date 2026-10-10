@@ -4582,6 +4582,38 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Canonical calls reuse the same boxed shells as direct VM calls.
+    fn frame_new(&mut self, name: impl Into<Rc<str>>) -> Box<Frame> {
+        if let Some(mut f) = self.vm_frame_pool.pop() {
+            *f = Frame::new(name);
+            f
+        } else {
+            Box::new(Frame::new(name))
+        }
+    }
+
+    fn frame_recycle(&mut self, mut f: Box<Frame>) {
+        // Retain shells, never PHP owners, after the caller's destructor pass.
+        f.vars.clear();
+        f.args.clear();
+        f.value_args.clear();
+        f.this_obj = None;
+        f.scope_class = None;
+        f.called_class = None;
+        f.decl_class = None;
+        f.closure_rc = None;
+        f.vm_sites.clear();
+        if self.vm_frame_pool.len() < 64 {
+            self.vm_frame_pool.push(f);
+        }
+    }
+
+    fn stack_discard(&mut self) {
+        if let Some(f) = self.stack_pop() {
+            self.frame_recycle(f);
+        }
+    }
+
     /// Pop a call frame and free its vm_stack span.
     fn stack_pop(&mut self) -> Option<Box<Frame>> {
         let f = self.stack.pop();
