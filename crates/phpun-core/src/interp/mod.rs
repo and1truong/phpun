@@ -3217,12 +3217,19 @@ impl<'a> Interp<'a> {
             || f.args
                 .iter()
                 .any(|c| matches!(&*c.borrow(), Value::Object(_)))
+            || f.value_args.iter().any(|v| matches!(v, Value::Object(_)))
             || f.this_obj.is_some();
         if !has_obj {
             return Ok(());
         }
         let mut cells: Vec<Cell> = f.vars.values().cloned().collect();
         cells.extend(f.args.iter().cloned());
+        // Value-ABI arg slots hold the same owner role as arg cells —
+        // a wrapped object whose only refs live here decrefs now.
+        cells.extend(f.value_args.iter().filter_map(|v| match v {
+            Value::Object(o) => Some(cell(Value::Object(o.clone()))),
+            _ => None,
+        }));
         if let Some(o) = &f.this_obj {
             cells.push(cell(Value::Object(o.clone())));
         }

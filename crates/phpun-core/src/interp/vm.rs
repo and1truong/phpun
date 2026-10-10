@@ -407,15 +407,11 @@ impl Compiled {
             )
         });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
-        // ponytail: scalar, read-only params only. Writable/by-ref/hybrid
-        // bodies keep cells until lazy promotion supports their full lifetime.
-        let value_abi = !hybrid
-            && !needs_bind
-            && !decl.params.iter().any(|p| p.variadic || p.promoted)
-            && !c.ops.iter().any(|op| match op {
-                Op::Store(i) | Op::IncDec { slot: i, .. } => (*i as usize) < decl.params.len(),
-                _ => false,
-            });
+        // ponytail: params bind inline (the frame's value_args are the arg
+        // slots; slot writes store through so func_get_args reports them).
+        // By-ref/canonical bodies keep cells — needs_bind/hybrid exclude them
+        // already — and promoted params keep their early publish pass.
+        let value_abi = !hybrid && !needs_bind && !decl.params.iter().any(|p| p.promoted);
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -1348,7 +1344,38 @@ impl<'a> Interp<'a> {
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
         if value_abi {
-            slots.extend((0..decl.params.len()).map(|i| Slot::Arg(i as u16)));
+            // Params bind inline to the frame's arg vector. An arg that
+            // was never sent binds its const default as an owned value —
+            // introspection must not see it (zend's CV fill stops at the
+            // highest bound slot); a variadic packs the tail args into a
+            // fresh array the callee owns.
+            let n_args = self.cur().value_args.len();
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic {
+                    let mut arr = PhpArray::new();
+                    for v in &self.cur().value_args[i.min(n_args)..] {
+                        arr.push(v.clone());
+                    }
+                    slots.push(Slot::V(Value::Array(Rc::new(std::cell::RefCell::new(arr)))));
+                    break;
+                }
+                if i < n_args {
+                    slots.push(Slot::Arg(i as u16));
+                    continue;
+                }
+                let mut dv = comp.defaults[i].clone().unwrap_or(Value::Null);
+                if let Some(ty) = &p.ty {
+                    // `float $f = 0` widens at bind like the typed prelude.
+                    if ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                        && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                    {
+                        if let Value::Int(n) = dv {
+                            dv = Value::Float(n as f64);
+                        }
+                    }
+                }
+                slots.push(Slot::V(dv));
+            }
         } else if comp.bind_free {
             for (i, _) in decl.params.iter().enumerate() {
                 let c = match fa.get(i) {
@@ -1986,7 +2013,16 @@ impl<'a> Interp<'a> {
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
                 Op::Store(s) => {
                     match &mut slots[*s as usize] {
-                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
+                        // CV write-through: zend's arg slot IS the param,
+                        // so the write lands in the frame's arg vector and
+                        // func_get_args/debug_backtrace report it.
+                        Slot::Arg(i) => {
+                            let old = std::mem::replace(
+                                &mut self.cur().value_args[*i as usize],
+                                vs.last().unwrap().clone(),
+                            );
+                            self.destruct_dying_value(&old)?;
+                        }
                         Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
                         Slot::V(v) => {
                             let old = std::mem::replace(v, vs.last().unwrap().clone());
@@ -2090,7 +2126,9 @@ impl<'a> Interp<'a> {
                     let old = self.vm_slot_value(comp, slots, *slot)?;
                     let new = self.incdec_value(&old, *delta)?;
                     match &mut slots[*slot as usize] {
-                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
+                        Slot::Arg(i) => {
+                            self.cur().value_args[*i as usize] = new;
+                        }
                         Slot::Uninit => slots[*slot as usize] = Slot::V(new),
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
@@ -2502,7 +2540,7 @@ impl<'a> Interp<'a> {
         let required = decl
             .params
             .iter()
-            .rposition(|p| p.default.is_none())
+            .rposition(|p| p.default.is_none() && !p.variadic)
             .map(|i| i + 1)
             .unwrap_or(0);
         if argv.len() < required {
@@ -2554,25 +2592,109 @@ impl<'a> Interp<'a> {
         padd!(0, __p);
         let __p = pnow!();
         let mut args = super::CallArgs::empty();
-        let value_abi = comp.value_abi
+        // Inline (value) binding: params stay owned Values in the frame's
+        // arg vector until a canonical path promotes them. Bound params
+        // need either a provided arg or a const default; a typed variadic
+        // and any failed check keep the canonical binder's machinery
+        // (per-extra gates, TypeErrors).
+        let mut abi = comp.value_abi
             && !argv.is_empty()
-            && argv.len() == decl.params.len()
-            && argv.iter().all(|v| {
-                matches!(
-                    v,
-                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
-                )
-            })
-            && decl.params.iter().enumerate().all(|(i, p)| {
-                p.ty.is_none() || comp.param_fast[i].is_some_and(|gate| gate(&argv[i]))
-            });
-        if value_abi {
+            && argv.len() <= u16::MAX as usize
+            && decl
+                .params
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.variadic || i < argv.len() || comp.defaults[i].is_some());
+        if abi {
+            'abi: for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic {
+                    abi = p.ty.is_none();
+                    break;
+                }
+                let (Some(ty), Some(v)) = (&p.ty, argv.get(i)) else {
+                    continue;
+                };
+                if comp.param_fast[i].is_some_and(|g| g(v)) {
+                    continue;
+                }
+                let v = v.clone();
+                match self.vm_abi_gate_slow(decl, p, ty, &v, argv, i) {
+                    Ok(()) => {}
+                    Err(Some(e)) => {
+                        self.stack_pop();
+                        return self.fail(e);
+                    }
+                    Err(None) => {
+                        abi = false;
+                        break 'abi;
+                    }
+                }
+            }
+        }
+        if abi {
             let n = argv.len() as u64;
             std::mem::swap(&mut self.cur().value_args, argv);
             self.vm_call_reserve(&mut args, n);
             padd!(1, __p);
             return self.vm_run(decl, comp, args);
         }
+        args.cells = self.vm_arg_cells(argv);
+        let n = args.cells.len() as u64;
+        self.vm_call_reserve(&mut args, n);
+        padd!(1, __p);
+        self.vm_run(decl, comp, args)
+    }
+
+    /// The typed check a fast `param_fast` gate could not settle for a
+    /// value-ABI candidate: probe-ok params get the prelude's widening/
+    /// coercion written into argv (so func_get_args reports the bound
+    /// value); anything else falls back to the canonical binder for its
+    /// TypeError machinery. Err(None) = rebind, Err(Some) = propagate.
+    #[cold]
+    fn vm_abi_gate_slow(
+        &mut self,
+        decl: &FunctionDecl,
+        p: &Param,
+        ty: &[String],
+        v: &Value,
+        argv: &mut [Value],
+        i: usize,
+    ) -> Result<(), Option<PhpError>> {
+        self.callable_probe_err = None;
+        match self.vm_param_gate(decl, p, ty, v) {
+            // A swallowed probe's exception propagates verbatim.
+            Some(Some(e)) => return Err(Some(e)),
+            // Any other miss needs the canonical TypeError.
+            Some(None) => return Err(None),
+            None => {}
+        }
+        let v = v.clone();
+        let strict = self.caller_file_strict();
+        if !strict && !self.ty_weak_exact(ty, &v) {
+            if let Some(cv) = self.coerce_scalar(ty, &v) {
+                // Arg-coercion deprecations attribute to the callee's
+                // decl line (scalar_basic).
+                let pl = self.cur_line;
+                self.cur_line = decl.line;
+                self.deprecate_lossy_int(ty, &v, &cv);
+                self.cur_line = pl;
+                argv[i] = cv;
+            }
+        }
+        if strict
+            && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+            && !self.ty_weak_exact(ty, &v)
+        {
+            if let Value::Int(n) = v {
+                argv[i] = Value::Float(n as f64);
+            }
+        }
+        Ok(())
+    }
+
+    /// Cells for args taking the canonical bind path — scalar cells come
+    /// from the recycle pool like the value-ABI teardown fills it.
+    fn vm_arg_cells(&mut self, argv: &mut Vec<Value>) -> Vec<Cell> {
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(|value| {
             if matches!(
@@ -2586,11 +2708,7 @@ impl<'a> Interp<'a> {
             }
             cell(value)
         }));
-        args.cells = cells;
-        let n = args.cells.len() as u64;
-        self.vm_call_reserve(&mut args, n);
-        padd!(1, __p);
-        self.vm_run(decl, comp, args)
+        cells
     }
 
     /// Resolve and cache at INIT, before args can declare overrides.
@@ -2711,10 +2829,8 @@ impl<'a> Interp<'a> {
             CachedFn::Direct(d, _) | CachedFn::Decl(d) => Some(d.clone()),
             CachedFn::Builtin => None,
         };
-        let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
-        cells.extend(argv.drain(..).map(cell));
         let mut args = super::CallArgs::empty();
-        args.cells = cells;
+        args.cells = self.vm_arg_cells(argv);
         let n = args.cells.len() as u64;
         self.vm_call_reserve(&mut args, n);
         if decl.is_none() {
