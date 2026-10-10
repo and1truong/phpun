@@ -4235,6 +4235,19 @@ impl<'a> Interp<'a> {
                                 return self.fail(e);
                             }
                         }
+                        if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
+                            if pd.readonly {
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!(
+                                        "Cannot indirectly modify readonly property {}::${}",
+                                        dcls.name(),
+                                        pd.name
+                                    ),
+                                    0,
+                                ));
+                            }
+                        }
                         // `=&` installs the source cell as the prop's
                         // slot itself — later writes through either name
                         // hit the same storage; a missing dynamic prop
@@ -4263,7 +4276,18 @@ impl<'a> Interp<'a> {
                                 merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
                             }
                         }
-                        let key = self.obj_prop_key(o, &pn).unwrap_or_else(|| pn.clone());
+                        let key = self
+                            .obj_prop_key(o, &pn)
+                            .or_else(|| {
+                                self.decl_prop(o, &pn).map(|(pd, dcls)| {
+                                    if pd.visibility == crate::ast::Visibility::Private {
+                                        format!("\0{}\0{}", dcls.name(), pd.name)
+                                    } else {
+                                        pd.name.clone()
+                                    }
+                                })
+                            })
+                            .unwrap_or_else(|| pn.clone());
                         let mut ob = o.borrow_mut();
                         if !ob.prop_order.contains(&key) {
                             ob.prop_order.push(key.clone());

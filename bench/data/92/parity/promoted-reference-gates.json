@@ -1,0 +1,81 @@
+{
+  "before_runtime": "943eae5",
+  "after_runtime": "b2c21b3",
+  "command": "BIN phpt PATHS --sut BIN --timeout 30 -j 4 --json SAVE",
+  "sets": [
+    {
+      "before": {
+        "total": 2160,
+        "passed": 1824,
+        "failed": 290,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 16,
+        "unsupported": 23,
+        "borked": 0,
+        "crashed": 3,
+        "timed_out": 4,
+        "applicable": 2121,
+        "compatibility_pct": 86.0
+      },
+      "after": {
+        "total": 2160,
+        "passed": 1825,
+        "failed": 289,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 16,
+        "unsupported": 23,
+        "borked": 0,
+        "crashed": 3,
+        "timed_out": 4,
+        "applicable": 2121,
+        "compatibility_pct": 86.04
+      },
+      "deltas": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/property_hooks/gh16615_002.phpt",
+          "before": "fail",
+          "after": "pass"
+        }
+      ]
+    },
+    {
+      "before": {
+        "total": 18,
+        "passed": 6,
+        "failed": 12,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 18,
+        "compatibility_pct": 33.33
+      },
+      "after": {
+        "total": 18,
+        "passed": 7,
+        "failed": 11,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 18,
+        "compatibility_pct": 38.89
+      },
+      "deltas": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/ctor_promotion/ctor_promotion_by_ref.phpt",
+          "before": "fail",
+          "after": "pass"
+        }
+      ]
+    }
+  ]
+}

@@ -753,3 +753,35 @@ restore_error_handler();
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn promoted_reference_properties_preserve_aliases_and_type_owners() {
+    let (out, err, code) = eval(
+        "promoted-ref.php",
+        r#"<?php
+class RefBox {
+    function __construct(public int &$x) { $x += 1; }
+}
+$x = 1; $a = new RefBox($x); $a->x = 9; echo "$x $a->x\n";
+$x = 10; echo "$a->x\n";
+try { $x = []; } catch (TypeError $e) { echo $e->getMessage(), "\n"; }
+unset($a); $x = []; echo gettype($x), "\n";
+class PrivateRef {
+    function __construct(private int &$x) {}
+    function put(int $n) { $this->x = $n; }
+    function get() { return $this->x; }
+}
+$v = 2; $p = new PrivateRef(x: $v); $p->put(12); echo "$v ", $p->get(), "\n";
+class LockedRef { function __construct(public readonly int &$x) {} }
+try { new LockedRef($v); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+class PairRef { function __construct(public int &$a, public int &$b) {} }
+$n = 4; $q = new PairRef($n, $n); $q->a++; echo "$n $q->a $q->b\n";
+class HookRef { function __construct(public int &$x { set { $this->x = $value; } }) {} }
+try { new HookRef($v); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+"#,
+        &[],
+    );
+    assert_eq!(out, "9 9\n10\nCannot assign array to reference held by property RefBox::$x of type int\narray\n12 12\nCannot indirectly modify readonly property LockedRef::$x\n5 5 5\nTyped property HookRef::$x must not be accessed before initialization\n");
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}

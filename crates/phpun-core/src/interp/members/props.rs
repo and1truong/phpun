@@ -601,12 +601,20 @@ impl<'a> Interp<'a> {
             return self.hook_get_typecheck(p, dcls, v);
         }
         if self.backed_for(o, &p.name, hs) {
-            return Ok(o
-                .borrow()
-                .props
-                .get(&p.name)
-                .map(|c| c.borrow().clone())
-                .unwrap_or(Value::Null));
+            let value = o.borrow().props.get(&p.name).map(|c| c.borrow().clone());
+            return match value {
+                Some(v) => Ok(v),
+                None if p.ty.is_some() => self.fail(PhpError::uncaught(
+                    "Error",
+                    format!(
+                        "Typed property {}::${} must not be accessed before initialization",
+                        dcls.name(),
+                        p.name
+                    ),
+                    0,
+                )),
+                None => Ok(Value::Null),
+            };
         }
         self.fail(PhpError::uncaught(
             "Error",
