@@ -3469,24 +3469,24 @@ impl<'a> Interp<'a> {
         // members never coerce.
         let has = |n: &str| ty.iter().any(|m| m.eq_ignore_ascii_case(n));
         let kind_flt = matches!(v, Value::Str(b) if matches!(numeric(b), Numeric::Float(_)));
-        let mut order: Vec<String> = Vec::with_capacity(4);
-        if kind_flt && has("float") {
-            order.push("float".into());
-        }
-        for n in ["int", "float", "string"] {
-            if has(n) && !order.iter().any(|o| o == n) {
-                order.push(n.into());
-            }
-        }
-        if let Some(b) = ty
-            .iter()
-            .find(|m| matches!(m.to_lowercase().as_str(), "bool" | "false" | "true"))
-        {
-            order.push(b.clone());
-        }
-        for m in &order {
-            let l = m.to_lowercase();
-            match l.as_str() {
+        let float_first = kind_flt && has("float");
+        let bool_member = ty.iter().find_map(|m| {
+            ["bool", "false", "true"]
+                .into_iter()
+                .find(|n| m.eq_ignore_ascii_case(n))
+        });
+        // At most four borrowed scalar names; no per-coercion Vec/String heap.
+        let order = float_first
+            .then_some("float")
+            .into_iter()
+            .chain(
+                ["int", "float", "string"]
+                    .into_iter()
+                    .filter(|n| has(n) && !(float_first && *n == "float")),
+            )
+            .chain(bool_member);
+        for m in order {
+            match m {
                 "int" => match v {
                     Value::Int(_) => return Some(v.clone()),
                     Value::Float(f)
@@ -3542,7 +3542,7 @@ impl<'a> Interp<'a> {
                     let t = v.is_truthy();
                     // Standalone `false`/`true` members only accept
                     // values that coerce to exactly that bool.
-                    if l == "bool" || t == (l == "true") {
+                    if m == "bool" || t == (m == "true") {
                         return Some(Value::Bool(t));
                     }
                 }

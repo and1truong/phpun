@@ -529,3 +529,62 @@ NULL
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn scalar_coercion_order_preserves_union_preference_and_constructor_args() {
+    let (out, err, code) = eval(
+        "coercion.php",
+        r#"<?php
+function ni(int|float $x) { var_dump($x); }
+function fs(float|string $x) { var_dump($x); }
+function bi(false|int $x) { var_dump($x); }
+function fl(FloAt $x) { var_dump($x); }
+function nb(bool|array $x) { var_dump($x); }
+function ref_float(float &$x) { var_dump($x); }
+foreach (["42", "42.0", "2e2", true] as $v) ni($v);
+foreach ([42, "42", false] as $v) fs($v);
+foreach ([false, true, "2"] as $v) bi($v);
+fl(7); fl("2.5"); nb([]); nb(2);
+$x = 3; ref_float($x); var_dump($x);
+class Converted { function __construct(public float $x, public float|string $y) { var_dump(func_get_args()); } }
+$c = new Converted(4, 5); var_dump($c->x, $c->y);
+class Text { function __toString() { echo "cast\n"; return "ok"; } }
+function text(string $x) { var_dump($x); }
+text(new Text);
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"int(42)
+float(42)
+float(200)
+int(1)
+float(42)
+string(2) "42"
+float(0)
+bool(false)
+int(1)
+int(2)
+float(7)
+float(2.5)
+array(0) {
+}
+bool(true)
+float(3)
+float(3)
+array(2) {
+  [0]=>
+  float(4)
+  [1]=>
+  float(5)
+}
+float(4)
+float(5)
+cast
+string(2) "ok"
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
