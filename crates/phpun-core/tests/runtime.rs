@@ -319,4 +319,22 @@ string(4) "keep"
     );
     assert_eq!(err, "");
     assert_eq!(code, 0);
+    let (out, err, code) = eval(
+        "strict-builtin.php",
+        r#"<?php
+    declare(strict_types=1);
+    foreach ([0,1,2,3] as $case) {
+        try {
+            if ($case===0) { parse_str([]); }
+            if ($case===1) { call_user_func('parse_str', []); }
+            if ($case===2) { parse_str([], $r, 3); }
+            if ($case===3) { getopt([]); }
+        } catch (Throwable $e) { echo get_class($e), ': ', $e->getMessage(), "\n"; }
+    }
+"#,
+        &[],
+    );
+    assert_eq!(out, "ArgumentCountError: parse_str() expects exactly 2 arguments, 1 given\nArgumentCountError: parse_str() expects exactly 2 arguments, 1 given\nArgumentCountError: parse_str() expects exactly 2 arguments, 3 given\nTypeError: getopt(): Argument #1 ($short_options) must be of type string, array given\n");
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
 }
