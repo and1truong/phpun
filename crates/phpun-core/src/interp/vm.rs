@@ -130,16 +130,16 @@ enum Op {
     /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
     /// for diagnostics. InitCall pins the target before args run.
     // Resolve and pin the target before any argument op executes.
-    InitCall(usize),
+    InitCall {
+        call: usize,
+        args: Box<[Expr]>,
+    },
     Call {
         lname: Rc<str>,
         raw: Rc<str>,
         argc: u16,
         site: usize,
         callee: usize,
-        /// Per-arg caller-CV slot (`u16::MAX` = not a plain CV) — the
-        /// only channel a by-ref callee param has back to the caller.
-        arg_slots: Box<[u16]>,
         cache: std::cell::RefCell<Option<CachedFn>>,
     },
     /// Statement boundary: decref the temps this statement left in
@@ -747,7 +747,10 @@ impl Compiler {
                 {
                     return None;
                 }
-                let init = self.emit(Op::InitCall(usize::MAX));
+                let init = self.emit(Op::InitCall {
+                    call: usize::MAX,
+                    args: args.clone().into_boxed_slice(),
+                });
                 for a in args {
                     match Interp::unmark_arg(a) {
                         Expr::Unpack(_) => return None,
@@ -757,23 +760,17 @@ impl Compiler {
                     self.expr(Interp::unmark_arg(a))?;
                 }
                 let lname: Rc<str> = Rc::from(raw.trim_start_matches('\u{1}').to_lowercase());
-                let arg_slots: Vec<u16> = args
-                    .iter()
-                    .map(|a| match Interp::unmark_arg(a) {
-                        Expr::Var(n) => self.slots.get(n.as_str()).copied().unwrap_or(u16::MAX),
-                        _ => u16::MAX,
-                    })
-                    .collect();
                 let call = self.emit(Op::Call {
                     lname,
                     raw: Rc::from(raw.trim_start_matches('\u{1}')),
                     argc: args.len() as u16,
                     site: *site,
                     callee: *callee,
-                    arg_slots: arg_slots.into_boxed_slice(),
                     cache: std::cell::RefCell::new(None),
                 });
-                self.ops[init] = Op::InitCall(call);
+                if let Op::InitCall { call: at, .. } = &mut self.ops[init] {
+                    *at = call;
+                }
             }
             _ => return None,
         };
@@ -1279,25 +1276,52 @@ impl<'a> Interp<'a> {
                     self.send_line = None;
                 }
                 Op::Return => return Ok(Flow::Return(vs.pop().unwrap_or(Value::Null))),
-                Op::InitCall(at) => {
+                Op::InitCall { call: at, args } => {
                     let Op::Call {
                         lname,
                         raw,
                         callee,
+                        site,
                         cache,
                         ..
                     } = &comp.ops[*at]
                     else {
                         unreachable!("InitCall always points to its Call");
                     };
-                    targets.push(self.vm_resolve(lname, raw, *callee, cache)?);
+                    let target = self.vm_resolve(lname, raw, *callee, cache)?;
+                    let needs_refs = match &target {
+                        CachedFn::Decl(d) => d.params.iter().any(|p| p.by_ref),
+                        CachedFn::Builtin => {
+                            builtin_byref(lname).is_some_and(|flags| flags.iter().any(|flag| *flag))
+                        }
+                        CachedFn::Direct(..) => false,
+                    };
+                    if needs_refs {
+                        // Cold reference calls use the canonical SEND machinery.
+                        // Cells shared with slots let argument expressions update
+                        // caller locals and keep escaping references alive.
+                        let frame = self.cur();
+                        for (name, index) in &comp.names {
+                            let slot = &mut slots[*index as usize];
+                            let c = match slot {
+                                Slot::C(c) => c.clone(),
+                                Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
+                            };
+                            *slot = Slot::C(c.clone());
+                            frame.vars.insert(name.clone(), c);
+                        }
+                        let value = self.vm_ref_call(&target, lname, raw, args, *site)?;
+                        vs.push(value);
+                        pc = *at + 1; // skip compiled argument ops and Call
+                        continue;
+                    }
+                    targets.push(target);
                 }
                 Op::Call {
                     lname,
                     raw,
                     argc,
                     site,
-                    arg_slots,
                     ..
                 } => {
                     let n = *argc as usize;
@@ -1314,7 +1338,7 @@ impl<'a> Interp<'a> {
                         self.send_line = Some(*site);
                         self.vm_run_direct(d, c, &mut argv)?
                     } else {
-                        self.vm_call(lname, raw, &mut argv, *site, (slots, arg_slots), &target)?
+                        self.vm_call(lname, raw, &mut argv, *site, &target)?
                     };
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -1746,6 +1770,47 @@ impl<'a> Interp<'a> {
         Ok(target)
     }
 
+    /// Reuse AST argument binding for the cold reference path; resolving
+    /// before this helper keeps the same pinned literal-call target.
+    fn vm_ref_call(
+        &mut self,
+        target: &CachedFn,
+        lname: &str,
+        raw: &str,
+        exprs: &[Expr],
+        site: usize,
+    ) -> Result<Value, PhpError> {
+        let decl = match target {
+            CachedFn::Decl(d) | CachedFn::Direct(d, _) => Some(d),
+            CachedFn::Builtin => None,
+        };
+        let builtin_params = if decl.is_none() {
+            super::calls::builtin_ref_params(lname)
+        } else {
+            Vec::new()
+        };
+        self.send_line = Some(site);
+        let args = self.arg_cells(
+            exprs,
+            decl.map(|d| d.params.as_slice()).unwrap_or(&builtin_params),
+            raw,
+            decl.is_none(),
+            Some(site),
+            false,
+        )?;
+        if let Some(d) = decl {
+            return self.invoke_fn(d, args, None, None);
+        }
+        if let Some(value) = self.call_builtin(lname, &args, true)? {
+            return Ok(value);
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!("Call to undefined function {}()", raw),
+            0,
+        ))
+    }
+
     /// Execute the target chosen before argument evaluation.
     fn vm_call(
         &mut self,
@@ -1753,7 +1818,6 @@ impl<'a> Interp<'a> {
         raw: &str,
         argv: &mut Vec<Value>,
         site: usize,
-        (slots, arg_slots): (&mut [Slot], &[u16]),
         target: &CachedFn,
     ) -> Result<Value, PhpError> {
         self.send_line = Some(site);
@@ -1763,79 +1827,6 @@ impl<'a> Interp<'a> {
         };
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(cell));
-        // By-ref callee params bind the caller's own zval — a plain-CV
-        // arg must hand over its slot cell (a Slot::V local upgrades to
-        // Slot::C, zend's separate-into-reference), or the callee's
-        // writes die on a throwaway cell.
-        let link = |slots: &mut [Slot], cells: &mut Vec<Cell>, i: usize| {
-            let Some(&sl) = arg_slots.get(i) else { return };
-            if sl == u16::MAX || i >= cells.len() {
-                return;
-            }
-            let sl = sl as usize;
-            match &mut slots[sl] {
-                Slot::C(c) => cells[i] = c.clone(),
-                Slot::V(v) => {
-                    let c = cell(std::mem::replace(v, Value::Null));
-                    slots[sl] = Slot::C(c.clone());
-                    cells[i] = c;
-                }
-            }
-        };
-        if let Some(d) = &decl {
-            for (i, p) in d.params.iter().enumerate() {
-                if p.variadic {
-                    // `&...$v` — every extra arg binds by-ref too.
-                    if p.by_ref {
-                        for j in i..cells.len() {
-                            link(slots, &mut cells, j);
-                        }
-                    }
-                    break;
-                }
-                if !p.by_ref || i >= cells.len() {
-                    continue;
-                }
-                if arg_slots.get(i).copied().unwrap_or(u16::MAX) == u16::MAX {
-                    // Non-lvalue into a by-ref slot is a zend Error,
-                    // not a silent fresh cell.
-                    return self.fail(PhpError::uncaught(
-                        "Error",
-                        format!(
-                            "{}(): Argument #{} (${}) could not be passed by reference",
-                            self.decl_fname(d),
-                            i + 1,
-                            p.name
-                        ),
-                        0,
-                    ));
-                }
-                link(slots, &mut cells, i);
-            }
-        } else if let Some(bp) = super::calls::builtin_byref(lname) {
-            for (i, &br) in bp.iter().enumerate() {
-                if !br || i >= cells.len() {
-                    continue;
-                }
-                if arg_slots.get(i).copied().unwrap_or(u16::MAX) == u16::MAX {
-                    let pname = builtins::builtin_params(lname)
-                        .and_then(|ps| ps.get(i))
-                        .map(|p| format!(" (${})", p.0))
-                        .unwrap_or_default();
-                    return self.fail(PhpError::uncaught(
-                        "Error",
-                        format!(
-                            "{}(): Argument #{}{} could not be passed by reference",
-                            lname,
-                            i + 1,
-                            pname
-                        ),
-                        0,
-                    ));
-                }
-                link(slots, &mut cells, i);
-            }
-        }
         let mut args = super::CallArgs::empty();
         args.cells = cells;
         let n = args.cells.len() as u64;

@@ -27,6 +27,37 @@ pub(in crate::interp) enum SiteErr {
     Thrown(PhpError),
 }
 
+/// Canonical synthetic params for the builtin by-reference send path.
+pub(in crate::interp) fn builtin_ref_params(name: &str) -> Vec<Param> {
+    let sig = crate::builtins::builtin_sig(name).unwrap_or_default();
+    let bparams = crate::builtins::builtin_params(name);
+    builtin_byref(name)
+        .map(|flags| {
+            flags
+                .iter()
+                .enumerate()
+                .map(|(i, by_ref)| Param {
+                    name: sig
+                        .get(i)
+                        .map(|(n, _)| n.clone())
+                        .or_else(|| bparams.and_then(|p| p.get(i).map(|(n, _)| n.to_string())))
+                        .unwrap_or_default(),
+                    default: None,
+                    by_ref: *by_ref,
+                    variadic: false,
+                    ty: None,
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl<'a> Interp<'a> {
     // ----- calls -----
 
@@ -979,36 +1010,8 @@ impl<'a> Interp<'a> {
         // Synthetic params carrying builtin by-ref flags so call results in
         // by-ref slots emit "Only variables should be passed by reference"
         // (passByReference_012, array_shift(array_shift($a))).
-        let builtin_params: Vec<Param> = if decl.is_none() {
-            let sig = crate::builtins::builtin_sig(lname.as_ref()).unwrap_or_default();
-            let bparams = crate::builtins::builtin_params(lname.as_ref());
-            builtin_byref(lname.as_ref())
-                .map(|flags| {
-                    flags
-                        .iter()
-                        .enumerate()
-                        .map(|(i, by_ref)| Param {
-                            name: sig
-                                .get(i)
-                                .map(|(n, _)| n.clone())
-                                .or_else(|| {
-                                    bparams.and_then(|p| p.get(i).map(|(n, _)| n.to_string()))
-                                })
-                                .unwrap_or_default(),
-                            default: None,
-                            by_ref: *by_ref,
-                            variadic: false,
-                            ty: None,
-                            promoted: false,
-                            vis: None,
-                            readonly: false,
-                            is_final: false,
-                            set_vis: None,
-                            hooks: None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+        let builtin_params = if decl.is_none() {
+            builtin_ref_params(lname.as_ref())
         } else {
             Vec::new()
         };
