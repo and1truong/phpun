@@ -3063,6 +3063,9 @@ impl<'a> Interp<'a> {
     /// nested statement's unwind must not free an outer statement's
     /// live temps (bug29368_3).
     fn sweep_expr_temps(&mut self, base: usize) -> Result<(), PhpError> {
+        if self.expr_temps.len() == base {
+            return Ok(());
+        }
         let temps = self.expr_temps.split_off(base);
         for o in temps {
             if Rc::strong_count(&o) != 1 {
@@ -3168,6 +3171,19 @@ impl<'a> Interp<'a> {
     /// to drop runs its __destruct now — Zend's behavior at function
     /// exit and exception unwind (bug52361).
     fn destruct_frame_objs(&mut self, f: &Frame) -> Result<(), PhpError> {
+        // The pass only acts on cells holding objects — skip the
+        // collect entirely for object-free frames (most calls).
+        let has_obj = f
+            .vars
+            .values()
+            .any(|c| matches!(&*c.borrow(), Value::Object(_)))
+            || f.args
+                .iter()
+                .any(|c| matches!(&*c.borrow(), Value::Object(_)))
+            || f.this_obj.is_some();
+        if !has_obj {
+            return Ok(());
+        }
         let mut cells: Vec<Cell> = f.vars.values().cloned().collect();
         cells.extend(f.args.iter().cloned());
         if let Some(o) = &f.this_obj {
@@ -3180,6 +3196,12 @@ impl<'a> Interp<'a> {
     /// generator frame's stashed CVs decref the same way when its
     /// execute_data is freed.
     pub(in crate::interp) fn destruct_cells(&mut self, cells: &[Cell]) -> Result<(), PhpError> {
+        if !cells
+            .iter()
+            .any(|c| matches!(&*c.borrow(), Value::Object(_)))
+        {
+            return Ok(());
+        }
         // Only a cell DYING with this batch decrefs its zval: a shared
         // cell (`=&` alias still owned by props/statics/another var)
         // keeps its content — the frame's handle dropping is not a
