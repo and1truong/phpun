@@ -1476,6 +1476,9 @@ impl<'a> Interp<'a> {
                     id: which as u64 + 1,
                     which,
                     pos: 0,
+                    eof: false,
+                    rbuf: std::collections::VecDeque::new(),
+                    rcap: 0,
                 }))),
             );
         }
@@ -8541,6 +8544,7 @@ impl<'a> Interp<'a> {
             "CallbackFilterIterator",
             "RecursiveIteratorIterator",
             "AppendIterator",
+            "RegexIterator",
         ];
         SPL_PRELUDE_CLASSES.iter().any(|n| self.is_a(cls, n))
     }
@@ -8660,6 +8664,69 @@ class CallbackFilterIterator extends FilterIterator {
     public function accept() {
         return ($this->callback)($this->current(), $this->key(), $this->inner);
     }
+}
+class RegexIterator extends FilterIterator {
+    public const USE_KEY = 1;
+    public const INVERT_MATCH = 2;
+    public const MATCH = 0;
+    public const GET_MATCH = 1;
+    public const ALL_MATCHES = 2;
+    public const SPLIT = 3;
+    public const REPLACE = 4;
+    private $regex;
+    public $replacement;
+    private $mode;
+    private $flags;
+    private $pregFlags;
+    private $key;
+    private $current;
+    private $matches;
+    public function __construct(Iterator $iterator, string $pattern, int $mode = self::MATCH, int $flags = 0, string $replacement = "") {
+        parent::__construct($iterator);
+        $this->regex = $pattern;
+        $this->replacement = $replacement;
+        $this->mode = $mode;
+        $this->flags = $flags;
+        $this->pregFlags = 0;
+    }
+    public function accept() {
+        $this->matches = [];
+        $this->key = parent::key();
+        $this->current = parent::current();
+        $subj = ($this->flags & self::USE_KEY) ? $this->key : $this->current;
+        switch ($this->mode) {
+            case self::GET_MATCH:
+                $ok = preg_match($this->regex, (string) $subj, $this->matches, $this->pregFlags) > 0;
+                if ($ok) { $this->current = $this->matches; }
+                break;
+            case self::ALL_MATCHES:
+                $ok = preg_match_all($this->regex, (string) $subj, $this->matches, $this->pregFlags) > 0;
+                if ($ok) { $this->current = $this->matches; }
+                break;
+            case self::SPLIT:
+                $this->current = preg_split($this->regex, (string) $subj, -1, $this->pregFlags);
+                $ok = $this->current !== false && count($this->current) > 1;
+                break;
+            case self::REPLACE:
+                $this->current = preg_replace($this->regex, $this->replacement, (string) $subj);
+                $ok = true;
+                break;
+            case self::MATCH:
+            default:
+                $ok = preg_match($this->regex, (string) $subj, $this->matches, $this->pregFlags) > 0;
+        }
+        if ($this->flags & self::INVERT_MATCH) { return !$ok; }
+        return $ok;
+    }
+    public function current() { return $this->current; }
+    public function key() { return $this->key; }
+    public function getMode() { return $this->mode; }
+    public function setMode($mode) { $this->mode = $mode; }
+    public function getFlags() { return $this->flags; }
+    public function setFlags($flags) { $this->flags = $flags; }
+    public function getPregFlags() { return $this->pregFlags; }
+    public function setPregFlags($flags) { $this->pregFlags = $flags; }
+    public function getRegex() { return $this->regex; }
 }
 class RecursiveIteratorIterator implements OuterIterator {
     const LEAVES_ONLY = 0;

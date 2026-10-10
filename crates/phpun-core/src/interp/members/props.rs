@@ -180,7 +180,7 @@ impl<'a> Interp<'a> {
     /// Would creating dynamic prop `key`/`pn` on `o` emit the
     /// E_DEPRECATED? True when no declared prop exists and the class
     /// isn't exempt (stdClass / #[AllowDynamicProperties]).
-    pub(in crate::interp) fn dyn_prop_deprecated(
+    pub(crate) fn dyn_prop_deprecated(
         &mut self,
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
@@ -2295,9 +2295,14 @@ impl<'a> Interp<'a> {
         name: &str,
     ) -> (crate::ast::Visibility, String) {
         // Private slots are stored mangled ("\0Cls\0name"); the declaring
-        // class is encoded directly in the key.
+        // class is encoded directly in the key. A verbatim `\0*\0` key
+        // (unserialize wrote an undeclared protected prop) decodes to
+        // protected scope.
         if let Some(rest) = name.strip_prefix('\0') {
             if let Some((dcls, _)) = rest.split_once('\0') {
+                if dcls == "*" {
+                    return (crate::ast::Visibility::Protected, String::new());
+                }
                 return (crate::ast::Visibility::Private, dcls.to_string());
             }
         }
