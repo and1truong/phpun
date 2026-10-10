@@ -1660,20 +1660,20 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
         "number_format" => &[("num", "float"), ("decimals", "int")],
         "preg_match" | "preg_match_all" => &[("pattern", "string"), ("subject", "string")],
         "preg_replace" | "preg_filter" => &[
-            ("pattern", "string|array"),
-            ("replacement", "string|array"),
-            ("subject", "string|array"),
+            ("pattern", "array|string"),
+            ("replacement", "array|string"),
+            ("subject", "array|string"),
             ("limit", "int"),
         ],
         "preg_replace_callback" => &[
-            ("pattern", "string|array"),
+            ("pattern", "array|string"),
             ("callback", "callable"),
-            ("subject", "string|array"),
+            ("subject", "array|string"),
             ("limit", "int"),
         ],
         "preg_replace_callback_array" => &[
             ("pattern", "array"),
-            ("subject", "string|array"),
+            ("subject", "array|string"),
             ("limit", "int"),
         ],
         "preg_split" => &[

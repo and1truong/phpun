@@ -2289,6 +2289,25 @@ impl<'a> Interp<'a> {
                 args = bound;
             }
         }
+        // Internal-method named args bind against the stub's arginfo
+        // params — same slot-fill/unknown-name/overwrite rules zend's
+        // ZPP applies to ctor args, so reuse the ctor binder.
+        if !args.named.is_empty() && !name.eq_ignore_ascii_case("__construct") {
+            let stub = self
+                .find_method_in(&cls, name)
+                .filter(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                .map(|(m, dc)| (m.clone(), dc.clone()));
+            if let Some((m, dc)) = stub {
+                let mut defaults: Vec<Option<Cell>> = Vec::new();
+                for p in &m.decl.params {
+                    defaults.push(match &p.default {
+                        Some(d) => Some(cell(self.eval(d)?)),
+                        None => None,
+                    });
+                }
+                args = self.ctor_zpp_bind(&dc, &m, &args, &defaults)?;
+            }
+        }
         // WeakReference::get() — upgrades the weak handle (null when
         // the target was collected).
         if name.eq_ignore_ascii_case("get") {
