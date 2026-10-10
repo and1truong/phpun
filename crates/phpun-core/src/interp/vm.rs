@@ -283,6 +283,9 @@ impl Compiled {
         Some(match (core[0].to_ascii_lowercase().as_str(), nullable) {
             ("int", false) => |v: &Value| matches!(v, Value::Int(_)),
             ("int", true) => |v: &Value| matches!(v, Value::Int(_) | Value::Null),
+            // Only already-float values prove pass; int widening keeps the binder.
+            ("float", false) => |v: &Value| matches!(v, Value::Float(_)),
+            ("float", true) => |v: &Value| matches!(v, Value::Float(_) | Value::Null),
             ("string", false) => |v: &Value| matches!(v, Value::Str(_)),
             ("string", true) => |v: &Value| matches!(v, Value::Str(_) | Value::Null),
             ("bool", false) => |v: &Value| matches!(v, Value::Bool(_)),

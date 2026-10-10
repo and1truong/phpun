@@ -4915,7 +4915,11 @@ impl<'a> Interp<'a> {
             None => self.exec_block(&decl.body),
         };
         self.loop_depth = saved_depth;
-        let ret_fname = self.decl_fname(decl);
+        let ret_fname = if decl.ret.is_some() || decl.name.eq_ignore_ascii_case("__tostring") {
+            self.decl_fname(decl)
+        } else {
+            String::new()
+        };
         // `static` resolves against THIS frame's called class — after
         // the pop, `stack.last()` is the caller (static_type_return).
         let resolved_ret = decl.ret.as_ref().map(|ty| self.resolve_static(ty));

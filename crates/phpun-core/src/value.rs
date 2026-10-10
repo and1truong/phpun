@@ -1988,6 +1988,10 @@ impl PhpClass {
         // (or the older `$LINE` uniquifier) internally; the public
         // display name truncates at the marker.
         let n = self.decl.name.split('\0').next().unwrap_or(&self.decl.name);
+        // Ordinary names cannot contain the anonymous-class marker.
+        if !n.contains('@') {
+            return n;
+        }
         if let Some(pos) = n.find("@anonymous$") {
             &n[..pos + "@anonymous".len()]
         } else {

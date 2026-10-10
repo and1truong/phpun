@@ -450,3 +450,37 @@ cast-error 99
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn class_names_and_float_gates_preserve_coercion_and_errors() {
+    let (out, err, code) = eval(
+        "class-float.php",
+        r#"<?php
+function floating(float $n): float { return $n; }
+function nullable(?float $n): ?float { return $n; }
+function widened(): float { return 7; }
+function rejected(): float { return 'bad'; }
+var_dump(floating(1.5), floating(7), floating('2.5'), nullable(null), nullable(2), widened());
+try { rejected(); } catch (Throwable $e) { echo get_class($e),"\n"; }
+class OrdinaryName { public function __construct(public int $n) {} }
+$o=new OrdinaryName(3); echo get_class($o),' ',$o->n,"\n";
+$a=new class { public function read() { return 4; } }; echo strpos(get_class($a),'@anonymous') !== false ? 'anonymous' : 'bad', ' ', $a->read(),"\n";
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"float(1.5)
+float(7)
+float(2.5)
+NULL
+float(2)
+float(7)
+TypeError
+OrdinaryName 3
+anonymous 4
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
