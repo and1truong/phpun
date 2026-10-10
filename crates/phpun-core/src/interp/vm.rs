@@ -1276,6 +1276,16 @@ impl<'a> Interp<'a> {
             // materialization costs no malloc.
             let mut fa = std::mem::take(&mut f.args);
             slots.clear();
+            // Pooled frames retain capacity, not PHP owners. Methods and
+            // closures also use vm_run, so release their receiver/captures
+            // after canonical destructor passes and before recycling cells.
+            f.vars.clear();
+            f.this_obj = None;
+            f.closure_rc = None;
+            f.statics_unit = None;
+            f.scope_class = None;
+            f.called_class = None;
+            f.decl_class = None;
             for c in fa.drain(..) {
                 // Only uniquely owned, untracked scalar cells can be reused.
                 // Trace snapshots, references and captures keep their cells.
