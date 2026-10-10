@@ -4237,15 +4237,21 @@ impl<'a> Interp<'a> {
                         }
                         if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
                             if pd.readonly {
-                                return self.fail(PhpError::uncaught(
-                                    "Error",
+                                let key = self.obj_prop_key(o, &pn);
+                                let object = key
+                                    .as_ref()
+                                    .and_then(|k| o.borrow().props.get(k).cloned())
+                                    .is_some_and(|c| matches!(&*c.borrow(), Value::Object(_)));
+                                let message = if object {
+                                    "Cannot assign by reference to overloaded object".to_string()
+                                } else {
                                     format!(
                                         "Cannot indirectly modify readonly property {}::${}",
                                         dcls.name(),
                                         pd.name
-                                    ),
-                                    0,
-                                ));
+                                    )
+                                };
+                                return self.fail(PhpError::uncaught("Error", message, 0));
                             }
                         }
                         // `=&` installs the source cell as the prop's
