@@ -3494,6 +3494,7 @@ fn internal_param_byref(f: &str, p: &str) -> bool {
         | "next"
         | "prev" => p == "array",
         "parse_str" => p == "result",
+        "getopt" => p == "rest_index",
         _ => false,
     }
 }
