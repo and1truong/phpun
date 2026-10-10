@@ -1151,9 +1151,9 @@ impl Compiler {
                 e: base,
                 i: Some(key),
             } => {
-                if let Expr::Var(array) = &**base {
+                if let Expr::Var(array) = Interp::unmark_rhs(base) {
                     if !Interp::is_superglobal(array) {
-                        let key = match &**key {
+                        let key = match Interp::unmark_rhs(key) {
                             Expr::Var(n) if !Interp::is_superglobal(n) => {
                                 Some((Some(self.slot(n)), 0))
                             }
@@ -2734,6 +2734,81 @@ impl<'a> Interp<'a> {
 #[cfg(test)]
 mod tests {
     use super::Interp;
+
+    #[test]
+    fn scalar_dimension_slots_preserve_mutation_refs_views_and_fallbacks() {
+        let mut it = Interp::new("array-read.php");
+        let result = it.run_source(r#"<?php
+function read_at($a, $k) { return $a[$k]; }
+function read_zero($a) { return $a[0]; }
+$a = [3, 1, 2]; $copy = $a; echo read_at($a, 1), ' ', read_zero($a), "\n";
+$r =& $a[1]; $r = 9; echo read_at($a, 1), ' ', read_at($copy, 1), "\n";
+unset($a[0]); $a[0] = 8; echo read_zero($a), "\n";
+sort($a); echo read_zero($a), "\n";
+array_unshift($a, 7); echo read_zero($a), "\n";
+array_splice($a, 0, 1, [4, 5]); echo read_zero($a), ' ', read_at($a, 1), "\n";
+foreach ($a as &$v) $v += 1; unset($v); echo read_zero($a), "\n";
+foreach ([null, false, 1, 1.5, "x\0z"] as $v) { $x=read_zero([$v]); echo gettype($x), ':', is_string($x) ? bin2hex($x) : json_encode($x), "\n"; }
+echo read_at(['k'=>'str', 2=>'num'], 'k'), ' ', read_at([2=>'num'], '2'), "\n";
+$o = new stdClass; $o->x=6; echo read_at([$o], 0)->x, ' ', read_at([[2]], 0)[0], "\n";
+class ReadAccess implements ArrayAccess {
+ function offsetExists(mixed $k): bool { return true; }
+ function offsetGet(mixed $k): mixed { echo "get:$k\n"; return 12; }
+ function offsetSet(mixed $k, mixed $v): void {}
+ function offsetUnset(mixed $k): void {}
+}
+echo read_at(new ReadAccess, 3), "\n";
+set_error_handler(function($errno, $message) { echo "warning:$message\n"; });
+var_dump(read_at([], 7));
+function missing_key($a) { return $a[$unknown]; }
+var_dump(missing_key([0=>2]));
+restore_error_handler();
+echo read_at(k: 0, a: [11]), "\n";
+$g=[1]; for ($i=0; $i<2; $i++) { echo $g[0], "\n"; $GLOBALS['g']=[5]; }
+echo $GLOBALS['g'][0], "\n";
+"#);
+        assert_eq!(
+            String::from_utf8_lossy(&it.out),
+            r#"1 3
+9 1
+8
+2
+7
+4 5
+5
+NULL:null
+boolean:false
+integer:1
+double:1.5
+string:78007a
+str num
+6 2
+get:3
+12
+warning:Undefined array key 7
+NULL
+warning:Undefined variable $unknown
+warning:Using null as an array offset is deprecated, use an empty string instead
+warning:Undefined array key ""
+NULL
+11
+1
+5
+5
+"#
+        );
+        assert_eq!(it.err_buf, "");
+        assert_eq!(result.exit_code, 0);
+        for name in ["read_at", "read_zero"] {
+            let decl = it.functions[name].clone();
+            let compiled = it.vm_compiled(&decl).unwrap();
+            assert!(compiled.needs_bind && !compiled.value_abi);
+            assert!(compiled
+                .ops
+                .iter()
+                .any(|op| matches!(op, super::Op::DimCv { .. })));
+        }
+    }
 
     #[test]
     fn canonical_frames_reuse_boxes_and_release_php_owners() {
