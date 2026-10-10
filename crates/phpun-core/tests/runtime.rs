@@ -807,6 +807,11 @@ $s = '{"ascii":"user-123@example.com","utf8":"é😀","escaped":"a\\u0000b\\n","
 $a = json_decode($s, true);
 echo $a['ascii'], ' ', bin2hex($a['utf8']), ' ', bin2hex($a['escaped']), ' ', json_encode($a['a']), "\n";
 echo json_encode(json_decode('{"x":1,"nested":{"k":"v"}}')), "\n";
+foreach (['"' . chr(92), '"ascii' . chr(92), '{"key":"value' . chr(92)] as $broken) {
+    var_dump(json_decode($broken));
+    echo json_last_error(), "\n";
+    var_dump(json_validate($broken));
+}
 "#,
         &[],
     );
@@ -822,6 +827,15 @@ get
 [{"ok":3},{"name":"hook","x":2}]
 user-123@example.com c3a9f09f9880 6100620a [1,true,null]
 {"x":1,"nested":{"k":"v"}}
+NULL
+4
+bool(false)
+NULL
+4
+bool(false)
+NULL
+4
+bool(false)
 "#
     );
     assert_eq!(err, "");

@@ -291,7 +291,10 @@ fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result
             *pos += 1;
             let mut s = String::new();
             while *pos < b.len() && b[*pos] != b'"' {
-                if b[*pos] == b'\\' && *pos + 1 < b.len() {
+                if b[*pos] == b'\\' {
+                    if *pos + 1 == b.len() {
+                        return Err(());
+                    }
                     *pos += 1;
                     match b[*pos] {
                         b'n' => s.push('\n'),
