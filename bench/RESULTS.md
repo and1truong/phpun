@@ -1,5 +1,36 @@
 # bench results
 
+## Latest performance follow-through — 2026-10-10
+
+Paired **current main dd99cac → runtime 0fe4140** cold CLI comparison, seven
+alternating profiler-off release pairs, Rust 1.99.0/LTO=true/codegen-units=1.
+Every measured exit/stdout/stderr matches PHP 8.5.11 (`-n`; genuine mbstring 8.5.11
+loaded for the full CLI/library oracle). These are before/after phpun timings,
+not updated phpun/PHP ratios. Exact binary/runtime/config hashes, argv and raw
+samples: [FOLLOW_THROUGH92.md](FOLLOW_THROUGH92.md) and
+[data/92/follow-through/foreach-bodies](data/92/follow-through/foreach-bodies).
+
+| Bench | Current main median [min,max] ms | Candidate median [min,max] ms | Change |
+|---|---:|---:|---:|
+| 00-startup | 5.502 [4.869,6.973] | 5.296 [4.947,7.411] | -3.8% |
+| 10-fib | 208.359 [205.300,227.041] | 207.090 [198.418,219.554] | -0.6% |
+| 11-sieve | 231.072 [222.908,241.107] | 228.990 [219.682,245.519] | -0.9% |
+| 20-strings | 623.345 [608.961,703.656] | 618.089 [607.577,668.999] | -0.8% |
+| 30-arrays | 1194.238 [1144.487,1253.653] | 234.631 [216.942,263.061] | -80.4% |
+| 40-objects | 546.384 [477.785,583.482] | 474.854 [418.097,570.509] | -13.1% |
+| 50-regex | 40.562 [37.262,47.950] | 40.377 [38.584,45.091] | -0.5% |
+| 60-json | 960.846 [903.388,1016.241] | 948.608 [923.298,1041.432] | -1.3% |
+| 70-db | 138.133 [124.387,153.955] | 131.503 [127.821,155.565] | -4.8% |
+
+Arrays improve 80.4%, objects 13.1% in this paired run. Smaller changes have
+overlapping ranges; the real-library demos do not establish a generic application
+win. PHPT gates and closure/foreach probes are documented in the linked report.
+
+## Historical PHP-ratio baseline — frozen runtime 308cc05
+
+The following frozen report retains its original binary, oracle and samples.
+Do not combine its PHP ratios with the newer before/after comparison.
+
 - date: 2026-10-10T02:14:18.762533+00:00
 - source checkout: 8a44d49be37943daea27d83ef991cf0f9c23e876; dirty: False (not binary build provenance)
 - phpun: phpun 0.0.1 (php compat target: 8.5)
