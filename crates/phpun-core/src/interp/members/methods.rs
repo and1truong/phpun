@@ -1826,11 +1826,10 @@ impl<'a> Interp<'a> {
                         0,
                     ));
                 }
-                let params = self
-                    .find_method_in(&cls, &mn)
-                    .map(|m| m.0.decl.params.clone())
-                    .unwrap_or_default();
-                let argvals = self.arg_cells(args, &params, &mn, false, site, false)?;
+                let fm = self.find_method_in(&cls, &mn);
+                let names_ok = fm.is_some();
+                let params = fm.map(|m| m.0.decl.params.clone()).unwrap_or_default();
+                let argvals = self.arg_cells(args, &params, &mn, false, site, false, names_ok)?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
                 self.method_invoke_vis(o.clone(), &mn, argvals)
             }
@@ -1851,7 +1850,8 @@ impl<'a> Interp<'a> {
                     CallableKind::Closure(d) => d.params.clone(),
                     _ => vec![],
                 };
-                let argvals = self.arg_cells(args, &params, &mn, false, site, false)?;
+                let argvals =
+                    self.arg_cells(args, &params, &mn, false, site, false, !params.is_empty())?;
                 // `$f->__invoke()` runs the internal Closure::__invoke —
                 // diagnostics name `Closure::__invoke` and drop the
                 // ", called in" suffix (closure_059).
@@ -1864,7 +1864,7 @@ impl<'a> Interp<'a> {
                 // `$fn->call($newThis, ...$args)`: bind with an omitted
                 // scope then invoke — previous scope preserved when the
                 // new instance is compatible (closure_036/038).
-                let argvals = self.arg_cells(args, &[], &mn, false, site, false)?;
+                let argvals = self.arg_cells(args, &[], &mn, false, site, false, false)?;
                 let mut ca = argvals;
                 let newthis = ca
                     .cells
@@ -1887,7 +1887,7 @@ impl<'a> Interp<'a> {
                 self.call_value(&Value::Callable(c), ca)
             }
             Value::Callable(c) if mn.eq_ignore_ascii_case("bindto") => {
-                let argvals = self.arg_cells(args, &[], &mn, false, site, false)?;
+                let argvals = self.arg_cells(args, &[], &mn, false, site, false, false)?;
                 let this = argvals.cells.first().map(|c| c.borrow().clone());
                 let scope = argvals.cells.get(1).map(|c| c.borrow().clone());
                 let new_this = match &this {
