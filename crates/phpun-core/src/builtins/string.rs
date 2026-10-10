@@ -1251,21 +1251,6 @@ fn brfind_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
         .rposition(|w| w.eq_ignore_ascii_case(needle))
 }
 
-fn breplace_ci(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    if from.is_empty() {
-        return hay.to_vec();
-    }
-    let mut out = Vec::with_capacity(hay.len());
-    let mut i = 0;
-    while let Some(p) = bfind_ci(hay, from, i) {
-        out.extend_from_slice(&hay[i..p]);
-        out.extend_from_slice(to);
-        i = p + from.len();
-    }
-    out.extend_from_slice(&hay[i..]);
-    out
-}
-
 /// Length of the UTF-8 sequence starting at `b[i]`, None if invalid.
 fn utf8_char_len(b: &[u8], i: usize) -> Option<usize> {
     let c = *b.get(i)?;
@@ -1316,40 +1301,41 @@ fn trim_set(s: &[u8], chars: &[u8], left: bool, right: bool) -> Vec<u8> {
     }
 }
 
-fn str_replace_one(
+fn str_replace_one<'s>(
     finds: &[Vec<u8>],
     repls: &[Vec<u8>],
     repl_scalar: bool,
-    subj: &[u8],
+    subj: &'s [u8],
     ci: bool,
     count: &mut i64,
-) -> Vec<u8> {
-    let mut out = subj.to_vec();
+) -> Cow<'s, [u8]> {
+    let mut out = Cow::Borrowed(subj);
     for (i, f) in finds.iter().enumerate() {
         if f.is_empty() {
             continue;
         }
-        // Scalar repl applies to every find; a short repl array pads ''.
         let r = if repl_scalar {
-            &repls[0]
+            repls[0].as_slice()
         } else {
             repls.get(i).map(|r| r.as_slice()).unwrap_or(&[])
         };
-        // Each replace is replace-all: occurrences present now are all hit.
-        let mut i0 = 0usize;
+        let mut start = 0;
+        let mut changed: Option<Vec<u8>> = None;
         while let Some(p) = if ci {
-            bfind_ci(&out, f, i0)
+            bfind_ci(&out, f, start)
         } else {
-            bfind(&out, f, i0)
+            bfind(&out, f, start)
         } {
+            let bytes = changed.get_or_insert_with(|| Vec::with_capacity(out.len()));
+            bytes.extend_from_slice(&out[start..p]);
+            bytes.extend_from_slice(r);
             *count += 1;
-            i0 = p + f.len();
+            start = p + f.len();
         }
-        out = if ci {
-            breplace_ci(&out, f, r)
-        } else {
-            breplace(&out, f, r)
-        };
+        if let Some(mut bytes) = changed {
+            bytes.extend_from_slice(&out[start..]);
+            out = Cow::Owned(bytes);
+        }
     }
     out
 }
@@ -1394,39 +1380,34 @@ fn str_replace(
     };
     let repl_scalar = !matches!(repl, Value::Array(_));
     let mut count = 0i64;
-    if let Value::Array(a) = subj {
-        // zend maps each element and sums replacements across the array.
+    let mut apply = |value: &Value| -> Result<Value, PhpError> {
+        let bytes = match value {
+            Value::Str(s) => Cow::Borrowed(s.as_ref()),
+            _ => Cow::Owned(it.conv_str(value)?.into_bytes()),
+        };
+        Ok(
+            match str_replace_one(&finds, &repls, repl_scalar, &bytes, ci, &mut count) {
+                Cow::Owned(bytes) => Value::bytes(bytes),
+                Cow::Borrowed(_) => match value {
+                    Value::Str(s) => Value::Str(s.clone()),
+                    _ => Value::bytes(bytes.into_owned()),
+                },
+            },
+        )
+    };
+    let result = if let Value::Array(a) = subj {
         let a = a.borrow();
         let mut out = PhpArray::default();
         for (k, c) in &a.entries {
-            let bytes = to_bytes(&c.borrow().clone())?;
-            out.set(
-                k.clone(),
-                Value::bytes(str_replace_one(
-                    &finds,
-                    &repls,
-                    repl_scalar,
-                    &bytes,
-                    ci,
-                    &mut count,
-                )),
-            );
+            out.set(k.clone(), apply(&c.borrow().clone())?);
         }
-        Ok((Value::Array(Rc::new(RefCell::new(out))), count))
+        Value::Array(Rc::new(RefCell::new(out)))
     } else {
-        Ok((
-            Value::bytes(str_replace_one(
-                &finds,
-                &repls,
-                repl_scalar,
-                &to_bytes(subj)?,
-                ci,
-                &mut count,
-            )),
-            count,
-        ))
-    }
+        apply(subj)?
+    };
+    Ok((result, count))
 }
+
 pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<Vec<u8>> {
     let n = s.len() as i64;
     let start = if start < 0 {

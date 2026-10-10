@@ -382,3 +382,53 @@ type-error
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn shared_string_replacement_preserves_bytes_counts_and_conversion_order() {
+    let (out, err, code) = eval(
+        "string-replace.php",
+        r#"<?php
+$s="fox\0DOG\xfffox"; $alias=$s;
+$r=str_replace('fox','wolf',$s,$count); echo bin2hex($r),' ',$count,' ',bin2hex($s),"\n";
+$r=str_ireplace(['FOX','dog'],['X','Y'],$s,$count); echo bin2hex($r),' ',$count,"\n";
+$r=str_replace(['ab','x'],['x',''],'abab',$count); var_dump($r,$count);
+$r=str_replace(['a','b'],['X'],['k'=>'ab',4=>'ba'],$count); var_dump($r,$count);
+$r=str_replace(['','absent'],['x','y'],$s,$count); echo bin2hex($r),' ',$count,' ',bin2hex($alias),"\n";
+$r=str_replace('aa','a','aaaaa',$count); var_dump($r,$count);
+$r=str_replace('o','O',$s,$s); echo bin2hex($r),' ',$s,"\n";
+class Text { public function __toString(): string { echo "cast\n"; return 'fox'; } }
+$r=str_replace(new Text(), new Text(), new Text(),$count); var_dump($r,$count);
+class BadText { public function __toString(): string { throw new Exception('cast-error'); } }
+$count=99;
+try { str_replace('x','y',new BadText(),$count); } catch(Throwable $e) { echo $e->getMessage()," ",$count,"\n"; }
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"776f6c6600444f47ff776f6c66 2 666f7800444f47ff666f78
+580059ff58 3
+string(0) ""
+int(4)
+array(2) {
+  ["k"]=>
+  string(1) "X"
+  [4]=>
+  string(1) "X"
+}
+int(4)
+666f7800444f47ff666f78 0 666f7800444f47ff666f78
+string(3) "aaa"
+int(2)
+664f7800444f47ff664f78 2
+cast
+cast
+cast
+string(3) "fox"
+int(1)
+cast-error 99
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
