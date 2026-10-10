@@ -265,7 +265,7 @@ struct Compiler {
 
 impl Compiled {
     /// Single-scalar type gate the ok-path proves with one `matches!`
-    /// (`?T`/union-null handled; `float` excluded — an Int arg widens,
+    /// (`?T`/union-null handled; an Int for `float` widens,
     /// which is the full path's job). `Some(f)` only proves pass —
     /// every miss still runs the canonical check.
     fn scalar_ty_gate(ty: &[String]) -> Option<ScalarGate> {
