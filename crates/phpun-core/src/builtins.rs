@@ -16,7 +16,7 @@ mod class;
 mod core;
 mod crypto;
 mod ctype;
-mod datetime;
+pub(crate) mod datetime;
 mod filter;
 pub(crate) mod fs;
 mod json;

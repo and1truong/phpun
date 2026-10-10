@@ -2487,28 +2487,93 @@ impl<'a> Interp<'a> {
             }
         }
         // DateTime: minimal native clock — the ctor stores the parsed
-        // timestamp so getTimestamp/diff can read it back
-        // (closure_call_internal).
+        // timestamp so getTimestamp/format/modify can read it back.
         if matches!(
             cls.name().to_lowercase().as_str(),
             "datetime" | "datetimeimmutable"
         ) {
+            let dt_ts = |o: &Rc<RefCell<PhpObject>>| -> i64 {
+                match o
+                    .borrow()
+                    .props
+                    .get("\0dt\0ts")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Int(0))
+                {
+                    Value::Int(t) => t,
+                    _ => 0,
+                }
+            };
+            // zend's malformed-string throw carries the native frame
+            // (`#0 DateTime->modify('bogus')`); push then pop around
+            // fail() so the snapshot captures it.
+            let dt_malformed = |it: &mut Interp, s: &str| -> Result<Value, PhpError> {
+                let first = s.chars().next().unwrap_or(' ');
+                it.call_trace.push(TraceFrame {
+                    file: it.diag_file(),
+                    line: it.send_line.unwrap_or(it.cur_line) as u32,
+                    function: name.to_string(),
+                    class: Some(cls.name().to_string()),
+                    ty: "->".into(),
+                    args: args.cells.clone(),
+                    named_args: args
+                        .named
+                        .iter()
+                        .map(|(n, c, ..)| (n.clone(), c.clone()))
+                        .collect(),
+                    internal: false,
+                    visible: true,
+                    named_dispatch: false,
+                    gen_resume: false,
+                    gen_body: false,
+                });
+                // ponytail: position is always 0 — the parse tracks no
+                // failing offset inside a partially-valid spec. The
+                // Cls::method(): prefix only rides modify; the ctor's
+                // message has none.
+                let prefix = if name.eq_ignore_ascii_case("modify") {
+                    format!("{}::{}(): ", cls.name(), name)
+                } else {
+                    String::new()
+                };
+                let r = it.fail(PhpError::uncaught(
+                    "DateMalformedStringException",
+                    format!(
+                        "{prefix}Failed to parse time string ({s}) at position 0 ({first}): The timezone could not be found in the database"
+                    ),
+                    0,
+                ));
+                it.call_trace.pop();
+                r
+            };
+            let immutable = cls.name().eq_ignore_ascii_case("datetimeimmutable");
             match name.to_lowercase().as_str() {
                 "__construct" => {
-                    let ts = match args
+                    let spec = args
                         .first()
                         .map(|c| c.borrow().clone())
-                        .unwrap_or(Value::Null)
-                    {
+                        .unwrap_or(Value::Null);
+                    let ts = match &spec {
                         Value::Str(s) => {
-                            let s = crate::value::lossy(&s);
+                            let s = crate::value::lossy(s);
                             match s.strip_prefix('@') {
                                 Some(num) => num.trim().parse::<i64>().unwrap_or(0),
-                                // Relative formats beyond '@N' are
-                                // stubs — treat as epoch for now.
-                                None => 0,
+                                None => {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0);
+                                    match crate::builtins::datetime::strtotime_parse(&s, now) {
+                                        Some(t) => t,
+                                        None => return dt_malformed(self, &s),
+                                    }
+                                }
                             }
                         }
+                        Value::Null => std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
                         _ => 0,
                     };
                     obj.borrow_mut()
@@ -2517,14 +2582,207 @@ impl<'a> Interp<'a> {
                     return Ok(Value::Null);
                 }
                 "gettimestamp" => {
-                    return Ok(obj
-                        .borrow()
-                        .props
-                        .get("\0dt\0ts")
+                    return Ok(Value::Int(dt_ts(&obj)));
+                }
+                "format" => {
+                    let fmt = match args
+                        .first()
                         .map(|c| c.borrow().clone())
-                        .unwrap_or(Value::Int(0)));
+                        .unwrap_or(Value::Null)
+                    {
+                        Value::Str(s) => crate::value::lossy(&s).to_string(),
+                        _ => String::new(),
+                    };
+                    return Ok(Value::str(crate::builtins::datetime::date_format(
+                        &fmt,
+                        dt_ts(&obj),
+                    )));
+                }
+                "modify" => {
+                    let spec = match args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null)
+                    {
+                        Value::Str(s) => crate::value::lossy(&s).to_string(),
+                        _ => String::new(),
+                    };
+                    match crate::builtins::datetime::strtotime_parse(&spec, dt_ts(&obj)) {
+                        Some(ts) => return self.dt_store(&obj, ts, immutable),
+                        None => return dt_malformed(self, &spec),
+                    }
+                }
+                "diff" => {
+                    let other = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .and_then(|v| match v {
+                            Value::Object(o) => Some(dt_ts(&o)),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let a = dt_ts(&obj);
+                    let (lo, hi) = if a <= other { (a, other) } else { (other, a) };
+                    let ld = lo.div_euclid(86400);
+                    let (ly, lm, ldd) = crate::builtins::datetime::civil_from_days(ld);
+                    let hd = hi.div_euclid(86400);
+                    // Months such that lo+months stays <= hi — zend's
+                    // y/m decomposition is calendar-aware, not /30.
+                    let (hy, hm, _) = crate::builtins::datetime::civil_from_days(hd);
+                    let mut months = (hy - ly) * 12 + hm - lm;
+                    let lsecs = lo.rem_euclid(86400);
+                    // days_from_civil wants m in [1,12] — fold the
+                    // accumulated months into the year first.
+                    let probe_day = |mo: i64| {
+                        let t = lm - 1 + mo;
+                        crate::builtins::datetime::days_from_civil(
+                            ly + t.div_euclid(12),
+                            t.rem_euclid(12) + 1,
+                            ldd,
+                        )
+                    };
+                    let mut d_rem = hd - probe_day(months);
+                    if d_rem < 0 {
+                        months -= 1;
+                        d_rem = hd - probe_day(months);
+                    }
+                    let mut s_rem = hi.rem_euclid(86400) - lsecs;
+                    if s_rem < 0 {
+                        s_rem += 86400;
+                        d_rem -= 1;
+                    }
+                    let fields: Vec<(&str, i64)> = vec![
+                        ("y", months.div_euclid(12)),
+                        ("m", months.rem_euclid(12)),
+                        ("d", d_rem),
+                        ("h", s_rem / 3600),
+                        ("i", s_rem % 3600 / 60),
+                        ("s", s_rem % 60),
+                        ("f", 0),
+                        ("invert", if other < a { 1 } else { 0 }),
+                        ("days", (other - a).abs() / 86400),
+                    ];
+                    return Ok(self.make_date_interval(fields));
+                }
+                "add" | "sub" => {
+                    let sign = if name.eq_ignore_ascii_case("add") {
+                        1
+                    } else {
+                        -1
+                    };
+                    let (mo, dy, sc) = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .and_then(|v| match v {
+                            Value::Object(io) => {
+                                let get = |k: &str| match io
+                                    .borrow()
+                                    .props
+                                    .get(&format!("\0di\0{}", k))
+                                    .map(|c| c.borrow().clone())
+                                    .unwrap_or(Value::Int(0))
+                                {
+                                    Value::Int(n) => n,
+                                    _ => 0,
+                                };
+                                Some((get("months"), get("days"), get("secs")))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or((0, 0, 0));
+                    let cur = dt_ts(&obj);
+                    let days = cur.div_euclid(86400);
+                    let (y, m, d) = crate::builtins::datetime::civil_from_days(days);
+                    let nd =
+                        crate::builtins::datetime::days_from_civil(y, m + mo * sign, d) + dy * sign;
+                    let ts = nd * 86400 + cur.rem_euclid(86400) + sc * sign;
+                    return self.dt_store(&obj, ts, immutable);
                 }
                 _ => {}
+            }
+        }
+        // DateInterval: the ctor parses `P[nY][nM][nW][nD][T[nH][nM][nS]]`
+        // into public fields + the derived  di  slots add/sub read.
+        if cls.name().eq_ignore_ascii_case("dateinterval") && name.eq_ignore_ascii_case("format") {
+            let fmt = match args
+                .first()
+                .map(|c| c.borrow().clone())
+                .unwrap_or(Value::Null)
+            {
+                Value::Str(s) => crate::value::lossy(&s).to_string(),
+                _ => String::new(),
+            };
+            return Ok(Value::str(dt_interval_format(&obj, &fmt)));
+        }
+        if cls.name().eq_ignore_ascii_case("dateinterval")
+            && name.eq_ignore_ascii_case("__construct")
+        {
+            let spec = match args
+                .first()
+                .map(|c| c.borrow().clone())
+                .unwrap_or(Value::Null)
+            {
+                Value::Str(s) => crate::value::lossy(&s).to_string(),
+                _ => String::new(),
+            };
+            match parse_date_interval(&spec) {
+                Some((y, mo, d, h, mi, se)) => {
+                    let mut ob = obj.borrow_mut();
+                    for (k, v) in [
+                        ("y", y),
+                        ("m", mo),
+                        ("d", d),
+                        ("h", h),
+                        ("i", mi),
+                        ("s", se),
+                    ] {
+                        ob.props.insert(k.into(), cell(Value::Int(v)));
+                        ob.prop_order.push(k.into());
+                    }
+                    for (k, v) in [
+                        ("f", Value::Int(0)),
+                        ("invert", Value::Int(0)),
+                        ("days", Value::Bool(false)),
+                    ] {
+                        ob.props.insert(k.into(), cell(v));
+                        ob.prop_order.push(k.into());
+                    }
+                    ob.props
+                        .insert("\0di\0months".into(), cell(Value::Int(y * 12 + mo)));
+                    ob.props.insert("\0di\0days".into(), cell(Value::Int(d)));
+                    ob.props.insert(
+                        "\0di\0secs".into(),
+                        cell(Value::Int(h * 3600 + mi * 60 + se)),
+                    );
+                    return Ok(Value::Null);
+                }
+                None => {
+                    self.call_trace.push(TraceFrame {
+                        file: self.diag_file(),
+                        line: self.send_line.unwrap_or(self.cur_line) as u32,
+                        function: name.to_string(),
+                        class: Some(cls.name().to_string()),
+                        ty: "->".into(),
+                        args: args.cells.clone(),
+                        named_args: args
+                            .named
+                            .iter()
+                            .map(|(n, c, ..)| (n.clone(), c.clone()))
+                            .collect(),
+                        internal: false,
+                        visible: true,
+                        named_dispatch: false,
+                        gen_resume: false,
+                        gen_body: false,
+                    });
+                    let r = self.fail(PhpError::uncaught(
+                        "DateMalformedIntervalStringException",
+                        format!("Unknown or bad format ({spec})"),
+                        0,
+                    ));
+                    self.call_trace.pop();
+                    return r;
+                }
             }
         }
         // ArrayIterator / ArrayObject: native storage state on the
@@ -2800,6 +3058,66 @@ impl<'a> Interp<'a> {
             end_line: args.end_line,
             verbatim_elems: args.verbatim_elems,
         })
+    }
+
+    /// Build a DateInterval object from computed fields — used by
+    /// diff(), which yields a real interval, not a spec-parsed one.
+    fn make_date_interval(&mut self, fields: Vec<(&str, i64)>) -> Value {
+        let Some(dc) = self.classes.get("dateinterval").cloned() else {
+            return Value::Null;
+        };
+        let mut props = HashMap::new();
+        let mut order = Vec::new();
+        let (mut mo, mut dy, mut sc) = (0i64, 0i64, 0i64);
+        for (k, v) in &fields {
+            props.insert((*k).to_string(), cell(Value::Int(*v)));
+            order.push((*k).to_string());
+            match *k {
+                "y" => mo += v * 12,
+                "m" => mo += v,
+                "d" => dy += v,
+                "h" => sc += v * 3600,
+                "i" => sc += v * 60,
+                "s" => sc += v,
+                _ => {}
+            }
+        }
+        props.insert("\0di\0months".into(), cell(Value::Int(mo)));
+        props.insert("\0di\0days".into(), cell(Value::Int(dy)));
+        props.insert("\0di\0secs".into(), cell(Value::Int(sc)));
+        Value::Object(self.alloc_obj(PhpObject {
+            class: dc,
+            props,
+            prop_order: order,
+            id: 0,
+            internal: None,
+            unset_props: std::collections::HashSet::new(),
+        }))
+    }
+
+    /// Store a DateTime result: DateTime mutates in place and returns
+    /// $this; DateTimeImmutable returns a cloned object carrying the
+    /// new timestamp.
+    fn dt_store(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        ts: i64,
+        immutable: bool,
+    ) -> Result<Value, PhpError> {
+        if immutable {
+            let nv = self.clone_object(obj)?;
+            if let Value::Object(no) = &nv {
+                no.borrow_mut()
+                    .props
+                    .insert("\0dt\0ts".into(), cell(Value::Int(ts)));
+            }
+            Ok(nv)
+        } else {
+            obj.borrow_mut()
+                .props
+                .insert("\0dt\0ts".into(), cell(Value::Int(ts)));
+            Ok(Value::Object(obj.clone()))
+        }
     }
 
     /// Native implementations of Throwable methods. Internal calls
@@ -3552,4 +3870,117 @@ fn tz_name_ok(s: &str) -> bool {
         .is_some_and(|c| CONTINENTS.iter().any(|k| c.eq_ignore_ascii_case(k)))
         && s.contains('/')
         && !s.ends_with('/')
+}
+
+/// ISO-8601 duration spec: `P[nY][nM][nW][nD][T[nH][nM][nS]]` —
+/// returns (years, months, days, hours, minutes, seconds).
+fn parse_date_interval(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    if b.get(i) != Some(&b'P') {
+        return None;
+    }
+    i += 1;
+    let num = |i: &mut usize| -> Option<i64> {
+        let st = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i == st {
+            return None;
+        }
+        std::str::from_utf8(&b[st..*i]).ok()?.parse().ok()
+    };
+    let mut out = (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+    let mut any = false;
+    while i < b.len() && b[i] != b'T' {
+        let n = num(&mut i)?;
+        match *b.get(i)? {
+            b'Y' => out.0 = n,
+            b'M' => out.1 = n,
+            b'W' => out.2 += n * 7,
+            b'D' => out.2 += n,
+            _ => return None,
+        }
+        i += 1;
+        any = true;
+    }
+    if i < b.len() && b[i] == b'T' {
+        i += 1;
+        while i < b.len() {
+            let n = num(&mut i)?;
+            match *b.get(i)? {
+                b'H' => out.3 = n,
+                b'M' => out.4 = n,
+                b'S' => out.5 = n,
+                _ => return None,
+            }
+            i += 1;
+            any = true;
+        }
+    }
+    (any && i == b.len()).then_some(out)
+}
+
+/// DateInterval::format — `%`-letter substitution over the interval's
+/// public fields. Lowercase letters print raw ints; uppercase adds
+/// the sign (empty when positive) and pads to 2. `%a` is `(unknown)`
+/// on spec-built intervals (days === false), the total on diff'd ones.
+fn dt_interval_format(obj: &Rc<RefCell<PhpObject>>, fmt: &str) -> String {
+    let f = |k: &str| -> Value {
+        obj.borrow()
+            .props
+            .get(k)
+            .map(|c| c.borrow().clone())
+            .unwrap_or(Value::Int(0))
+    };
+    let fi = |k: &str| -> i64 {
+        match f(k) {
+            Value::Int(n) => n,
+            _ => 0,
+        }
+    };
+    let neg = fi("invert") != 0;
+    let sp2 = |n: i64| format!("{}{:02}", if neg { "-" } else { "" }, n.abs());
+    let mut out = String::new();
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('a') => match f("days") {
+                Value::Int(n) => out.push_str(&n.to_string()),
+                _ => out.push_str("(unknown)"),
+            },
+            Some('d') => out.push_str(&fi("d").to_string()),
+            Some('D') => out.push_str(&sp2(fi("d"))),
+            Some('m') => out.push_str(&fi("m").to_string()),
+            Some('M') => out.push_str(&sp2(fi("m"))),
+            Some('y') => out.push_str(&fi("y").to_string()),
+            Some('Y') => out.push_str(&sp2(fi("y"))),
+            Some('h') => out.push_str(&fi("h").to_string()),
+            Some('H') => out.push_str(&sp2(fi("h"))),
+            Some('i') => out.push_str(&fi("i").to_string()),
+            Some('I') => out.push_str(&sp2(fi("i"))),
+            Some('s') => out.push_str(&fi("s").to_string()),
+            Some('S') => out.push_str(&sp2(fi("s"))),
+            Some('f') => out.push_str(&fi("f").to_string()),
+            Some('F') => out.push_str(&format!("{:06}", fi("f").abs())),
+            Some('r') => {
+                if neg {
+                    out.push('-');
+                }
+            }
+            Some('R') => out.push_str(if neg { "-" } else { "+" }),
+            Some('%') => out.push('%'),
+            Some(c) => {
+                out.push('%');
+                out.push(c);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }

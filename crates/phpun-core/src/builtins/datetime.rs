@@ -114,7 +114,7 @@ pub(crate) fn dispatch(
 
 // ----- helpers -----
 
-pub(in crate::builtins) fn date_format(fmt: &str, ts: i64) -> String {
+pub(crate) fn date_format(fmt: &str, ts: i64) -> String {
     // minimal strftime-ish for the common tokens
     let days = ts.div_euclid(86400);
     let secs = ts.rem_euclid(86400);
@@ -243,7 +243,7 @@ fn is_leap(y: i64) -> bool {
 }
 
 /// Howard Hinnant's civil calendar math.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -253,7 +253,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;
@@ -541,7 +541,7 @@ fn year_2dig(n: i64) -> i64 {
 
 /// Parse `s` as a relative/absolute date-time per Zend's strtotime.
 /// Returns the resulting Unix timestamp, or None (PHP false).
-fn strtotime_parse(s: &str, base: i64) -> Option<i64> {
+pub(crate) fn strtotime_parse(s: &str, base: i64) -> Option<i64> {
     let toks = strto_toks(s.as_bytes());
     if toks.is_empty() {
         // "" → false, but whitespace/empty-token-only → base unchanged
