@@ -380,14 +380,12 @@ fn json_enc(
             if lvl * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH.into());
             }
-            if lvl > cx.max {
-                // zend ignores the depth cap under PARTIAL — encodes the
-                // whole shape and still records err=1.
-                if cx.esc.flags & F_PARTIAL != 0 {
-                    cx.err = J_DEPTH;
-                } else {
-                    return Err(J_DEPTH.into());
-                }
+            // zend depth-checks AFTER encoding children: under PARTIAL
+            // the cap is ignored and every over-depth frame writes err=1
+            // on unwind, so err1 always wins over deeper errors.
+            let over = lvl > cx.max;
+            if over && cx.esc.flags & F_PARTIAL == 0 {
+                return Err(J_DEPTH.into());
             }
             let key = Rc::as_ptr(a) as usize;
             if it.json_enc_stack.contains(&key) {
@@ -396,6 +394,9 @@ fn json_enc(
             it.json_enc_stack.push(key);
             let r = json_arr(it, a, cx, out, lvl);
             it.json_enc_stack.pop();
+            if over {
+                cx.err = J_DEPTH;
+            }
             return r;
         }
         Value::Object(o) => {
@@ -403,12 +404,9 @@ fn json_enc(
             if lvl * LEVEL_BYTES > cx.lim {
                 return Err(J_DEPTH.into());
             }
-            if lvl > cx.max {
-                if cx.esc.flags & F_PARTIAL != 0 {
-                    cx.err = J_DEPTH;
-                } else {
-                    return Err(J_DEPTH.into());
-                }
+            let over = lvl > cx.max;
+            if over && cx.esc.flags & F_PARTIAL == 0 {
+                return Err(J_DEPTH.into());
             }
             let key = Rc::as_ptr(o) as usize;
             if it.json_enc_stack.contains(&key) {
@@ -437,6 +435,9 @@ fn json_enc(
                 json_obj(it, o, cx, out, lvl)
             };
             it.json_enc_stack.pop();
+            if over {
+                cx.err = J_DEPTH;
+            }
             return r;
         }
         Value::Callable(_) => out.push_str("{}"),
