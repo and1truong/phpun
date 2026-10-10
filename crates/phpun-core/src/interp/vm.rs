@@ -1624,10 +1624,7 @@ impl<'a> Interp<'a> {
                 "||" => Value::Bool(rv.is_truthy()),
                 "." => {
                     let grow = matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
-                    let mut ls = self.conv_bytes(&lv)?;
-                    let rs = self.conv_bytes(&rv)?;
-                    ls.extend_from_slice(&rs);
-                    let nv = Value::bytes(ls);
+                    let nv = self.concat_bytes(&lv, &rv)?;
                     if let Value::Str(s) = &nv {
                         match &lv {
                             Value::Str(os) if grow => {

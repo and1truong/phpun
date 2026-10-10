@@ -678,3 +678,46 @@ default 12
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn borrowed_concat_preserves_bytes_aliases_and_conversion_order() {
+    let (out, err, code) = eval(
+        "concat.php",
+        r#"<?php
+function joined($a, $b) { return $a . $b; }
+$s = "\xff\0a"; $alias = $s; $s .= "\0b";
+echo bin2hex($s), ' ', bin2hex($alias), ' ', bin2hex(joined($alias, "\xfe")), "\n";
+$a = 'A'; $a .= ($a = 'B'); echo "$a\n";
+$b = 'A'; echo $b . ($b = 'B'), "\n";
+class Piece {
+    function __construct(private string $name, private bool $throw = false) {}
+    function __toString() { echo "cast $this->name\n"; if ($this->throw) throw new Exception($this->name); return $this->name; }
+}
+echo joined(new Piece('L'), new Piece('R')), "\n";
+try { joined(new Piece('stop', true), new Piece('never')); } catch (Exception $e) { echo $e->getMessage(), "\n"; }
+set_error_handler(function ($n, $m) { echo "$m\n"; return true; });
+echo joined([], 7), "\n";
+restore_error_handler();
+var_dump(joined(null, false), joined(true, 2.5));
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"ff00610062 ff0061 ff0061fe
+BB
+BB
+cast L
+cast R
+LR
+cast stop
+stop
+Array to string conversion
+Array7
+string(0) ""
+string(4) "12.5"
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
