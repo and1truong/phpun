@@ -455,8 +455,47 @@ fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>)
                 inc.iter().for_each(|e| collect_assigned_e(e, out));
                 collect_assigned(body, out);
             }
+            Stmt::Foreach {
+                arr,
+                key,
+                val,
+                body,
+            } => {
+                collect_assigned_e(arr, out);
+                if let Some(crate::ast::ForeachKey::Var(name)) = key {
+                    out.insert(name.clone());
+                }
+                collect_assigned_foreach(val, out);
+                collect_assigned(body, out);
+            }
             Stmt::Block(b) => collect_assigned(b, out),
             _ => {}
+        }
+    }
+}
+
+fn collect_assigned_foreach(
+    target: &crate::ast::ForeachTarget,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::ForeachTarget;
+    match target {
+        ForeachTarget::Var(name) => {
+            out.insert(name.clone());
+        }
+        ForeachTarget::ByRef(e) | ForeachTarget::Lvalue(e) => {
+            if let Expr::Var(name) = &**e {
+                out.insert(name.clone());
+            }
+            collect_assigned_e(e, out);
+        }
+        ForeachTarget::List(items) => {
+            for (key, target) in items.iter().flatten() {
+                if let Some(key) = key {
+                    collect_assigned_e(key, out);
+                }
+                collect_assigned_foreach(target, out);
+            }
         }
     }
 }

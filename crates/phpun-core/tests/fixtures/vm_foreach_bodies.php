@@ -50,3 +50,15 @@ function early_return() {
 $value = early_return();
 echo 'returned:', $value->n, "\n";
 unset($value);
+function foreach_read_order() {
+    foreach (['A' => 'A'] as $key => $v) {
+        echo $v . ($v = 'B'), ':', $key . ($key = 'C'), "\n";
+        echo $local . ($local = 'D'), "\n";
+    }
+    $a = ['A'];
+    foreach ($a as &$ref) { echo $ref . ($ref = 'E'), "\n"; }
+    unset($ref);
+    foreach ([['A']] as [$item]) { echo $item . ($item = 'F'), "\n"; }
+    echo $a[0], "\n";
+}
+foreach_read_order();
