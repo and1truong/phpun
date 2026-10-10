@@ -153,6 +153,13 @@ enum Op {
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
     Canonical(Box<Expr>),
+    CanonicalStmt {
+        stmt: Box<Stmt>,
+        depth: u32,
+        normal: usize,
+        breaks: Vec<usize>,
+        continues: Vec<usize>,
+    },
     Load(u16),
     /// Store top-of-stack into a slot, KEEPING it on the stack
     /// (an assignment is an expression).
@@ -285,6 +292,9 @@ impl Compiled {
         if decl.by_ref {
             return Err("reference-return");
         }
+        if Interp::decl_contains_yield(&decl.body) {
+            return Err("generator");
+        }
         let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
         let mut bind_free = !needs_bind
             && decl.ret.is_none()
@@ -338,7 +348,10 @@ impl Compiled {
                 }
             })
             .collect();
-        let hybrid = c.ops.iter().any(|op| matches!(op, Op::Canonical(_)));
+        let hybrid = c
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Canonical(_) | Op::CanonicalStmt { .. }));
         Ok(Rc::new(Compiled {
             hybrid,
             nslots: c.slots.len(),
@@ -608,19 +621,57 @@ impl Compiler {
                     self.patch(jf, end);
                 }
             }
-            Stmt::Break(n) => {
-                if !matches!(n, None | Some(Expr::Int(1))) {
-                    return None; // `break N` past the innermost loop
+            Stmt::Break(level) | Stmt::Continue(level) => {
+                let level = match level {
+                    None => 1,
+                    Some(Expr::Int(n)) if *n > 0 => *n as usize,
+                    _ => return None,
+                };
+                let target = self.loops.len().checked_sub(level)?;
+                let jump = self.emit(Op::Jump(usize::MAX));
+                if matches!(s, Stmt::Break(_)) {
+                    self.loops[target].0.push(jump);
+                } else {
+                    self.loops[target].1.push(jump);
                 }
-                let j = self.emit(Op::Jump(usize::MAX));
-                self.loops.last_mut()?.0.push(j);
             }
-            Stmt::Continue(n) => {
-                if !matches!(n, None | Some(Expr::Int(1))) {
-                    return None;
+            Stmt::Foreach { .. }
+            | Stmt::Switch { .. }
+            | Stmt::Try { .. }
+            | Stmt::Global(_)
+            | Stmt::Static { .. }
+            | Stmt::Unset(_) => {
+                // Reuse canonical iterator/unwind/scope machinery while the
+                // surrounding bytecode loops retain their own jump targets.
+                let at = self.emit(Op::CanonicalStmt {
+                    stmt: Box::new(s.clone()),
+                    depth: self.loops.len() as u32,
+                    normal: usize::MAX,
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
+                let mut breaks = Vec::new();
+                let mut continues = Vec::new();
+                for index in (0..self.loops.len()).rev() {
+                    let jump = self.emit(Op::Jump(usize::MAX));
+                    self.loops[index].0.push(jump);
+                    breaks.push(jump);
+                    let jump = self.emit(Op::Jump(usize::MAX));
+                    self.loops[index].1.push(jump);
+                    continues.push(jump);
                 }
-                let j = self.emit(Op::Jump(usize::MAX));
-                self.loops.last_mut()?.1.push(j);
+                let normal = self.ops.len();
+                if let Op::CanonicalStmt {
+                    normal: n,
+                    breaks: b,
+                    continues: c,
+                    ..
+                } = &mut self.ops[at]
+                {
+                    *n = normal;
+                    *b = breaks;
+                    *c = continues;
+                }
             }
             _ => return None,
         }
@@ -1377,6 +1428,34 @@ impl<'a> Interp<'a> {
                     let result = self.eval(expr);
                     self.vm_refresh(comp, slots);
                     vs.push(result?);
+                }
+                Op::CanonicalStmt {
+                    stmt,
+                    depth,
+                    normal,
+                    breaks,
+                    continues,
+                } => {
+                    self.vm_materialize(comp, slots);
+                    let previous_depth = std::mem::replace(&mut self.loop_depth, *depth);
+                    let flow = self.exec(stmt);
+                    self.loop_depth = previous_depth;
+                    self.vm_refresh(comp, slots);
+                    pc = match flow {
+                        Flow::Normal => *normal,
+                        Flow::Break(level) => match breaks.get(level.saturating_sub(1) as usize) {
+                            Some(target) => *target,
+                            None => return Ok(Flow::Break(level)),
+                        },
+                        Flow::Continue(level) => {
+                            match continues.get(level.saturating_sub(1) as usize) {
+                                Some(target) => *target,
+                                None => return Ok(Flow::Continue(level)),
+                            }
+                        }
+                        other => return Ok(other),
+                    };
+                    continue;
                 }
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
                 Op::Store(s) => match &mut slots[*s as usize] {

@@ -225,7 +225,7 @@ impl<'a> Interp<'a> {
         f
     }
 
-    fn exec(&mut self, s: &Stmt) -> Flow {
+    pub(in crate::interp) fn exec(&mut self, s: &Stmt) -> Flow {
         match s {
             Stmt::Line(l) => {
                 self.cur_line = *l;
