@@ -54,7 +54,7 @@ impl<'a> Interp<'a> {
             gen_body: false,
         });
         let inc_pop = |it: &mut Interp| {
-            it.call_trace.pop();
+            it.trace_pop();
         };
         // Resolution: include_path entries (`.` = cwd), then the calling
         // file's dir, then cwd (PHP's stream search order).
@@ -515,7 +515,7 @@ impl<'a> Interp<'a> {
                     }
                     f => f,
                 };
-                self.call_trace.pop();
+                self.trace_pop();
                 self.cur_line = saved_line;
                 self.cur_file = saved_file;
                 if let Some(old) = saved_frame_file {
@@ -576,7 +576,7 @@ impl<'a> Interp<'a> {
                     if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
                         e.trace = Some(self.compile_err_frames());
                     }
-                    self.call_trace.pop();
+                    self.trace_pop();
                     self.print_fatal(&e);
                     return Err(PhpError {
                         trace: None,

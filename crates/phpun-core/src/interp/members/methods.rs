@@ -51,7 +51,7 @@ impl<'a> Interp<'a> {
             gen_body: false,
         });
         let r = self.array_iter_body(obj, name, args);
-        self.call_trace.pop();
+        self.trace_pop();
         r
     }
 
@@ -751,16 +751,16 @@ impl<'a> Interp<'a> {
                 if deep {
                     let e =
                         self.spl_throw("Error", "Nesting level too deep - recursive dependency?");
-                    self.call_trace.pop();
+                    self.trace_pop();
                     nr?;
                     return self.fail(e);
                 }
                 if let Some(e) = conv_err {
-                    self.call_trace.pop();
+                    self.trace_pop();
                     nr?;
                     return self.fail(e);
                 }
-                self.call_trace.pop();
+                self.trace_pop();
                 nr?;
                 Value::Bool(true)
             }
@@ -813,11 +813,11 @@ impl<'a> Interp<'a> {
                 arr.borrow_mut().entries = sorted;
                 let nr = self.emit_cmp_notices();
                 if let Some(e) = cb_err {
-                    self.call_trace.pop();
+                    self.trace_pop();
                     nr?;
                     return self.fail(e);
                 }
-                self.call_trace.pop();
+                self.trace_pop();
                 nr?;
                 Value::Bool(true)
             }
@@ -2398,7 +2398,7 @@ impl<'a> Interp<'a> {
                     gen_body: false,
                 });
                 let r = self.reflection_method(&obj, name, &args);
-                self.call_trace.pop();
+                self.trace_pop();
                 if let Some(v) = r? {
                     return Ok(v);
                 }
@@ -2934,7 +2934,7 @@ impl<'a> Interp<'a> {
             gen_body: false,
         });
         let bound = self.ctor_zpp_bind(&dc, &m, args, &defaults)?;
-        self.call_trace.pop();
+        self.trace_pop();
         // zend 8.5 deprecates the one-positional-arg ReflectionMethod
         // ctor form (the named form is exempt).
         if dc.name().eq_ignore_ascii_case("reflectionmethod")
@@ -3174,7 +3174,7 @@ impl<'a> Interp<'a> {
             gen_body: false,
         });
         let r = self.throwable_method_inner(obj, name, args, ctor_bound);
-        self.call_trace.pop();
+        self.trace_pop();
         r
     }
 
