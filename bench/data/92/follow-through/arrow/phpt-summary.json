@@ -1,0 +1,72 @@
+{
+  "baseline": "dd99cac1c27910b331ff7cdeace545777ea3ea73",
+  "candidate": "ecc31840a03b453e553e83dd0b014c12716742cd",
+  "core": {
+    "total": 1467,
+    "before": {
+      "total": 1467,
+      "passed": 1341,
+      "failed": 97,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 14,
+      "unsupported": 15,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 1438,
+      "compatibility_pct": 93.25
+    },
+    "after": {
+      "total": 1467,
+      "passed": 1341,
+      "failed": 97,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 14,
+      "unsupported": 15,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 1438,
+      "compatibility_pct": 93.25
+    },
+    "status_changes": []
+  },
+  "closures_and_arrows": {
+    "total": 144,
+    "before": {
+      "total": 144,
+      "passed": 120,
+      "failed": 20,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 0,
+      "unsupported": 4,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 140,
+      "compatibility_pct": 85.71
+    },
+    "after": {
+      "total": 144,
+      "passed": 122,
+      "failed": 18,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 0,
+      "unsupported": 4,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 140,
+      "compatibility_pct": 87.14
+    },
+    "fixed": [
+      "Zend/tests/arrow_functions/003.phpt",
+      "Zend/tests/arrow_functions/005.phpt"
+    ],
+    "new_failures": []
+  }
+}
