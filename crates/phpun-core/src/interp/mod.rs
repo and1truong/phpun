@@ -1791,6 +1791,10 @@ impl<'a> Interp<'a> {
             tentative: {
                 let mut t = HashSet::new();
                 t.insert(("datetimezone".into(), "listidentifiers".into()));
+                // SPL heap/PQ compare carries a tentative return type —
+                // untyped overrides warn instead of fataling.
+                t.insert(("splpriorityqueue".into(), "compare".into()));
+                t.insert(("splheap".into(), "compare".into()));
                 // php_user_filter's methods carry tentative return
                 // types — overrides without matching types warn
                 // (ReturnTypeWillChange suppresses).
@@ -8545,6 +8549,10 @@ impl<'a> Interp<'a> {
             "RecursiveIteratorIterator",
             "AppendIterator",
             "RegexIterator",
+            "SplPriorityQueue",
+            "SplHeap",
+            "SplMaxHeap",
+            "SplMinHeap",
         ];
         SPL_PRELUDE_CLASSES.iter().any(|n| self.is_a(cls, n))
     }
@@ -8727,6 +8735,127 @@ class RegexIterator extends FilterIterator {
     public function getPregFlags() { return $this->pregFlags; }
     public function setPregFlags($flags) { $this->pregFlags = $flags; }
     public function getRegex() { return $this->regex; }
+}
+class SplPriorityQueue implements Iterator, Countable {
+    public const EXTR_DATA = 1;
+    public const EXTR_PRIORITY = 2;
+    public const EXTR_BOTH = 3;
+    private $flags = self::EXTR_DATA;
+    private $heap = [];
+    public function insert($data, $priority) {
+        $h = &$this->heap;
+        $h[] = [$data, $priority];
+        for ($i = count($h) - 1; $i > 0;) {
+            $p = ($i - 1) >> 1;
+            if ($this->compare($h[$i][1], $h[$p][1]) > 0) {
+                $t = $h[$i]; $h[$i] = $h[$p]; $h[$p] = $t;
+                $i = $p;
+            } else { break; }
+        }
+        return true;
+    }
+    public function extract() {
+        $h = &$this->heap;
+        if (!$h) { throw new RuntimeException("Can't extract from an empty heap"); }
+        $top = $h[0];
+        $n = count($h) - 1;
+        $h[0] = $h[$n];
+        unset($h[$n]);
+        for ($i = 0, $n = count($h);;) {
+            $l = 2 * $i + 1;
+            if ($l >= $n) { break; }
+            $r = $l + 1;
+            $c = ($r < $n && $this->compare($h[$r][1], $h[$l][1]) > 0) ? $r : $l;
+            if ($this->compare($h[$c][1], $h[$i][1]) > 0) {
+                $t = $h[$i]; $h[$i] = $h[$c]; $h[$c] = $t;
+                $i = $c;
+            } else { break; }
+        }
+        return $this->fmt($top);
+    }
+    public function top() {
+        if (!$this->heap) { throw new RuntimeException("Can't peek at an empty heap"); }
+        return $this->fmt($this->heap[0]);
+    }
+    public function count(): int { return count($this->heap); }
+    public function isEmpty(): bool { return count($this->heap) === 0; }
+    public function setExtractFlags($flags) { $this->flags = $flags; }
+    public function getExtractFlags(): int { return $this->flags; }
+    public function compare(mixed $priority1, mixed $priority2): int {
+        return $priority1 <=> $priority2;
+    }
+    private function fmt($e) {
+        switch ($this->flags) {
+            case self::EXTR_PRIORITY: return $e[1];
+            case self::EXTR_BOTH: return ["data" => $e[0], "priority" => $e[1]];
+            default: return $e[0];
+        }
+    }
+    // zend's heap iterator drains: current() = top-formatted,
+    // next() = extract, key() = remaining-1, rewind() no-op.
+    public function rewind() {}
+    public function valid(): bool { return count($this->heap) > 0; }
+    public function current() { return $this->top(); }
+    public function key() { return count($this->heap) - 1; }
+    public function next() { $this->extract(); }
+}
+abstract class SplHeap implements Iterator, Countable {
+    private $heap = [];
+    abstract protected function compare(mixed $value1, mixed $value2): int;
+    public function insert($value) {
+        $h = &$this->heap;
+        $h[] = $value;
+        for ($i = count($h) - 1; $i > 0;) {
+            $p = ($i - 1) >> 1;
+            if ($this->compare($h[$i], $h[$p]) > 0) {
+                $t = $h[$i]; $h[$i] = $h[$p]; $h[$p] = $t;
+                $i = $p;
+            } else { break; }
+        }
+        return true;
+    }
+    public function extract() {
+        $h = &$this->heap;
+        if (!$h) { throw new RuntimeException("Can't extract from an empty heap"); }
+        $top = $h[0];
+        $n = count($h) - 1;
+        $h[0] = $h[$n];
+        unset($h[$n]);
+        for ($i = 0, $n = count($h);;) {
+            $l = 2 * $i + 1;
+            if ($l >= $n) { break; }
+            $r = $l + 1;
+            $c = ($r < $n && $this->compare($h[$r], $h[$l]) > 0) ? $r : $l;
+            if ($this->compare($h[$c], $h[$i]) > 0) {
+                $t = $h[$i]; $h[$i] = $h[$c]; $h[$c] = $t;
+                $i = $c;
+            } else { break; }
+        }
+        return $top;
+    }
+    public function top() {
+        if (!$this->heap) { throw new RuntimeException("Can't peek at an empty heap"); }
+        return $this->heap[0];
+    }
+    public function count(): int { return count($this->heap); }
+    public function isEmpty(): bool { return count($this->heap) === 0; }
+    public function isCorrupted(): bool { return false; }
+    public function recoverFromCorruption(): bool { return true; }
+    public function rewind() {}
+    public function valid(): bool { return count($this->heap) > 0; }
+    public function current() { return $this->top(); }
+    public function key() { return count($this->heap) - 1; }
+    public function next() { $this->extract(); }
+}
+class SplMaxHeap extends SplHeap {
+    protected function compare(mixed $value1, mixed $value2): int {
+        return $value1 <=> $value2;
+    }
+}
+class SplMinHeap extends SplHeap {
+    protected function compare(mixed $value1, mixed $value2): int {
+        return $value2 <=> $value1;
+    }
 }
 class RecursiveIteratorIterator implements OuterIterator {
     const LEAVES_ONLY = 0;
