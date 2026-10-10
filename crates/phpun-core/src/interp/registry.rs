@@ -1142,6 +1142,13 @@ impl<'a> Interp<'a> {
                     stub_method("add", &["interval"]),
                     stub_method("sub", &["interval"]),
                     stub_method("diff", &["targetObject"]),
+                    stub_method("setTimestamp", &["timestamp"]),
+                    stub_method("setDate", &["year", "month", "day"]),
+                    stub_method("setTime", &["hour", "minute", "second", "microsecond"]),
+                    stub_method("setISODate", &["year", "week", "dayOfWeek"]),
+                    stub_method("setTimezone", &["timezone"]),
+                    stub_method("createFromInterface", &["object"]),
+                    stub_method("createFromImmutable", &["object"]),
                 ],
                 props: vec![],
                 consts: [
@@ -1308,6 +1315,7 @@ impl<'a> Interp<'a> {
                         visibility: Visibility::Public,
                         trait_alias_of: None,
                     }),
+                    stub_method("getOffset", &["datetime"]),
                 ],
                 props: vec![],
                 consts: vec![ConstDecl {
@@ -2696,11 +2704,15 @@ impl<'a> Interp<'a> {
         // on-write return. Registered last so it can clone the
         // datetime decl's methods/consts.
         {
-            let (methods, consts) = self
+            let (mut methods, consts) = self
                 .classes
                 .get("datetime")
                 .map(|dt| (dt.decl.methods.clone(), dt.decl.consts.clone()))
                 .unwrap_or_default();
+            // zend keeps createFromImmutable on DateTime only; the
+            // immutable twin's own factory is createFromMutable.
+            methods.retain(|m| !m.decl.name.eq_ignore_ascii_case("createfromimmutable"));
+            methods.push(stub_method("createFromMutable", &["object"]));
             let c = Rc::new(PhpClass {
                 decl: Rc::new(ClassDecl {
                     name: "DateTimeImmutable".into(),
