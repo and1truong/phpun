@@ -61,5 +61,11 @@
       ]
     },
     "note": "Config follow-up on the same frozen oracle binary; seven-rep timing samples are unchanged."
+  },
+  "benchmark_gate_review": {
+    "fix": "8fd2764",
+    "checks": "8 temporary-runtime controls: normal Python and -O both reject mismatched stdout, failed runtime, failed oracle and active profiler flags; no successful report written",
+    "runnable_control": "python -O bench/data/92/parity/compare-php-main-stack.py --php <php85> --main <frozen-main> --stack /usr/bin/false --main-runtime probe --stack-runtime probe --save /tmp/rejected.json",
+    "expected": "nonzero exit with gate failed, runtime=2, exit=1; rejected.json not created"
   }
 }
