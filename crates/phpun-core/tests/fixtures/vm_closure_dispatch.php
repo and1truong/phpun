@@ -32,3 +32,12 @@ unset($bound);
 echo "held-native-closure\n";
 unset($scalar_bound);
 echo implode(',', array_map($scalar, [1, 2], [3, 4])), "\n";
+$a = [1]; array_walk($a, function ($v) { $v = 2; }); echo $a[0], "\n";
+$b = [1]; $f = function ($v) { $v = 2; }; $f(...$b); echo $b[0], "\n";
+$c = ['7']; call_user_func_array(function (int $v) { $v += 1; }, $c); var_dump($c[0]);
+$d = [1]; array_walk($d, function (&$v) { $v = 2; }); echo $d[0], "\n";
+function named_value($v) { $v = 3; }
+function named_int(int $v) { $v += 1; }
+$named = [1]; array_walk($named, 'named_value'); named_value(...$named); echo $named[0], "\n";
+$typed = ['7']; call_user_func_array('named_int', $typed); var_dump($typed[0]);
+$alias = 5; $refargs = [&$alias]; $byvalue = function (float $v) { $v = 9.0; }; $byvalue(...$refargs); var_dump($alias);
