@@ -1,0 +1,14 @@
+{
+  "before_source": "c5e7eca6c860b0ab22431bd3f35daf3f48ad51ff",
+  "before_sha256": "5f3de127ff71092ae4a1e776f72dd282ae5302b5bc997b6696c8a1461edae89b",
+  "initial_all_phase_runtime": "6ea4a3aaf3ae6e7a8ace86ecd2fae94074941cbe",
+  "initial_sha256": "c4d302fc0f771e4f9513987df254d5b4baea0575acb4a89dfbaf5a105d63230a",
+  "sort_only_runtime": "074da0a",
+  "sort_only_sha256": "6877bf7cd8cb0876ace1281f16dea47352706760f37fb53ad7cd08ae08de0d70",
+  "final_runtime": "92d0be0421f5eb845a7f25db3d74330fa762e5ad",
+  "final_sha256": "df19afc5bf14758f5021e028ac1ee7b97ea209be35d8e1d9c90f642d5d1ad63b",
+  "build": "each branch core force-cleaned; Rust1.99.0 release/LTO/codegen-units1; immutable artifacts",
+  "gate": "final583PHPT individual statuses unchanged453pass120fail3skip7unsupported0crash0timeout;22VM/probe oracles;19workloads; workspace6core22runtime19format checks/clippy/fmt",
+  "limits": "primitive context-free fixed2-arg user-sort only; map/filter unchanged; physical alloc counters are requested bytes, not peak live; copy lower bounds only; no speed from instrumented runs",
+  "known_gap": "canonical object-argument dtor/WeakReference mismatch predates this step; source and PHP/parent/initial/sort/final outcomes retained separately and parent==candidate. Not an oracle-passing case. PHP WeakReference::create(Closure) also unsupported on parent, no claim of that PHP gate; RustWeak directly tests callable owner release."
+}

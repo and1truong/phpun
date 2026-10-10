@@ -618,3 +618,89 @@ Hashes: main76fd8bb184d7853ddfe972b311feb691a9390d8a1c949b05441d49ddb6db9400;
 after5f3de127ff71092ae4a1e776f72dd282ae5302b5bc997b6696c8a1461edae89b.
 Both release cores force-cleaned/rebuilt (Rust1.99.0 LTO/codegen-units1);
 raw `data/92/parity/metadata-*`, same native host/PHP as preceding supplement.
+
+## Proven user-sort argument pairs (#215)
+
+Final runtime92d0be0421f5eb845a7f25db3d74330fa762e5ad on reviewed property
+metadata sourcec5e7eca; parents merged into main31316ca via #213/#214/#216.
+Only **usort/uasort/uksort** fresh pairs enter the shared value ABI. A context-free
+capture-free fixed-arity primitive closure must pass compiler value-ABI and exact
+parameter-type gates, without reference/variadic/promotion requirements. Caller
+pending aliases/class/generator/hook context retain canonical binding. Metadata
+owner stays on the frame through the existing closure_rc field, cleared before
+pooling. The compile cache owns declarations, not the callable instance.
+
+Canonical callbacks create their original fresh cells directly, preserving sort's
+nonref flags. They never traverse an extra value vector. map/filter unchanged.
+This is neither a comparator arithmetic special case nor a universal dynamic-call
+ABI. Bound/captured/method/string/object/coercing/default/unresolved cases stay
+canonical. No new cache or packed layout; #187 remains open.
+
+**Prototype history retained:** all-phase6ea4a3a removed49.9% requests, but focused
+map100k145.315→159.396ms (+9.7%). Therefore map/filter implementation was removed.
+Sort-only074da0a still transferred values through a vector on fallback;
+app41.512→46.781 (+12.7%) in that sample. Final92d0be0 gates first and sends
+fallbacks directly to cells. These datasets keep original runtime hashes, not
+relabelled as final or silently dropped. Do not multiply gains across them.
+
+One retained runnable core check: live func_get_args/ancestor backtrace argument
+writes during sort, map/filter/captured/bound/default/coercion fallback, integer
+key sorting, by-ref warning flags, boolean retry/deprecation, exception unwind
+and continued calls. RustWeak verifies pooled frames do not retain callable
+owners, and a value-vector capacity witness verifies the actual ABI was reached.
+PHP WeakReference::create(Closure) is unsupported on parent, so no claim of that
+PHP gate. Separately a preexisting canonical object-argument dtor/WeakReference
+mismatch is retained with source + PHP/parent/prototype/final results: every
+candidate matches the parent, but this is **not an oracle-passing case**. No broad
+PHP lifetime compatibility claim or silent baseline deletion.
+
+Final workspace6core/22runtime/19format checks, fmt/clippy pass;
+21VM fixtures + new probe exact exit/stdout/stderr == PHP8.5.11 -n;
+19 existing workload oracles pass. All583relevant array/sort/closure/argument/
+exception/backtrace PHPT individual statuses unchanged:453pass/120existing fail/
+3skip/7unsupported/zero crash or timeout. Original per-file maps retained.
+
+Separate byte-gated arrays20 instrumented counts:
+
+| Measure | Parent | Final | Ratio |
+|---|---:|---:|---:|
+| Rust allocation requests | 2,649,899 | 1,408,498 | 0.532 |
+| Requested bytes | 81,127,379 | 51,333,823 | 0.633 |
+| Observed copy calls | 2,894,832 | 2,894,832 | 1.000 |
+| Observed out-of-line copy bytes | 487,078,120 | 380,317,386 | 0.781 |
+
+No speed from instrumented times. Copy lower bounds omit LLVM inline/hidden/
+realloc movement. The `cell` site counter remains40125 because fresh builtin
+callback cells bypass that helper; it is not an all-Cell counter. `vm_site`
+requests6→310357 reflects the shared direct binder's arena protocol, not that
+many new physical heap allocations: sites are reused. Physical request totals
+above are measured separately, not inferred from site hits.
+
+Seven final alternating profiler-off PHP-byte-gated release pairs:
+
+| Workload | Parent / final median ms | Final/parent |
+|---|---:|---:|
+| bench/30-arrays.php | 194.526 / 180.164 | 0.926 |
+| bench/30-arrays.php 100 | 1119.369 / 1044.455 | 0.933 |
+| bench/profile/arrays.php usort 100000 | 918.011 / 818.829 | 0.892 |
+| bench/40-objects.php | 414.289 / 442.686 | 1.069 |
+| bench/60-json.php | 656.371 / 663.564 | 1.011 |
+| bench/10-fib.php | 153.354 / 156.922 | 1.023 |
+| bench/11-sieve.php | 222.492 / 230.378 | 1.035 |
+| bench/app/cli.php 100 20 | 42.258 / 41.617 | 0.985 |
+| examples/composer/run.php | 7.199 / 7.489 | 1.040 |
+| bench/00-startup.php | 5.387 / 5.427 | 1.007 |
+
+Arrays−7.4%,larger100−6.7%,usort phase−10.8%; ranges overlap and no parity
+claim. Objects+6.9%,JSON+1.1%,fib+2.3%,sieve+3.5%,Composer+4.0% remain visible;
+no attribution to the callback path for workloads that do not execute it.
+Seven app42.258→41.617 (0.985), then31fresh isolated alternating followup
+40.243→41.219ms (1.024), ranges overlap. No broad app win, no asserted removal
+of every performance regression. The canonical fallback extra transfer is
+structurally removed; these timings do not isolate its causal contribution.
+
+Each release core force-cleaned/rebuilt; parent SHA256
+5f3de127ff71092ae4a1e776f72dd282ae5302b5bc997b6696c8a1461edae89b,
+finaldf19afc5bf14758f5021e028ac1ee7b97ea209be35d8e1d9c90f642d5d1ad63b.
+Same native host/Rust/PHP config as preceding steps, frozen identities/config/
+argv/maps/counters/callsite lower bounds/samples under `data/92/parity/callback-*`.
