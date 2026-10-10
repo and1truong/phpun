@@ -1532,8 +1532,22 @@ pub(crate) fn php_unserialize(
                 Value::Object(o) => Some(o.clone()),
                 _ => None,
             };
-            if let Some(o) = fix_obj {
+            if let Some(o) = &fix_obj {
                 crate::builtins::datetime::dt_unserialize_fixup(&mut o.borrow_mut());
+            }
+            // O: payloads invoke __wakeup once the object is fully
+            // rebuilt (zend calls it after internals are restored).
+            if let Some(o) = &fix_obj {
+                if it.find_method_in(&o.borrow().class, "__wakeup").is_some() {
+                    if let Err(e) = it.method_invoke(
+                        o.clone(),
+                        "__wakeup",
+                        crate::interp::CallArgs::positional(vec![]),
+                    ) {
+                        *err = Some(e);
+                        return Err(());
+                    }
+                }
             }
             Ok(this)
         }
