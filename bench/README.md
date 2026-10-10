@@ -9,7 +9,22 @@ cargo build --release
 PHP=/path/to/php PHPUN=./target/release/phpun bench/run.sh [--save bench/RESULTS.md]
 ```
 
-Defaults: `PHP=php`, `PHPUN=./target/release/phpun`, `TIMEOUT=300` (per run, seconds).
+Defaults: `PHP=php`, `PHPUN=./target/release/phpun`, `TIMEOUT=300` (per run,
+seconds), `BENCH_REPS=7`. Python 3 is required (also used by the HTTP driver).
+
+`run.sh` delegates to `measure.py`. Use `--reps N`, `--bench PATH`
+(repeatable), `--script-arg VALUE`, and `--php-arg=-n` to record an explicit
+workload/reference configuration. For example, a longer call workload:
+
+```sh
+bench/run.sh --bench bench/10-fib.php --script-arg 32 --reps 7 --php-arg=-n
+python3 bench/check-measure.py # failure/timeout/output gate self-check
+```
+
+Set `PHPUN_BUILD_INFO` to the binary's exact source commit, dirty state,
+Rust version and build flags. Reports record the current checkout separately
+from binary hashes; a checkout commit alone does not prove where an existing
+binary was built. Disable `PHPUN_CALLPROF` and `PHPUN_ALLOC` for speed timings.
 
 ### HTTP (concurrent server load)
 
@@ -33,18 +48,20 @@ servers respond). `bench/http/` is intentionally outside `run.sh`'s
 - Each `bench/*.php` script does a fixed workload and prints one deterministic
   `RESULT <checksum>` line. Workload size is set in the script (some accept an
   override via `$argv[1]`/`$argv[2]`).
-- The runner times each script under both runtimes — **min wall-clock ms** over
-  an adaptive number of reps (5 reps under 150ms, 3 under 1s, 2 above) — and
-  reports `phpun / php` per bench plus a geometric mean.
+- The runner reports **median wall-clock ms** plus min/max across all reps,
+  alternating which runtime runs first. It reports `phpun / php` per bench
+  plus a geometric mean and the number of valid benchmarks.
 - Times include process startup, parse, and execution. `00-startup` isolates
   startup+parse alone.
-- **Correctness gate:** the runner byte-compares stdout from both runtimes and
-  marks `MISMATCH` when they differ. A mismatched bench reports its times but
-  is excluded from the geometric mean — don't compare speeds on divergent
-  semantics.
+- **Correctness gate on every repetition:** zero exit status, no timeout,
+  deterministic stdout/stderr, and byte-identical stdout/stderr between the
+  runtimes. Invalid benches show no speedup, are excluded from the geometric
+  mean and make the runner exit nonzero, including when a later rep fails.
 - Wall-clock on a shared machine is noisy; treat ratios as orders of magnitude,
-  not precise numbers. For tighter numbers, run on an idle box and raise the
-  rep counts.
+  not precise numbers. For tighter numbers, run on an idle box, raise the
+  rep counts and choose workloads long enough that startup does not dominate.
+  These timings remain cold CLI measurements; do not subtract the startup
+  time of a different script and label the result steady-state execution.
 
 ## Latest
 
