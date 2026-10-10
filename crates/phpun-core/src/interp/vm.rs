@@ -35,6 +35,10 @@ pub(in crate::interp) enum Slot {
 }
 
 /// One compiled function body — op vector + slot layout.
+/// Single-scalar pass-proof (`?T`/union-null handled) — see
+/// [`Compiled::ret_fast`].
+type ScalarGate = fn(&Value) -> bool;
+
 pub(crate) struct Compiled {
     ops: Vec<Op>,
     /// Slot count — params occupy the first `decl.params.len()` slots.
@@ -58,6 +62,44 @@ pub(crate) struct Compiled {
     /// compile — they flow through bind_and_run, which runs the body
     /// via vm_bound_exec.
     pub(in crate::interp) needs_bind: bool,
+    /// Cheap pass-proof for single-scalar return types: `Some(f)`
+    /// means `f(returned)` proving the type check satisfied lets the
+    /// caller skip `vm_ret_apply` entirely. The gate only ever proves
+    /// pass, never decides fail — weak-mode coercions and TypeErrors
+    /// keep one canonical home in the full path.
+    ret_fast: Option<ScalarGate>,
+    /// Same proof per param (variadic params get `None` — their
+    /// extras take the full gate each).
+    param_fast: Vec<Option<ScalarGate>>,
+}
+
+pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+macro_rules! pnow {
+    () => {
+        if Interp::callprof_on() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    };
+}
+macro_rules! padd {
+    ($i:expr, $t:expr) => {
+        if let Some(t) = $t {
+            PROF[$i].fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    };
 }
 
 enum Op {
@@ -157,6 +199,37 @@ struct Compiler {
 }
 
 impl Compiled {
+    /// Single-scalar type gate the ok-path proves with one `matches!`
+    /// (`?T`/union-null handled; `float` excluded — an Int arg widens,
+    /// which is the full path's job). `Some(f)` only proves pass —
+    /// every miss still runs the canonical check.
+    fn scalar_ty_gate(ty: &[String]) -> Option<ScalarGate> {
+        let core: Vec<&str> = ty
+            .iter()
+            .map(|m| m.trim_start_matches('?'))
+            .filter(|m| !m.eq_ignore_ascii_case("null"))
+            .collect();
+        if core.len() != 1 {
+            return None;
+        }
+        let nullable = ty
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case("null") || m.starts_with('?'));
+        Some(match (core[0].to_ascii_lowercase().as_str(), nullable) {
+            ("int", false) => |v: &Value| matches!(v, Value::Int(_)),
+            ("int", true) => |v: &Value| matches!(v, Value::Int(_) | Value::Null),
+            ("string", false) => |v: &Value| matches!(v, Value::Str(_)),
+            ("string", true) => |v: &Value| matches!(v, Value::Str(_) | Value::Null),
+            ("bool", false) => |v: &Value| matches!(v, Value::Bool(_)),
+            ("bool", true) => |v: &Value| matches!(v, Value::Bool(_) | Value::Null),
+            ("array", false) => |v: &Value| matches!(v, Value::Array(_)),
+            ("array", true) => |v: &Value| matches!(v, Value::Array(_) | Value::Null),
+            ("null", _) => |v: &Value| matches!(v, Value::Null),
+            ("mixed", _) => |_: &Value| true,
+            _ => return None,
+        })
+    }
+
     pub(crate) fn compile(decl: &FunctionDecl) -> Option<Rc<Compiled>> {
         // A by-ref return needs cell plumbing on Flow::Return — AST
         // keeps it. Everything else still compiles: typed/variadic/
@@ -202,6 +275,21 @@ impl Compiled {
         // No trailing Const+Return: pc exhausting the stream is
         // Flow::Normal — the bound path's `Flow::Return` arm treats
         // an explicit `return` differently from fall-off-the-end.
+        // Single-scalar type gates the ok-path proves in one match —
+        // `int`/`?string`/`bool`/`array`/`null`/`mixed` only.
+        let ret_fast: Option<fn(&Value) -> bool> =
+            decl.ret.as_deref().and_then(Self::scalar_ty_gate);
+        let param_fast: Vec<Option<ScalarGate>> = decl
+            .params
+            .iter()
+            .map(|p| {
+                if p.variadic {
+                    None
+                } else {
+                    p.ty.as_deref().and_then(Self::scalar_ty_gate)
+                }
+            })
+            .collect();
         Some(Rc::new(Compiled {
             nslots: c.slots.len(),
             names: c.slots,
@@ -209,6 +297,8 @@ impl Compiled {
             defaults,
             bind_free,
             needs_bind,
+            ret_fast,
+            param_fast,
         }))
     }
 }
@@ -717,6 +807,8 @@ impl<'a> Interp<'a> {
         comp: &Compiled,
         mut args: super::CallArgs,
     ) -> Result<Value, PhpError> {
+        PROF[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let __p = pnow!();
         let saved = VmSaved {
             line: self.cur_line,
             prop_ov: self.last_prop_ov.take(),
@@ -724,6 +816,8 @@ impl<'a> Interp<'a> {
         };
         let fr = self.call_site_frame(decl, &args);
         self.call_trace.push(fr);
+        padd!(2, __p);
+        let __p = pnow!();
         self.last_call_by_ref = decl.by_ref;
         // Param slots SHARE the arg cells: func_get_arg(i) reads them,
         // and a CV overwrite is the arg write like Zend's shared slot.
@@ -802,6 +896,10 @@ impl<'a> Interp<'a> {
                     }
                 };
                 if let Some(ty) = &p.ty {
+                    if comp.param_fast[i].is_some_and(|g| g(&c.borrow())) {
+                        slots.push(Slot::C(c));
+                        continue;
+                    }
                     // Probe errors belong to THIS param's check only.
                     self.callable_probe_err = None;
                     let v = c.borrow().clone();
@@ -841,14 +939,21 @@ impl<'a> Interp<'a> {
         }
         let temps_base = self.expr_temps.len();
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
+        padd!(3, __p);
+        let __p = pnow!();
         let r = self.vm_exec(comp, &mut slots, temps_base);
         self.loop_depth = saved_depth;
+        padd!(4, __p);
+        let __p = pnow!();
         // The return-type tail runs while the callee's frame, class
         // context and trace frame are still live — `static` resolves
         // against the callee and the TypeError's backtrace must list
         // it (zend checks between exec and the teardown).
         let r = match r {
-            Ok(fl) => self.vm_ret_apply(decl, comp, fl),
+            Ok(fl) => match (&fl, comp.ret_fast) {
+                (Flow::Return(v), Some(chk)) if chk(v) => Ok(v.clone()),
+                _ => self.vm_ret_apply(decl, comp, fl),
+            },
             Err(e) => Err(e),
         };
         let popped = self.stack_pop();
@@ -906,6 +1011,7 @@ impl<'a> Interp<'a> {
                 (r, _) => r,
             }
         };
+        padd!(5, __p);
         self.last_prop_ov = saved.prop_ov;
         self.dim_by_ref = saved.dim_by_ref;
         out
@@ -1449,6 +1555,36 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// ponytail: dev-only phase profiler — PHPUN_CALLPROF=1 accumulates
+    /// ns per call phase; printed at process exit (registered once).
+    /// Instant::now skews absolute numbers; proportions stay valid.
+    fn callprof_on() -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ON: AtomicBool = AtomicBool::new(false);
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            ON.store(std::env::var_os("PHPUN_CALLPROF").is_some(), Ordering::Relaxed);
+            if !ON.load(Ordering::Relaxed) {
+                return;
+            }
+            extern "C" fn dump() {
+                use std::sync::atomic::Ordering;
+                eprintln!(
+                    "callprof: pre={}ns cells={}ns site={}ns bind={}ns exec={}ns post={}ns calls={}",
+                    PROF[0].load(Ordering::Relaxed),
+                    PROF[1].load(Ordering::Relaxed),
+                    PROF[2].load(Ordering::Relaxed),
+                    PROF[3].load(Ordering::Relaxed),
+                    PROF[4].load(Ordering::Relaxed),
+                    PROF[5].load(Ordering::Relaxed),
+                    PROF[6].load(Ordering::Relaxed),
+                );
+            }
+            unsafe { libc::atexit(dump) };
+        });
+        ON.load(Ordering::Relaxed)
+    }
+
     /// Compiled-callee call: skips `invoke_fn`'s preamble (the yield
     /// body-walk, SPL stubs, decl-class pendings) — a compiled decl
     /// can contain no `yield`, `Stmt`/`Expr` coverage is fixed, and a
@@ -1462,6 +1598,7 @@ impl<'a> Interp<'a> {
         comp: &Compiled,
         argv: &mut Vec<Value>,
     ) -> Result<Value, PhpError> {
+        let __p = pnow!();
         let required = decl
             .params
             .iter()
@@ -1513,12 +1650,15 @@ impl<'a> Interp<'a> {
             frame.vars.insert(n, c2);
         }
         self.stack.push(frame);
+        padd!(0, __p);
+        let __p = pnow!();
         let mut args = super::CallArgs::empty();
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(cell));
         args.cells = cells;
         let n = args.cells.len() as u64;
         self.vm_call_reserve(&mut args, n);
+        padd!(1, __p);
         self.vm_run(decl, comp, args)
     }
 
