@@ -1742,7 +1742,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Object→string with __toString, plus array warning.
-    pub(in crate::interp) fn conv_str(&mut self, v: &Value) -> Result<String, PhpError> {
+    pub(crate) fn conv_str(&mut self, v: &Value) -> Result<String, PhpError> {
         match v {
             Value::Array(_) => {
                 self.warn("Array to string conversion")?;
