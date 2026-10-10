@@ -475,7 +475,7 @@ impl<'a> Interp<'a> {
                 // error that bypassed them (a raw Err propagation)
                 // falls back to whatever stack remains.
                 if self.gen_raise_ctx.is_empty() {
-                    self.gen_raise_ctx = self.call_trace.clone();
+                    self.gen_raise_ctx = self.snapshot_call_trace();
                 }
                 // Slice out everything at/below the gen's own frame.
                 let raise_frames = self
@@ -902,7 +902,9 @@ impl<'a> Interp<'a> {
                 if crate::value::trace_frame_hidden(fr) {
                     continue;
                 }
-                frames.push(crate::value::trace_frame_str(fr));
+                frames.push(crate::value::trace_frame_str(
+                    &self.snapshot_trace_frame(fr),
+                ));
             }
             if e.kind == crate::error::ErrorKind::Throw {
                 if !injected {
@@ -1078,7 +1080,9 @@ impl<'a> Interp<'a> {
             if crate::value::trace_frame_hidden(fr) {
                 continue;
             }
-            frames.push(crate::value::trace_frame_str(fr));
+            frames.push(crate::value::trace_frame_str(
+                &self.snapshot_trace_frame(fr),
+            ));
         }
         frames
     }
@@ -1160,6 +1164,7 @@ impl<'a> Interp<'a> {
         let userland = self.iter_calls == 0 && self.gen_internal_resume == 0 && !caller_is_spl_stub;
         if userland {
             self.call_trace.push(TraceFrame {
+                args_frame: None,
                 function: name.to_string().into(),
                 class: Some("Generator".into()),
                 ty: "->".into(),

@@ -676,7 +676,7 @@ impl<'a> Interp<'a> {
             // consumer's echoed bytes, with the resume-stack trace —
             // instead of printing early at the raise site.
             self.gen_pending_fatal = Some(e);
-            self.gen_raise_ctx = self.call_trace.clone();
+            self.gen_raise_ctx = self.snapshot_call_trace();
             return Flow::Exit(255);
         }
         self.print_fatal(&e);
@@ -698,7 +698,8 @@ impl<'a> Interp<'a> {
                 crate::value::include_frame(f) || (f.internal && f.function.as_ref() == "eval")
             })
             .unwrap_or(self.call_trace.len());
-        let frames: Vec<&crate::value::TraceFrame> = self.call_trace[..upto]
+        let snapshot = self.snapshot_call_trace();
+        let frames: Vec<&crate::value::TraceFrame> = snapshot[..upto]
             .iter()
             .rev()
             .filter(|f| !crate::value::trace_frame_hidden(f))
@@ -731,8 +732,8 @@ impl<'a> Interp<'a> {
     /// level, the real frames inside a function call.
     pub(in crate::interp) fn decl_fatal_ctx(&mut self, mut e: PhpError) -> PhpError {
         if matches!(e.kind, ErrorKind::Fatal) {
-            let frames: Vec<&crate::value::TraceFrame> = self
-                .call_trace
+            let snapshot = self.snapshot_call_trace();
+            let frames: Vec<&crate::value::TraceFrame> = snapshot
                 .iter()
                 .rev()
                 .filter(|f| !crate::value::trace_frame_hidden(f))

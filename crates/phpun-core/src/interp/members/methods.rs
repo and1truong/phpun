@@ -33,6 +33,7 @@ impl<'a> Interp<'a> {
         // `ArrayObject->unserialize('O:11:"ArrayObje...')` in uncaught
         // traces (arg repr truncates at 15 chars via trace_arg).
         self.call_trace.push(TraceFrame {
+            args_frame: None,
             file: self.diag_file_shared(),
             line: self.send_line.unwrap_or(self.cur_line) as u32,
             function: name.to_string().into(),
@@ -718,6 +719,7 @@ impl<'a> Interp<'a> {
                     vec![cell(Value::Array(arr.clone())), cell(Value::Int(flag))]
                 };
                 self.call_trace.push(crate::value::TraceFrame {
+                    args_frame: None,
                     function: lname.clone().into(),
                     class: None,
                     ty: String::new(),
@@ -787,6 +789,7 @@ impl<'a> Interp<'a> {
                 Self::ao_set_sorting(obj, true);
                 let src = arr.borrow().entries.clone();
                 self.call_trace.push(crate::value::TraceFrame {
+                    args_frame: None,
                     function: lname.clone().into(),
                     class: None,
                     ty: String::new(),
@@ -2384,6 +2387,7 @@ impl<'a> Interp<'a> {
                 // Native Reflection calls leave a `Cls->m()` frame in
                 // uncaught traces (named_params/attributes_named_flags).
                 self.call_trace.push(TraceFrame {
+                    args_frame: None,
                     file: self.diag_file_shared(),
                     line: self.send_line.unwrap_or(self.cur_line) as u32,
                     function: name.to_string().into(),
@@ -2568,6 +2572,7 @@ impl<'a> Interp<'a> {
             let dt_malformed = |it: &mut Interp, s: &str| -> Result<Value, PhpError> {
                 let first = s.chars().next().unwrap_or(' ');
                 it.call_trace.push(TraceFrame {
+                    args_frame: None,
                     file: it.diag_file_shared(),
                     line: it.send_line.unwrap_or(it.cur_line) as u32,
                     function: name.to_string().into(),
@@ -2601,7 +2606,7 @@ impl<'a> Interp<'a> {
                     ),
                     0,
                 ));
-                it.call_trace.pop();
+                it.trace_pop();
                 r
             };
             let immutable = cls.name().eq_ignore_ascii_case("datetimeimmutable");
@@ -2967,6 +2972,7 @@ impl<'a> Interp<'a> {
                 }
                 None => {
                     self.call_trace.push(TraceFrame {
+                        args_frame: None,
                         file: self.diag_file_shared(),
                         line: self.send_line.unwrap_or(self.cur_line) as u32,
                         function: name.to_string().into(),
@@ -2989,7 +2995,7 @@ impl<'a> Interp<'a> {
                         format!("Unknown or bad format ({spec})"),
                         0,
                     ));
-                    self.call_trace.pop();
+                    self.trace_pop();
                     return r;
                 }
             }
@@ -3111,6 +3117,7 @@ impl<'a> Interp<'a> {
         // arity error. Pop it again only when the bind succeeds; the
         // bind's errors snapshot call_trace inside fail().
         self.call_trace.push(TraceFrame {
+            args_frame: None,
             file: self.diag_file_shared(),
             line: self.send_line.unwrap_or(self.cur_line) as u32,
             function: m.decl.name.clone(),
@@ -3355,6 +3362,7 @@ impl<'a> Interp<'a> {
         let mut fargs = args.cells.clone();
         fargs.extend(args.named.iter().map(|(_, c, ..)| c.clone()));
         self.call_trace.push(TraceFrame {
+            args_frame: None,
             file: self.diag_file_shared(),
             line: self.cur_line as u32,
             function: name.to_string().into(),

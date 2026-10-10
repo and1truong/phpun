@@ -1,0 +1,33 @@
+{
+  "php_config_for_phase_real_apps": {
+    "version": "8.5.11",
+    "ini": false,
+    "scanned": false,
+    "extensions": [
+      "Core",
+      "date",
+      "pcre",
+      "sqlite3",
+      "hash",
+      "json",
+      "lexbor",
+      "Zend OPcache",
+      "uri",
+      "SPL",
+      "PDO",
+      "pdo_sqlite",
+      "random",
+      "Reflection",
+      "tokenizer",
+      "standard",
+      "mbstring"
+    ],
+    "opcache.enable_cli": "0",
+    "opcache.jit": "disable",
+    "opcache.jit_buffer_size": "64M"
+  },
+  "mbstring_source": "PHP 8.5.11 official source, --enable-mbstring=shared --disable-mbregex; cc -O2",
+  "mbstring_sha256": "faf63a2fd2e88e1c52c5de9acf583e8cececb46100d3dd5d36438010ba637e0d",
+  "lifecycle_example_build": "308cc05345fb2a00991bebf5620769e3361eeebf; Rust1.99.0 release LTO codegen-units=1; 200 iterations; full-body PHP oracle passed",
+  "lifecycle_example_sha256": "3ba2ca08e48787f0253c530839e85615856653e1955bbde33d489b1ae1bae031"
+}

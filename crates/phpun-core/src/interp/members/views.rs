@@ -3221,7 +3221,7 @@ impl<'a> Interp<'a> {
             .skip_while(|f| {
                 f.internal && !crate::value::include_frame(f) && f.function.as_ref() != "eval"
             })
-            .cloned()
+            .map(|f| self.snapshot_trace_frame(f))
             .collect();
         format_backtrace_frames(&frames)
     }
@@ -3235,7 +3235,7 @@ impl<'a> Interp<'a> {
                 f.internal && !crate::value::include_frame(f) && f.function.as_ref() != "eval"
             })
             .filter(|f| !crate::value::trace_frame_hidden(f))
-            .cloned()
+            .map(|f| self.snapshot_trace_frame(f))
             .collect()
     }
 

@@ -1,0 +1,8 @@
+Interp::new: 1884.507 us/op (200 reps)
+parse: 108.833 us/op (200 reps)
+bootstrap_including_parse: 98.992 us/op (200 reps)
+reset_request: 0.041 us/op (200 reps)
+handler: 29.942 us/op (200 reps)
+end_request: 0.094 us/op (200 reps)
+layout bytes: Value=24 Cell=8 TraceFrame=160
+response: bench-ok:{"id":65735,"name":"alice","greeting":"hello ALICE","tags":["t1","t2","t3","t4"],"ts":"2026-10-06T00:00:00Z"}

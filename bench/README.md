@@ -39,18 +39,27 @@ adds overhead; compare speed only with profiling disabled.
 
 ```sh
 PHP=/path/to/php PHPUN=./target/release/phpun REQ=400 CONC=8 WORKERS=8 \
-    bench/run-http.sh [--save bench/RESULTS.md]
+    bench/run-http.sh [--save bench/HTTP_RESULTS.md]
 ```
 
-Compares four server configs on `bench/http/app*.php` (same response body;
-the driver asserts a `bench-ok` marker): `php -S` single process,
-`php -S` with `PHP_CLI_SERVER_WORKERS`, `phpun serve` classic (fresh
-interp per request), and `phpun serve --workers N` (warm interpreter
-reused per request — the script returns a `fn(array $req)` handler,
-see `http/app-worker.php`). Load driver is `http/http-load.py` (python3
-stdlib threads; one connection per request, matching how these dev
-servers respond). `bench/http/` is intentionally outside `run.sh`'s
-`bench/[0-9]*.php` glob.
+Compares `php -S` with one process, `php -S` with WORKERS total processes,
+`phpun serve` with a fresh interpreter per request, and `phpun serve` with
+WORKERS warm handler threads. PHP's multi-process configuration forks
+WORKERS-1 children plus the serving parent; use WORKERS=1 or >=3.
+Warm handlers have persistent interpreter state and a different lifecycle.
+
+`HTTP_REPS=3` (or `--reps N`) repeats each configuration, rotating order after
+the initial PHP oracle. `PHP_ARGS=-n` is the default reference configuration.
+Reports include binary hashes/build provenance, throughput median/min/max,
+measured duration and latency p50/p95/p99. Every readiness, warmup and measured
+response must match PHP's 200 status, Content-Type and full body. An invalid
+rep removes that configuration's throughput result and makes the runner fail.
+The runner cleans up each server's process group, including PHP children.
+
+These are dev-server measurements; PHP-FPM + OPcache remains a separate
+production comparison. The stdlib thread load driver uses one connection per
+request. `bench/http/` stays outside the CLI benchmark glob. Run
+`python3 bench/check-http-load.py` to verify response/error gates.
 
 ## How it works
 

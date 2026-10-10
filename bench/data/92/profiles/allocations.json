@@ -1,0 +1,172 @@
+{
+  "note": "Diagnostic runs, excluded from wall-clock comparisons. Cumulative requested allocation bytes, not peak live bytes. Site counters are events, not malloc counts. VM body entries are not CPU percentages.",
+  "binaries": {
+    "initial": {
+      "path": "/workspace/phpun-baseline",
+      "sha256": "7210dc5fb44e133ea25230f0f19163877bc72931f0b0a317f15c40e75d024782"
+    },
+    "main": {
+      "path": "/workspace/validation/ff93d67/phpun",
+      "sha256": "307caabd3186ff80e57c09db3275b9ed7a0cfcb2c9aa91b242fc68a592932277"
+    },
+    "final": {
+      "path": "/workspace/validation/308cc05/phpun",
+      "sha256": "32ceb49586648842817a23ddbb30e76da01e38d53c1b51c63187dec13ef70419"
+    }
+  },
+  "cases": [
+    {
+      "argv": [
+        "bench/00-startup.php"
+      ],
+      "initial": {
+        "allocations": 19956,
+        "requested_bytes": 3634538
+      },
+      "main": {
+        "allocations": 20417,
+        "requested_bytes": 3495740
+      },
+      "final": {
+        "allocations": 20417,
+        "requested_bytes": 3495868
+      }
+    },
+    {
+      "argv": [
+        "bench/10-fib.php"
+      ],
+      "initial": {
+        "allocations": 4341657,
+        "requested_bytes": 93747009
+      },
+      "main": {
+        "allocations": 1985281,
+        "requested_bytes": 50822635
+      },
+      "final": {
+        "allocations": 413992,
+        "requested_bytes": 16230731
+      }
+    },
+    {
+      "argv": [
+        "bench/11-sieve.php"
+      ],
+      "initial": {
+        "allocations": 3217404,
+        "requested_bytes": 96901137
+      },
+      "main": {
+        "allocations": 3217865,
+        "requested_bytes": 96759000
+      },
+      "final": {
+        "allocations": 1858627,
+        "requested_bytes": 31913011
+      }
+    },
+    {
+      "argv": [
+        "bench/20-strings.php"
+      ],
+      "initial": {
+        "allocations": 3098183,
+        "requested_bytes": 10059963421
+      },
+      "main": {
+        "allocations": 3098659,
+        "requested_bytes": 10096471659
+      },
+      "final": {
+        "allocations": 2457013,
+        "requested_bytes": 2843897395
+      }
+    },
+    {
+      "argv": [
+        "bench/30-arrays.php"
+      ],
+      "initial": {
+        "allocations": 21975321,
+        "requested_bytes": 1278010928
+      },
+      "main": {
+        "allocations": 19523337,
+        "requested_bytes": 1194103334
+      },
+      "final": {
+        "allocations": 19033257,
+        "requested_bytes": 1165448433
+      }
+    },
+    {
+      "argv": [
+        "bench/40-objects.php"
+      ],
+      "initial": {
+        "allocations": 8996234,
+        "requested_bytes": 415525253
+      },
+      "main": {
+        "allocations": 7021784,
+        "requested_bytes": 172425895
+      },
+      "final": {
+        "allocations": 6971829,
+        "requested_bytes": 167993383
+      }
+    },
+    {
+      "argv": [
+        "bench/50-regex.php"
+      ],
+      "initial": {
+        "allocations": 318150,
+        "requested_bytes": 29164610
+      },
+      "main": {
+        "allocations": 318617,
+        "requested_bytes": 29086947
+      },
+      "final": {
+        "allocations": 318248,
+        "requested_bytes": 27969591
+      }
+    },
+    {
+      "argv": [
+        "bench/60-json.php"
+      ],
+      "initial": {
+        "allocations": 15098463,
+        "requested_bytes": 512592700
+      },
+      "main": {
+        "allocations": 15098930,
+        "requested_bytes": 512520734
+      },
+      "final": {
+        "allocations": 15095712,
+        "requested_bytes": 498703281
+      }
+    },
+    {
+      "argv": [
+        "bench/70-db.php"
+      ],
+      "initial": {
+        "allocations": 1231168,
+        "requested_bytes": 40671686
+      },
+      "main": {
+        "allocations": 1231635,
+        "requested_bytes": 40468009
+      },
+      "final": {
+        "allocations": 1190849,
+        "requested_bytes": 40128925
+      }
+    }
+  ]
+}

@@ -8,3 +8,5 @@ target/
 !examples/symfony-console/vendor/
 examples/composer/composer-src/
 examples/composer/composer-*.phar
+
+__pycache__/

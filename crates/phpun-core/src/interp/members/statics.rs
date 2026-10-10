@@ -724,6 +724,7 @@ impl<'a> Interp<'a> {
                 None => {
                     // static-call frame like dt_malformed's ->
                     self.call_trace.push(TraceFrame {
+                        args_frame: None,
                         file: self.diag_file_shared(),
                         line: self.send_line.unwrap_or(self.cur_line) as u32,
                         function: name.to_string().into(),
@@ -749,7 +750,7 @@ impl<'a> Interp<'a> {
                         ),
                         0,
                     ));
-                    self.call_trace.pop();
+                    self.trace_pop();
                     r
                 }
             };

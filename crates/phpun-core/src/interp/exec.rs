@@ -49,72 +49,8 @@ impl<'a> Interp<'a> {
         while i < stmts.len() {
             let s = &stmts[i];
             i += 1;
-            // memory_limit fires between statements (bug45392) once
-            // a charge recorded its overflowing call site in oom_at,
-            // or the live arena itself passed the limit. Buffer
-            // growth since the last boundary reconciles into the
-            // sim here — ob bytes are why the walk exists.
-            self.ob_meter_sync();
-            let lim = self.ini_bytes("memory_limit");
-            crate::value::mem_set_arena_lim(lim);
-            // lim > 0: zend refuses memory_limit=0 at ini_set, and a
-            // limit of -1 (unlimited) can never trip.
-            let arena_over = lim > 0 && self.mem_total() > lim;
-            if self.oom_at.is_some() || arena_over {
-                self.mem_exceeded = true;
-                // zend's bailout backtraces the allocating call —
-                // oom_at captured it inside mem_charge. Arena trips
-                // report the crossing charge's request, not whatever
-                // charge happened to come last before the boundary.
-                let (line, frames) = self
-                    .oom_at
-                    .clone()
-                    .unwrap_or((self.cur_line, self.fatal_frames()));
-                let mut e = PhpError::fatal(
-                    format!(
-                        "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        lim,
-                        if arena_over {
-                            match crate::value::mem_arena_trip() {
-                                0 => crate::value::mem_last_alloc(),
-                                n => n,
-                            }
-                        } else {
-                            self.mem_last as i64
-                        }
-                    ),
-                    line,
-                );
-                e.trace = Some(frames);
-                return self.err_flow(e);
-            }
-            if let Some(d) = self.deadline {
-                if std::time::Instant::now() > d {
-                    let secs = self.deadline_secs;
-                    return self.err_flow(PhpError::fatal(
-                        format!(
-                            "Maximum execution time of {} second{} exceeded",
-                            secs,
-                            if secs == 1 { "" } else { "s" }
-                        ),
-                        self.cur_line,
-                    ));
-                }
-            }
-            // Per-op scratch tied to a statement's last write op: the
-            // prop-cell receiver stash and the dim operand caches hold
-            // Rc clones — left over they keep a container externally
-            // strong and gc_collect_cycles reads the dead cycle as
-            // rooted (gc_006's `$a->a[0] =& $a` then `unset($a)`).
-            // `!in_handler` like every other clear site: a user error
-            // handler's own statements run through exec() mid-op and
-            // must not wipe the outer op's dim binds (bug79793 — the
-            // write pass's re-lookup would read post-handler values).
-            self.last_prop_ov = None;
-            if !self.in_handler {
-                self.dim_key_conv.clear();
-                self.dim_cv_bound.clear();
-                self.dim_undef_cells.clear();
+            if let Some(flow) = self.statement_boundary() {
+                return flow;
             }
             match self.exec(s) {
                 Flow::Normal => {
@@ -225,7 +161,83 @@ impl<'a> Interp<'a> {
         f
     }
 
-    fn exec(&mut self, s: &Stmt) -> Flow {
+    pub(in crate::interp) fn statement_boundary(&mut self) -> Option<Flow> {
+        // memory_limit fires between statements (bug45392) once
+        // a charge recorded its overflowing call site in oom_at,
+        // or the live arena itself passed the limit. Buffer
+        // growth since the last boundary reconciles into the
+        // sim here — ob bytes are why the walk exists.
+        self.ob_meter_sync();
+        let lim = self.ini_bytes("memory_limit");
+        crate::value::mem_set_arena_lim(lim);
+        // lim > 0: zend refuses memory_limit=0 at ini_set, and a
+        // limit of -1 (unlimited) can never trip.
+        let arena_over = lim > 0 && self.mem_total() > lim;
+        if self.oom_at.is_some() || arena_over {
+            self.mem_exceeded = true;
+            // zend's bailout backtraces the allocating call —
+            // oom_at captured it inside mem_charge. Arena trips
+            // report the crossing charge's request, not whatever
+            // charge happened to come last before the boundary.
+            let (line, frames) = self
+                .oom_at
+                .clone()
+                .unwrap_or((self.cur_line, self.fatal_frames()));
+            let mut e = PhpError::fatal(
+                format!(
+                    "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                    lim,
+                    if arena_over {
+                        match crate::value::mem_arena_trip() {
+                            0 => crate::value::mem_last_alloc(),
+                            n => n,
+                        }
+                    } else {
+                        self.mem_last as i64
+                    }
+                ),
+                line,
+            );
+            e.trace = Some(frames);
+            return Some(self.err_flow(e));
+        }
+        if let Some(d) = self.deadline {
+            if std::time::Instant::now() > d {
+                let secs = self.deadline_secs;
+                return Some(self.err_flow(PhpError::fatal(
+                    format!(
+                        "Maximum execution time of {} second{} exceeded",
+                        secs,
+                        if secs == 1 { "" } else { "s" }
+                    ),
+                    self.cur_line,
+                )));
+            }
+        }
+        // Per-op scratch tied to a statement's last write op: the
+        // prop-cell receiver stash and the dim operand caches hold
+        // Rc clones — left over they keep a container externally
+        // strong and gc_collect_cycles reads the dead cycle as
+        // rooted (gc_006's `$a->a[0] =& $a` then `unset($a)`).
+        // `!in_handler` like every other clear site: a user error
+        // handler's own statements run through exec() mid-op and
+        // must not wipe the outer op's dim binds (bug79793 — the
+        // write pass's re-lookup would read post-handler values).
+        self.last_prop_ov = None;
+        if !self.in_handler {
+            self.dim_key_conv.clear();
+            self.dim_cv_bound.clear();
+            self.dim_undef_cells.clear();
+        }
+        None
+    }
+
+    pub(in crate::interp) fn exec(&mut self, s: &Stmt) -> Flow {
+        self.exec_at(s, None)
+    }
+
+    /// Bytecode copies statements but preserves early-bound declaration identity.
+    pub(in crate::interp) fn exec_at(&mut self, s: &Stmt, decl_site: Option<usize>) -> Flow {
         match s {
             Stmt::Line(l) => {
                 self.cur_line = *l;
@@ -563,7 +575,7 @@ impl<'a> Interp<'a> {
                     return self.err_flow(e);
                 }
                 let key = d.name.to_lowercase();
-                let site = std::ptr::from_ref(d) as usize;
+                let site = decl_site.unwrap_or_else(|| std::ptr::from_ref(d) as usize);
                 // The decl site early-bound at compile no-ops on
                 // execution; a DIFFERENT decl (a conditional decl in an
                 // if/loop, or a decl in another unit) claiming the

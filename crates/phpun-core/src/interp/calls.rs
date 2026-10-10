@@ -2588,7 +2588,7 @@ impl<'a> Interp<'a> {
         // otherwise take the silent by-ref bucket path and swallow
         // the missing-key warning zend emits on a normal read.
         let saved_dim_by_ref = std::mem::replace(&mut self.dim_by_ref, false);
-        let fr = self.call_site_frame(decl, &args);
+        let fr = self.call_site_frame(decl, &args, false);
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
         let r = self.bind_and_run_inner(decl, args, unused);
@@ -2711,6 +2711,7 @@ impl<'a> Interp<'a> {
         &mut self,
         decl: &FunctionDecl,
         args: &CallArgs,
+        defer_args: bool,
     ) -> TraceFrame {
         crate::interp::util::alloc_hit(3);
         // The callee's argline markers overwrite `send_line`; after
@@ -2744,9 +2745,16 @@ impl<'a> Interp<'a> {
         // declaration order — `test3(NULL, 'B')` in named_params/defaults).
         // Named args collected by a variadic stay keyed
         // (`test(1, 2, x: 3, y: 4)` in named_params/backtrace).
-        let mut targs_named: Vec<(String, Cell)> = Vec::new();
-        let targs: Vec<Cell> = if args.named.is_empty() {
-            args.cells.clone()
+        let mut fr = self.trace_pool.pop().unwrap_or_default();
+        let mut targs_named = std::mem::take(&mut fr.named_args);
+        targs_named.clear();
+        let mut reusable = std::mem::take(&mut fr.args);
+        reusable.clear();
+        let targs: Vec<Cell> = if defer_args {
+            reusable
+        } else if args.named.is_empty() {
+            reusable.extend(args.cells.iter().cloned());
+            reusable
         } else {
             let mut last: i64 = -1;
             for (i, p) in decl.params.iter().enumerate() {
@@ -2811,9 +2819,8 @@ impl<'a> Interp<'a> {
             }
             t
         };
-        // Reuse a pooled frame — clone_from keeps String/Vec capacity
-        // so a steady-state call path allocates nothing here.
-        let mut fr = self.trace_pool.pop().unwrap_or_default();
+        // Context is eager; positional trace vectors reuse pooled capacity.
+        // Named normalization retains its canonical ordering/default handling.
         if let Some(f) = self.stack.last() {
             // fn_name is already the Zend scope name —
             // `{closure:Foo::m():L}`/`{closure:FILE:L}` included.
@@ -2860,8 +2867,9 @@ impl<'a> Interp<'a> {
             fr.gen_body = false;
         }
         fr.line = site_line;
-        fr.args.clone_from(&targs);
-        fr.named_args.clone_from(&targs_named);
+        fr.args_frame = defer_args.then(|| self.stack.len() - 1);
+        fr.args = targs;
+        fr.named_args = targs_named;
         fr.internal = false;
         fr.visible = true;
         fr.named_dispatch = false;
@@ -4591,7 +4599,9 @@ impl<'a> Interp<'a> {
                     if crate::value::trace_frame_hidden(fr) {
                         continue;
                     }
-                    frs.push(crate::value::trace_frame_str(fr));
+                    frs.push(crate::value::trace_frame_str(
+                        &self.snapshot_trace_frame(fr),
+                    ));
                 }
                 self.stack_pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
@@ -5156,7 +5166,7 @@ impl<'a> Interp<'a> {
                 .or_else(|| scope_class.clone());
             crate::interp::util::alloc_hit(4);
             self.stack.push(frame);
-            let fr = self.call_site_frame(decl, &args);
+            let fr = self.call_site_frame(decl, &args, false);
             self.call_trace.push(fr);
             let fname = self.decl_fname(decl);
             self.stack_pop();

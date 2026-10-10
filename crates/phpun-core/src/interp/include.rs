@@ -33,6 +33,7 @@ impl<'a> Interp<'a> {
         // an open still in progress renders bare `include()` even with
         // frames above it (the error-handler trace of a failed open).
         self.call_trace.push(TraceFrame {
+            args_frame: None,
             function: match kind {
                 IncludeKind::Include => "include",
                 IncludeKind::IncludeOnce => "include_once",
@@ -432,6 +433,7 @@ impl<'a> Interp<'a> {
                 // eval()` frame at the call site (rendered bare — the
                 // eval'd source is not an arg in backtraces).
                 self.call_trace.push(TraceFrame {
+                    args_frame: None,
                     function: "eval".to_string().into(),
                     class: None,
                     ty: String::new(),
@@ -558,6 +560,7 @@ impl<'a> Interp<'a> {
                     // compile-context backtrace with the eval frame
                     // itself dropped like the exec-time gates below.
                     self.call_trace.push(TraceFrame {
+                        args_frame: None,
                         function: "eval".to_string().into(),
                         class: None,
                         ty: String::new(),

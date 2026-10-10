@@ -379,6 +379,8 @@ pub struct Interp<'a> {
     /// Recycled slot frames + arg-cell vecs for the same reason.
     vm_slot_pool: Vec<Vec<crate::interp::vm::Slot>>,
     vm_cell_pool: Vec<Vec<Cell>>,
+    vm_scalar_cell_pool: Vec<Cell>,
+    vm_site_pool: Vec<Rc<VmSite>>,
     /// Popped VM frames — Frame::new/vars-map alloc per call avoided.
     vm_frame_pool: Vec<Frame>,
     /// Popped trace frames — keeps String/Vec capacity alive so the
@@ -1397,7 +1399,10 @@ impl<'a> Interp<'a> {
         if let Some(mut fr) = self.call_trace.pop() {
             fr.args.clear();
             fr.named_args.clear();
-            self.trace_pool.push(fr);
+            fr.args_frame = None;
+            if self.trace_pool.len() < 64 {
+                self.trace_pool.push(fr);
+            }
         }
     }
 
@@ -1758,6 +1763,8 @@ impl<'a> Interp<'a> {
             vm_target_pool: Vec::new(),
             vm_slot_pool: Vec::new(),
             vm_cell_pool: Vec::new(),
+            vm_scalar_cell_pool: Vec::new(),
+            vm_site_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
             trace_pool: Vec::new(),
             classes: crate::value::FxMap::default(),
@@ -2693,7 +2700,9 @@ impl<'a> Interp<'a> {
             }
             return result;
         }
-        let flow = self.exec_block(stmts);
+        let flow = self
+            .vm_top_exec(stmts)
+            .unwrap_or_else(|| self.exec_block(stmts));
         // A generator destroyed by the unwind (last ref dropped as
         // the error propagated) replays its finally before the fatal
         // renders — Zend tears objects down between diagnosing and
@@ -4518,8 +4527,14 @@ impl<'a> Interp<'a> {
     /// at sweep once a never-dispatched call's token dies.
     fn vm_site(&mut self, out: &mut CallArgs, seg: usize, slots: u64, own: usize) {
         crate::interp::util::alloc_hit(1);
-        let site: Rc<VmSite> = Rc::new(VmSite);
-        self.mem_track(&site, 0);
+        let site = match self.vm_site_pool.pop() {
+            Some(site) => site, // Its zero-sized charge stays live in the pool.
+            None => {
+                let site = Rc::new(VmSite);
+                self.mem_track(&site, 0);
+                site
+            }
+        };
         let key = Rc::as_ptr(&site) as *const u8 as usize;
         if let Some(c) = self.mem_tracked.get_mut(&key) {
             c.vm = Some((seg, slots, own));
@@ -7134,7 +7149,9 @@ impl<'a> Interp<'a> {
             if crate::value::trace_frame_hidden(fr) {
                 continue;
             }
-            frames.push(crate::value::trace_frame_str(fr));
+            frames.push(crate::value::trace_frame_str(
+                &self.snapshot_trace_frame(fr),
+            ));
         }
         frames
     }
@@ -7233,7 +7250,9 @@ impl<'a> Interp<'a> {
                     if dup {
                         continue;
                     }
-                    parts.push(crate::value::trace_frame_str(fr));
+                    parts.push(crate::value::trace_frame_str(
+                        &self.snapshot_trace_frame(fr),
+                    ));
                 }
                 parts.extend(frames.iter().cloned());
                 let mut t = String::new();
@@ -7356,7 +7375,7 @@ impl<'a> Interp<'a> {
                 full_msg: String::new(),
                 eval_ctx: 0,
                 frames: {
-                    let mut fr = self.call_trace.clone();
+                    let mut fr = self.snapshot_call_trace();
                     if std::mem::take(&mut self.exc_frameless) {
                         fr.pop();
                     }
@@ -7375,7 +7394,7 @@ impl<'a> Interp<'a> {
     /// Raise `throw $v` as an error result.
     fn throw(&mut self, v: Value) -> PhpError {
         if self.gen_run_state.is_some() {
-            self.gen_raise_ctx = self.call_trace.clone();
+            self.gen_raise_ctx = self.snapshot_call_trace();
         }
         self.pending_exception = Some(v);
         PhpError {
@@ -7437,6 +7456,7 @@ impl<'a> Interp<'a> {
             ),
         };
         self.call_trace.push(TraceFrame {
+            args_frame: None,
             function: name.to_string().into(),
             class: None,
             ty: String::new(),
@@ -8264,7 +8284,7 @@ impl<'a> Interp<'a> {
             );
         }
         if self.gen_run_state.is_some() {
-            self.gen_raise_ctx = self.call_trace.clone();
+            self.gen_raise_ctx = self.snapshot_call_trace();
         }
         self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
@@ -8275,6 +8295,7 @@ impl<'a> Interp<'a> {
             let const_frame = self.class_const_ctx > 0;
             if const_frame {
                 self.call_trace.push(TraceFrame {
+                    args_frame: None,
                     function: "[constant expression]".to_string().into(),
                     class: None,
                     ty: String::new(),

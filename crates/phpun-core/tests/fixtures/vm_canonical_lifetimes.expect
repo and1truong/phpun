@@ -1,0 +1,6 @@
+destroy
+after temporary
+destroy
+caught constructor
+Cannot assign string to reference held by property VmReturnedObject::$n of type int
+destroy

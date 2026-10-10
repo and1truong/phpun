@@ -1,17 +1,7 @@
-//! Spike bytecode VM (issue #39): a `FunctionDecl` whose body stays
-//! inside the supported subset compiles once to a flat `Vec<Op>` and
-//! runs on a value stack with locals in slots — no per-arg Cell, no
-//! binds vec, no vars-map insert per call. Any construct outside the
-//! subset bails the WHOLE body to the AST path. Oracle probes and
-//! regression checks are still required for every supported construct.
-//!
-//! ponytail: the subset is deliberately narrow (scalars, arith/compare,
-//! if/while/for, direct named calls, return). The known ceiling: frame
-//! args still materialize cells (dtor coverage via frame.args) and the
-//! call arena charge (`vm_sites`) is kept, so the win here is
-//! dispatch + locals, not yet arena accounting. Extend coverage by
-//! teaching `compile` more constructs — never by loosening runtime
-//! semantics.
+//! Bytecode control flow and scalar operations with canonical AST bridges.
+//! Unsupported bodies retain the AST path; hybrid functions retain binding
+//! and frame teardown. Top-level loops reuse globals without a synthetic frame.
+//! Oracle probes and regression gates are required for each extension.
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -45,6 +35,9 @@ type ScalarGate = fn(&Value) -> bool;
 
 pub(crate) struct Compiled {
     ops: Vec<Op>,
+    /// Canonical expression operations retain AST semantics inside VM control flow.
+    hybrid: bool,
+    top_level: bool,
     /// Slot count — params occupy the first `decl.params.len()` slots.
     nslots: usize,
     /// Param name → slot index — the bound (typed/variadic/named-arg)
@@ -107,7 +100,7 @@ macro_rules! padd {
 }
 
 // Opt-in diagnostics: cache lookups are not calls or elapsed-time shares.
-const COVERAGE_NAMES: [&str; 18] = [
+const COVERAGE_NAMES: [&str; 21] = [
     "compiled-lookup",
     "executed-body",
     "reference-return",
@@ -126,9 +119,12 @@ const COVERAGE_NAMES: [&str; 18] = [
     "scope",
     "operator",
     "other",
+    "hybrid-lookup",
+    "hybrid-body",
+    "top-level-entry",
 ];
-static COVERAGE: [std::sync::atomic::AtomicU64; 18] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static COVERAGE: [std::sync::atomic::AtomicU64; 21] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 21];
 
 fn coverage_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -147,6 +143,16 @@ fn coverage_hit(reason: &str) {
 
 enum Op {
     Const(Value),
+    /// Shared AST expression implementation; slots and frame vars alias.
+    Canonical(Box<Expr>),
+    CanonicalStmt {
+        stmt: Box<Stmt>,
+        decl_site: Option<usize>,
+        depth: u32,
+        normal: usize,
+        breaks: Vec<usize>,
+        continues: Vec<usize>,
+    },
     Load(u16),
     /// Store top-of-stack into a slot, KEEPING it on the stack
     /// (an assignment is an expression).
@@ -237,6 +243,7 @@ struct Compiler {
     /// model can't reproduce, so it bails.
     assigned: std::collections::HashSet<String>,
     fallback: &'static str,
+    top_level: bool,
 }
 
 impl Compiled {
@@ -271,13 +278,20 @@ impl Compiled {
         })
     }
 
-    pub(crate) fn compile(decl: &FunctionDecl) -> Result<Rc<Compiled>, &'static str> {
+    pub(crate) fn compile(
+        decl: &FunctionDecl,
+        body: &[Stmt],
+        top_level: bool,
+    ) -> Result<Rc<Compiled>, &'static str> {
         // A by-ref return needs cell plumbing on Flow::Return — AST
         // keeps it. Everything else still compiles: typed/variadic/
         // promoted params, declared returns and expr defaults get
         // bound + checked by bind_and_run and only the body runs here.
         if decl.by_ref {
             return Err("reference-return");
+        }
+        if Interp::decl_contains_yield(body) {
+            return Err("generator");
         }
         let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
         let mut bind_free = !needs_bind
@@ -301,7 +315,7 @@ impl Compiled {
 
         let mut assigned: std::collections::HashSet<String> =
             decl.params.iter().map(|p| p.name.clone()).collect();
-        collect_assigned(&decl.body, &mut assigned);
+        collect_assigned(body, &mut assigned);
 
         let mut c = Compiler {
             ops: Vec::new(),
@@ -309,11 +323,12 @@ impl Compiled {
             loops: Vec::new(),
             assigned,
             fallback: "other",
+            top_level,
         };
         for (i, p) in decl.params.iter().enumerate() {
             c.slots.insert(p.name.clone(), i as u16);
         }
-        c.stmts(&decl.body).ok_or(c.fallback)?;
+        c.stmts(body).ok_or(c.fallback)?;
         // No trailing Const+Return: pc exhausting the stream is
         // Flow::Normal — the bound path's `Flow::Return` arm treats
         // an explicit `return` differently from fall-off-the-end.
@@ -332,13 +347,20 @@ impl Compiled {
                 }
             })
             .collect();
+        let hybrid = c
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Canonical(_) | Op::CanonicalStmt { .. }));
         Ok(Rc::new(Compiled {
+            hybrid,
+            top_level,
             nslots: c.slots.len(),
             names: c.slots,
             ops: c.ops,
             defaults,
             bind_free,
-            needs_bind,
+            // Canonical expressions need the canonical frame lifetime/teardown.
+            needs_bind: needs_bind || hybrid,
             ret_fast,
             param_fast,
         }))
@@ -506,7 +528,8 @@ impl Compiler {
                         self.emit(Op::Const(Value::Null));
                     }
                 };
-                self.emit(Op::Sweep);
+                // Return temporaries stay live through the caller's statement,
+                // matching exec(Return); sweeping here loses returned objects.
                 self.emit(Op::Return);
             }
             Stmt::Block(b) => self.stmts(b)?,
@@ -598,19 +621,81 @@ impl Compiler {
                     self.patch(jf, end);
                 }
             }
-            Stmt::Break(n) => {
-                if !matches!(n, None | Some(Expr::Int(1))) {
-                    return None; // `break N` past the innermost loop
+            Stmt::Break(level) | Stmt::Continue(level) => {
+                let level = match level {
+                    None => 1,
+                    Some(Expr::Int(n)) if *n > 0 => *n as usize,
+                    _ => return None,
+                };
+                let target = self.loops.len().checked_sub(level)?;
+                let jump = self.emit(Op::Jump(usize::MAX));
+                if matches!(s, Stmt::Break(_)) {
+                    self.loops[target].0.push(jump);
+                } else {
+                    self.loops[target].1.push(jump);
                 }
-                let j = self.emit(Op::Jump(usize::MAX));
-                self.loops.last_mut()?.0.push(j);
             }
-            Stmt::Continue(n) => {
-                if !matches!(n, None | Some(Expr::Int(1))) {
-                    return None;
+            Stmt::Foreach { .. }
+            | Stmt::Switch { .. }
+            | Stmt::Try { .. }
+            | Stmt::Global(_)
+            | Stmt::Static { .. }
+            | Stmt::Unset(_) => {
+                // Reuse canonical iterator/unwind/scope machinery while the
+                // surrounding bytecode loops retain their own jump targets.
+                let at = self.emit(Op::CanonicalStmt {
+                    stmt: Box::new(s.clone()),
+                    decl_site: None,
+                    depth: self.loops.len() as u32,
+                    normal: usize::MAX,
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
+                let mut breaks = Vec::new();
+                let mut continues = Vec::new();
+                for index in (0..self.loops.len()).rev() {
+                    let jump = self.emit(Op::Jump(usize::MAX));
+                    self.loops[index].0.push(jump);
+                    breaks.push(jump);
+                    let jump = self.emit(Op::Jump(usize::MAX));
+                    self.loops[index].1.push(jump);
+                    continues.push(jump);
                 }
-                let j = self.emit(Op::Jump(usize::MAX));
-                self.loops.last_mut()?.1.push(j);
+                let normal = self.ops.len();
+                if let Op::CanonicalStmt {
+                    normal: n,
+                    breaks: b,
+                    continues: c,
+                    ..
+                } = &mut self.ops[at]
+                {
+                    *n = normal;
+                    *b = breaks;
+                    *c = continues;
+                }
+            }
+            Stmt::Function(_)
+            | Stmt::Class(_)
+            | Stmt::Namespace(_)
+            | Stmt::Use(_)
+            | Stmt::Declare { .. }
+            | Stmt::ConstDecl(_)
+            | Stmt::Diag { .. }
+            | Stmt::Inline(_)
+                if self.top_level =>
+            {
+                let next = self.ops.len() + 1;
+                self.emit(Op::CanonicalStmt {
+                    stmt: Box::new(s.clone()),
+                    decl_site: match s {
+                        Stmt::Function(d) => Some(std::ptr::from_ref(d) as usize),
+                        _ => None,
+                    },
+                    depth: self.loops.len() as u32,
+                    normal: next,
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
             }
             _ => return None,
         }
@@ -648,19 +733,41 @@ impl Compiler {
             Expr::Str(s) => {
                 self.emit(Op::Const(Value::str(s.clone())));
             }
+            Expr::Interp(parts)
+                if parts
+                    .iter()
+                    .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))) =>
+            {
+                let bytes: Vec<u8> = parts
+                    .iter()
+                    .flat_map(|p| match p {
+                        crate::lexer::StringPart::Lit(bytes) => bytes.as_slice(),
+                        _ => unreachable!(),
+                    })
+                    .copied()
+                    .collect();
+                self.emit(Op::Const(Value::bytes(bytes)));
+            }
             Expr::Paren(i) => return self.expr(i),
             Expr::Var(n) => {
                 if n == "this" || !self.assigned.contains(n.as_str()) {
-                    return None;
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 }
                 let sl = self.slot(n);
                 self.emit(Op::Load(sl));
             }
             Expr::Assign {
+                op: "=&" | "??=", ..
+            } => {
+                self.emit(Op::Canonical(Box::new(e.clone())));
+            }
+            Expr::Assign {
                 target, op, value, ..
             } => {
                 let Expr::Var(n) = &**target else {
-                    return None;
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 };
                 if n == "this" {
                     return None; // AST path emits the canonical fatal
@@ -793,10 +900,21 @@ impl Compiler {
                 // names, method/static calls and named/unpack args keep
                 // the AST call machinery.
                 let Expr::Str(raw) = &**name else {
-                    return None;
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 };
-                if raw.contains("::") || raw.starts_with('\\') {
-                    return None;
+                if !raw.starts_with('\u{1}')
+                    || raw.contains('\\')
+                    || raw.contains("::")
+                    || args.iter().any(|a| {
+                        matches!(
+                            Interp::unmark_arg(a),
+                            Expr::Unpack(_) | Expr::Binary { op: "named", .. }
+                        )
+                    })
+                {
+                    self.emit(Op::Canonical(Box::new(e.clone())));
+                    return Some(());
                 }
                 // Reads the caller's var table — VM frames keep vars
                 // in slots, not `f.vars` (compact_one's lookup_var
@@ -838,6 +956,31 @@ impl Compiler {
                     *at = call;
                 }
             }
+            Expr::ArrayLit(_)
+            | Expr::Index { .. }
+            | Expr::Prop { .. }
+            | Expr::StaticProp { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::StaticCallDyn { .. }
+            | Expr::ClassConst { .. }
+            | Expr::ClassConstDyn { .. }
+            | Expr::Closure(_)
+            | Expr::New { .. }
+            | Expr::Interp(_)
+            | Expr::Cast { .. }
+            | Expr::Const(_)
+            | Expr::MagicConst(_)
+            | Expr::Isset(_)
+            | Expr::Empty(_)
+            | Expr::Fcc(_)
+            | Expr::Clone(_)
+            | Expr::Instanceof { .. }
+            | Expr::Match { .. }
+            | Expr::Throw(_)
+            | Expr::Include { .. } => {
+                self.emit(Op::Canonical(Box::new(e.clone())));
+            }
             _ => return None,
         };
         Some(())
@@ -845,6 +988,39 @@ impl Compiler {
 }
 
 impl<'a> Interp<'a> {
+    pub(in crate::interp) fn vm_top_exec(&mut self, stmts: &[Stmt]) -> Option<Flow> {
+        fn has_loop(stmts: &[Stmt]) -> bool {
+            stmts.iter().any(|s| match s {
+                Stmt::For { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } => true,
+                Stmt::Block(b) => has_loop(b),
+                Stmt::If { then, else_, .. } => has_loop(then) || has_loop(else_),
+                _ => false,
+            })
+        }
+        // Avoid compilation overhead for short CLI entry files with no loops.
+        if !has_loop(stmts) {
+            return None;
+        }
+        let decl = FunctionDecl {
+            name: Rc::from("{main}"),
+            params: Vec::new(),
+            ret: None,
+            body: Vec::new(),
+            attrs: Vec::new(),
+            by_ref: false,
+            line: 0,
+            end_line: 0,
+            file: self.cur_file.clone(),
+            ns: String::new(),
+            decl_in: None,
+        };
+        let comp = Compiled::compile(&decl, stmts, true).ok()?;
+        Some(match self.vm_bound_exec(&comp) {
+            Ok(flow) => flow,
+            Err(err) => self.err_flow(err),
+        })
+    }
+
     /// CLI-only diagnostic report; profiling changes runtime overhead.
     pub fn dump_vm_coverage() {
         if coverage_on() {
@@ -869,8 +1045,15 @@ impl<'a> Interp<'a> {
         let entry = match self.compiled_fns.entry(Rc::as_ptr(decl) as usize) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let (compiled, reason) = match Compiled::compile(decl) {
-                    Ok(c) => (Some(c), "compiled-lookup"),
+                let (compiled, reason) = match Compiled::compile(decl, &decl.body, false) {
+                    Ok(c) => {
+                        let reason = if c.hybrid {
+                            "hybrid-lookup"
+                        } else {
+                            "compiled-lookup"
+                        };
+                        (Some(c), reason)
+                    }
                     Err(reason) => {
                         if coverage_on() {
                             eprintln!(
@@ -908,7 +1091,15 @@ impl<'a> Interp<'a> {
             prop_ov: self.last_prop_ov.take(),
             dim_by_ref: std::mem::replace(&mut self.dim_by_ref, false),
         };
-        let fr = self.call_site_frame(decl, &args);
+        // Only defer when every provided param is check-free or proven to
+        // pass. Rebinding/coercion errors retain eager send-time arguments.
+        let defer_args = args.named.is_empty()
+            && args.cells.len() >= decl.params.len()
+            && decl.params.iter().enumerate().all(|(i, p)| {
+                p.ty.is_none()
+                    || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
+            });
+        let fr = self.call_site_frame(decl, &args, defer_args);
         self.call_trace.push(fr);
         padd!(2, __p);
         let __p = pnow!();
@@ -1084,13 +1275,44 @@ impl<'a> Interp<'a> {
             // clear+pool it like the slots vec so the next call's arg
             // materialization costs no malloc.
             let mut fa = std::mem::take(&mut f.args);
-            fa.clear();
+            slots.clear();
+            // Pooled frames retain capacity, not PHP owners. Methods and
+            // closures also use vm_run, so release their receiver/captures
+            // after canonical destructor passes and before recycling cells.
+            f.vars.clear();
+            f.this_obj = None;
+            f.closure_rc = None;
+            f.statics_unit = None;
+            f.scope_class = None;
+            f.called_class = None;
+            f.decl_class = None;
+            for c in fa.drain(..) {
+                // Only uniquely owned, untracked scalar cells can be reused.
+                // Trace snapshots, references and captures keep their cells.
+                if self.vm_scalar_cell_pool.len() < 256
+                    && Rc::strong_count(&c) == 1
+                    && Rc::weak_count(&c) == 0
+                    && matches!(
+                        &*c.borrow(),
+                        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                    )
+                {
+                    *c.borrow_mut() = Value::Null;
+                    self.vm_scalar_cell_pool.push(c);
+                }
+            }
             if self.vm_cell_pool.len() < 64 {
                 self.vm_cell_pool.push(fa);
             }
-            slots.clear();
             if self.vm_slot_pool.len() < 64 {
                 self.vm_slot_pool.push(std::mem::take(&mut slots));
+            }
+            // stack_pop already repaid these spans. Reuse only unaliased
+            // site tokens after destructor callbacks and argument cleanup.
+            for site in f.vm_sites.drain(..) {
+                if self.vm_site_pool.len() < 256 && Rc::strong_count(&site) == 1 {
+                    self.vm_site_pool.push(site);
+                }
             }
             if self.vm_frame_pool.len() < 64 {
                 self.vm_frame_pool.push(f);
@@ -1117,7 +1339,14 @@ impl<'a> Interp<'a> {
         slots: &mut [Slot],
         tmark: usize,
     ) -> Result<Flow, PhpError> {
-        coverage_hit("executed-body");
+        if comp.top_level {
+            coverage_hit("top-level-entry");
+        } else {
+            coverage_hit("executed-body");
+        }
+        if comp.hybrid && !comp.top_level {
+            coverage_hit("hybrid-body");
+        }
         // Value-stack/argv vecs come from a per-Interp pool — a call
         // costs no malloc here (cap bounds retention under deep
         // recursion; each live frame holds its own vec anyway).
@@ -1242,6 +1471,60 @@ impl<'a> Interp<'a> {
         })
     }
 
+    fn vm_cell_value(&mut self, c: &Cell, value: Value) -> Result<Value, PhpError> {
+        let ptr = Rc::as_ptr(c) as usize;
+        if self.typed_slots.contains_key(&ptr) || self.slot_owners.contains_key(&ptr) {
+            self.typed_slot_store_mode(c, value, false)
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn vm_publish_global(&mut self, comp: &Compiled, slots: &mut [Slot], index: u16) {
+        if comp.top_level {
+            if let Slot::V(value) = &mut slots[index as usize] {
+                let c = cell(std::mem::replace(value, Value::Null));
+                let name = comp.names.iter().find(|(_, i)| **i == index).unwrap().0;
+                self.cur().vars.insert(name.clone(), c.clone());
+                slots[index as usize] = Slot::C(c);
+            }
+        }
+    }
+
+    fn vm_materialize(&mut self, comp: &Compiled, slots: &mut [Slot]) {
+        let frame = self.cur();
+        for (name, index) in &comp.names {
+            let slot = &mut slots[*index as usize];
+            // Move the handle out: it must not look like a PHP alias while
+            // AST code runs. Existing canonical cells need no reinsertion.
+            let c = match std::mem::replace(slot, Slot::Uninit) {
+                Slot::Uninit => continue,
+                Slot::C(c) => c,
+                Slot::V(v) => cell(v),
+            };
+            if frame
+                .vars
+                .get(name)
+                .is_some_and(|current| Rc::ptr_eq(current, &c))
+            {
+                continue;
+            }
+            frame.vars.insert(name.clone(), c);
+        }
+    }
+
+    fn vm_refresh(&mut self, comp: &Compiled, slots: &mut [Slot]) {
+        for (name, index) in &comp.names {
+            let c = if comp.top_level {
+                // $GLOBALS writes/unsets synchronize lazily on canonical reads.
+                self.global_var_cell(name)
+            } else {
+                self.cur().vars.get(name).cloned()
+            };
+            slots[*index as usize] = c.map(Slot::C).unwrap_or(Slot::Uninit);
+        }
+    }
+
     fn vm_slot_value(
         &mut self,
         comp: &Compiled,
@@ -1275,22 +1558,60 @@ impl<'a> Interp<'a> {
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
+                Op::Canonical(expr) => {
+                    self.vm_materialize(comp, slots);
+                    let result = self.eval(expr);
+                    self.vm_refresh(comp, slots);
+                    vs.push(result?);
+                }
+                Op::CanonicalStmt {
+                    stmt,
+                    decl_site,
+                    depth,
+                    normal,
+                    breaks,
+                    continues,
+                } => {
+                    self.vm_materialize(comp, slots);
+                    let previous_depth = std::mem::replace(&mut self.loop_depth, *depth);
+                    let flow = self.exec_at(stmt, *decl_site);
+                    self.loop_depth = previous_depth;
+                    self.vm_refresh(comp, slots);
+                    pc = match flow {
+                        Flow::Normal => *normal,
+                        Flow::Break(level) => match breaks.get(level.saturating_sub(1) as usize) {
+                            Some(target) => *target,
+                            None => return Ok(Flow::Break(level)),
+                        },
+                        Flow::Continue(level) => {
+                            match continues.get(level.saturating_sub(1) as usize) {
+                                Some(target) => *target,
+                                None => return Ok(Flow::Continue(level)),
+                            }
+                        }
+                        other => return Ok(other),
+                    };
+                    continue;
+                }
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
-                Op::Store(s) => match &mut slots[*s as usize] {
-                    Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
-                    Slot::V(v) => {
-                        let old = std::mem::replace(v, vs.last().unwrap().clone());
-                        self.destruct_dying_value(&old)?;
+                Op::Store(s) => {
+                    match &mut slots[*s as usize] {
+                        Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
+                        Slot::V(v) => {
+                            let old = std::mem::replace(v, vs.last().unwrap().clone());
+                            self.destruct_dying_value(&old)?;
+                        }
+                        Slot::C(c) => {
+                            // CV write: new zval lands, displaced decrefs —
+                            // same ordering as cell_store.
+                            let c = c.clone();
+                            let value = self.vm_cell_value(&c, vs.last().unwrap().clone())?;
+                            *vs.last_mut().unwrap() = value.clone();
+                            self.cell_store(&c, value)?;
+                        }
                     }
-                    Slot::C(c) => {
-                        // CV write: new zval lands, displaced decrefs —
-                        // same ordering as cell_store.
-                        let c = c.clone();
-                        let old =
-                            std::mem::replace(&mut *c.borrow_mut(), vs.last().unwrap().clone());
-                        self.destruct_dying_value(&old)?;
-                    }
-                },
+                    self.vm_publish_global(comp, slots, *s);
+                }
                 Op::Pop => {
                     // Statement boundary like exec's Stmt::Expr entry:
                     // the ret-cell pin from the just-run call is stale
@@ -1358,10 +1679,11 @@ impl<'a> Interp<'a> {
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
                             let c = c.clone();
-                            let prev = std::mem::replace(&mut *c.borrow_mut(), new);
-                            self.destruct_dying_value(&prev)?;
+                            let value = self.vm_cell_value(&c, new)?;
+                            self.cell_store(&c, value)?;
                         }
                     }
+                    self.vm_publish_global(comp, slots, *slot);
                     vs.push(if *post {
                         old
                     } else {
@@ -1374,6 +1696,11 @@ impl<'a> Interp<'a> {
                     self.emit_bytes(&s);
                 }
                 Op::Line(l) => {
+                    if comp.hybrid || comp.top_level {
+                        if let Some(flow) = self.statement_boundary() {
+                            return Ok(flow);
+                        }
+                    }
                     self.cur_line = *l;
                     // Statement boundary like exec's Stmt::Line — the
                     // caller's pending send_line dies with the stmt.
@@ -1404,23 +1731,10 @@ impl<'a> Interp<'a> {
                         // Cold reference calls use the canonical SEND machinery.
                         // Cells shared with slots let argument expressions update
                         // caller locals and keep escaping references alive.
-                        let frame = self.cur();
-                        for (name, index) in &comp.names {
-                            let slot = &mut slots[*index as usize];
-                            let c = match slot {
-                                Slot::Uninit => continue,
-                                Slot::C(c) => c.clone(),
-                                Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
-                            };
-                            *slot = Slot::C(c.clone());
-                            frame.vars.insert(name.clone(), c);
-                        }
-                        let value = self.vm_ref_call(&target, lname, raw, args, *site)?;
-                        for (name, index) in &comp.names {
-                            if let Some(c) = self.cur().vars.get(name) {
-                                slots[*index as usize] = Slot::C(c.clone());
-                            }
-                        }
+                        self.vm_materialize(comp, slots);
+                        let result = self.vm_ref_call(&target, lname, raw, args, *site);
+                        self.vm_refresh(comp, slots);
+                        let value = result?;
                         vs.push(value);
                         pc = *at + 1; // skip compiled argument ops and Call
                         continue;
@@ -1444,12 +1758,21 @@ impl<'a> Interp<'a> {
                     // finding: skipped it attributed callee traces to
                     // the previous call's site).
                     let target = targets.pop().expect("InitCall resolved this call");
-                    let v = if let CachedFn::Direct(d, c) = &target {
+                    if comp.top_level {
+                        // Callees may unset/rebind globals or run GC. Slot
+                        // handles must not pin old bindings during the call.
+                        self.vm_materialize(comp, slots);
+                    }
+                    let result = if let CachedFn::Direct(d, c) = &target {
                         self.send_line = Some(*site);
-                        self.vm_run_direct(d, c, &mut argv)?
+                        self.vm_run_direct(d, c, &mut argv)
                     } else {
-                        self.vm_call(lname, raw, &mut argv, *site, &target)?
+                        self.vm_call(lname, raw, &mut argv, *site, &target)
                     };
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
+                    let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
                         self.vm_val_pool.push(argv);
@@ -1473,25 +1796,28 @@ impl<'a> Interp<'a> {
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
         slots.resize_with(comp.nslots, || Slot::Uninit);
-        if let Some(f) = self.stack.last() {
-            for (name, idx) in &comp.names {
-                if let Some(c) = f.vars.get(name) {
-                    slots[*idx as usize] = Slot::C(c.clone());
-                }
+        for (name, idx) in &comp.names {
+            if let Some(c) = self.cur().vars.get(name) {
+                slots[*idx as usize] = Slot::C(c.clone());
             }
         }
         let r = self.vm_exec(comp, &mut slots, self.expr_temps.len());
         // Slot-V objects die with the frame like a CV decref (Slot::C
         // cells are f.vars — bind's own frame teardown owns those).
-        let mut dying = Vec::new();
-        for sl in &mut slots {
-            if let Slot::V(v) = sl {
-                if matches!(v, Value::Object(_)) {
-                    dying.push(cell(std::mem::replace(v, Value::Null)));
+        let derr = if comp.top_level {
+            self.vm_materialize(comp, &mut slots);
+            None // Globals live until canonical request shutdown.
+        } else {
+            let mut dying = Vec::new();
+            for sl in &mut slots {
+                if let Slot::V(v) = sl {
+                    if matches!(v, Value::Object(_)) {
+                        dying.push(cell(std::mem::replace(v, Value::Null)));
+                    }
                 }
             }
-        }
-        let derr = self.destruct_cells(&dying).err();
+            self.destruct_cells(&dying).err()
+        };
         slots.clear();
         if self.vm_slot_pool.len() < 64 {
             self.vm_slot_pool.push(slots);
@@ -1808,7 +2134,18 @@ impl<'a> Interp<'a> {
         let __p = pnow!();
         let mut args = super::CallArgs::empty();
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
-        cells.extend(argv.drain(..).map(cell));
+        cells.extend(argv.drain(..).map(|value| {
+            if matches!(
+                value,
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+            ) {
+                if let Some(c) = self.vm_scalar_cell_pool.pop() {
+                    *c.borrow_mut() = value;
+                    return c;
+                }
+            }
+            cell(value)
+        }));
         args.cells = cells;
         let n = args.cells.len() as u64;
         self.vm_call_reserve(&mut args, n);
@@ -1951,5 +2288,37 @@ impl<'a> Interp<'a> {
             ));
         }
         self.invoke_fn(&decl.unwrap(), args, None, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Interp;
+
+    #[test]
+    fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
+        let mut it = Interp::new("arena.php");
+        let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
+        let result = it.run_source(
+            r#"<?php
+            function scalar($n) { return $n + 1; }
+            function explode_call($n) { return intdiv($n, 0); }
+            for ($i = 0; $i < 300; $i++) { scalar($i); }
+            try { explode_call(5); } catch (Throwable $e) {}
+            scalar(...array_fill(0, 20000, 1));
+            for ($i = 0; $i < 300; $i++) { scalar($i); }
+            echo 'ok';
+        "#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.out, b"ok");
+        assert_eq!(
+            it.vm_stack
+                .iter()
+                .map(|s| (s.size, s.used))
+                .collect::<Vec<_>>(),
+            initial
+        );
+        assert!(it.mem_tracked.values().all(|charge| charge.vm.is_none()));
     }
 }
