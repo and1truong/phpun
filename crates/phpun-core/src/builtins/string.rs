@@ -1,6 +1,14 @@
 //! String builtins — PHP string ops are byte ops on `Rc<[u8]>`.
 
 use super::*;
+use std::borrow::Cow;
+
+fn bytes_view<'v>(it: &mut Interp, value: &'v Value) -> Cow<'v, [u8]> {
+    match value {
+        Value::Str(s) => Cow::Borrowed(s),
+        _ => Cow::Owned(it.to_bytes_of(value)),
+    }
+}
 
 pub(crate) fn dispatch(
     it: &mut Interp,
@@ -146,7 +154,10 @@ pub(crate) fn dispatch(
         }
 
         // ----- strings -----
-        "strlen" => Value::Int(arg(args, 0).to_php_bytes().len() as i64),
+        "strlen" => Value::Int(match arg(args, 0) {
+            Value::Str(s) => s.len(),
+            value => value.to_php_bytes().len(),
+        } as i64),
         // PHP strtoupper/strtolower are ASCII-only byte maps.
         "strtoupper" => Value::bytes({
             let mut s = arg_bs(it, args, 0);
@@ -253,7 +264,8 @@ pub(crate) fn dispatch(
             Value::bytes(r)
         }
         "substr" => {
-            let s = arg_bs(it, args, 0);
+            let source = arg(args, 0);
+            let s = bytes_view(it, &source);
             let start = arg(args, 1).to_int();
             let len = if args.len() > 2 {
                 Some(arg(args, 2).to_int())
@@ -266,8 +278,10 @@ pub(crate) fn dispatch(
             }
         }
         "substr_count" => {
-            let s = arg_bs(it, args, 0);
-            let n = arg_bs(it, args, 1);
+            let source = arg(args, 0);
+            let needle = arg(args, 1);
+            let s = bytes_view(it, &source);
+            let n = bytes_view(it, &needle);
             Value::Int(if n.is_empty() {
                 0
             } else {
