@@ -2896,11 +2896,30 @@ fn uri_read(it: &mut Interp, f: &str, path: &str) -> Result<Option<UriRead>, Php
                 }
                 // php://output reads fail silently.
                 "php://output" => UriRead::ReadErr,
-                "php://stdin" | "php://memory" | "php://temp" => UriRead::Body(Vec::new()),
-                _ => {
-                    invalid_php_uri(it, f, path)?;
-                    UriRead::Fail
-                }
+                "php://stdin" => UriRead::Body(stdin_read_all()),
+                _ => match mem_uri_kind(path) {
+                    // A fresh temp/memory stream reads as empty;
+                    // php://memory/<suffix> isn't a URI at all.
+                    Some(MemUri::Temp(_)) | Some(MemUri::Memory) => UriRead::Body(Vec::new()),
+                    Some(MemUri::NegMax) => {
+                        // zend raises the error in the caller's arg2
+                        // frame — the name differs per function.
+                        let name = match f {
+                            "file" => "$flags",
+                            _ => "$use_include_path",
+                        };
+                        return err(
+                            "ValueError",
+                            format!(
+                                "{f}(): Argument #2 ({name}) must be greater than or equal to 0"
+                            ),
+                        );
+                    }
+                    None => {
+                        invalid_php_uri(it, f, path)?;
+                        UriRead::Fail
+                    }
+                },
             }
         }
     } else if let Some(scheme) = uri_scheme(path) {
@@ -3621,6 +3640,22 @@ fn fd_fill(
 /// (temp/memory ops are exempt from zend's single-fill break, so the
 /// loop is greedy). A chunk_size of 1 flips zend's NO_BUFFER flag —
 /// reads then bypass the readbuf entirely (stale bytes just sit).
+/// file()/readfile()-style whole-fd0 slurp: raw read(2) loop until
+/// EOF (no buffered remainder to preserve — these drains are
+/// one-shot).
+fn stdin_read_all() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let got = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if got <= 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..got as usize]);
+    }
+    out
+}
+
 fn fd_stream_read(
     fd: std::os::unix::io::RawFd,
     pos: &mut u64,
