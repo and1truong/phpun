@@ -1,0 +1,148 @@
+{
+  "metric": "first call (includes VM compile, not pure compile cost); warm execution function-only; cold CLI separate",
+  "gate": "exact exit/stdout/stderr; metric file intentionally variable",
+  "profiler": "off",
+  "source_script": "<?php\nfunction warm_fib(int $n): int { return $n < 2 ? $n : warm_fib($n - 1) + warm_fib($n - 2); }\n$start = microtime(true); $first = warm_fib(10); $firstMs = (microtime(true)-$start)*1000;\n$start = microtime(true); $sum = 0; for ($i=0; $i<3; $i++) $sum += warm_fib(29); $warmMs = (microtime(true)-$start)*1000/3;\nfile_put_contents($argv[1], json_encode([$firstMs, $warmMs]));\necho \"RESULT $first $sum\\n\";\n",
+  "binaries": {
+    "/workspace/php85": {
+      "first_call_including_compile_ms": [
+        0.010967254638671875,
+        0.010967254638671875,
+        0.007867813110351562,
+        0.010967254638671875,
+        0.011920928955078125,
+        0.012159347534179688,
+        0.009059906005859375
+      ],
+      "warm_fib29_ms": [
+        30.063390731811523,
+        30.256986618041992,
+        33.8583787282308,
+        31.86202049255371,
+        31.378666559855144,
+        31.4789613087972,
+        29.31634585062663
+      ],
+      "cold_cli_ms": [
+        95.588983,
+        96.5164,
+        107.248496,
+        100.837351,
+        99.40451,
+        99.553359,
+        92.834491
+      ],
+      "hash": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f",
+      "medians": {
+        "first_call_including_compile_ms": 0.010967254638671875,
+        "warm_fib29_ms": 31.378666559855144,
+        "cold_cli_ms": 99.40451
+      }
+    },
+    "/workspace/parity92/json-sink": {
+      "first_call_including_compile_ms": [
+        0.09918212890625,
+        0.11610984802246,
+        0.09608268737793,
+        0.092983245849609,
+        0.097036361694336,
+        0.11610984802246,
+        0.09608268737793
+      ],
+      "warm_fib29_ms": [
+        641.83839162191,
+        664.93805249532,
+        628.11962763468,
+        607.58328437805,
+        631.92534446716,
+        636.26130421956,
+        626.59700711568
+      ],
+      "cold_cli_ms": [
+        1932.010137,
+        2004.587095,
+        1890.784392,
+        1829.310595,
+        1903.192744,
+        1914.902491,
+        1886.335735
+      ],
+      "hash": "b5b392345462ec3f2b24c834f2c6d76a990a84a8b570983a713a191546f0a578",
+      "medians": {
+        "first_call_including_compile_ms": 0.097036361694336,
+        "warm_fib29_ms": 631.92534446716,
+        "cold_cli_ms": 1903.192744
+      }
+    },
+    "/workspace/parity92/slot-immediates": {
+      "first_call_including_compile_ms": [
+        0.094175338745117,
+        0.12397766113281,
+        0.093936920166016,
+        0.092029571533203,
+        0.092029571533203,
+        0.09608268737793,
+        0.093936920166016
+      ],
+      "warm_fib29_ms": [
+        615.32870928446,
+        614.27934964498,
+        684.80968475342,
+        607.32928911845,
+        681.39370282491,
+        664.91270065308,
+        608.2329750061
+      ],
+      "cold_cli_ms": [
+        1853.486177,
+        1850.97521,
+        2060.913722,
+        1828.230992,
+        2050.170224,
+        2000.75693,
+        1831.189303
+      ],
+      "hash": "1436b9ce7e8974cc31153f94fb87204702703f3c0317efbf19850bd513ce4809",
+      "medians": {
+        "first_call_including_compile_ms": 0.093936920166016,
+        "warm_fib29_ms": 615.32870928446,
+        "cold_cli_ms": 1853.486177
+      }
+    },
+    "/workspace/parity92/capacity-strings": {
+      "first_call_including_compile_ms": [
+        0.08702278137207,
+        0.08392333984375,
+        0.12493133544922,
+        0.083208084106445,
+        0.08702278137207,
+        0.2751350402832,
+        0.089883804321289
+      ],
+      "warm_fib29_ms": [
+        558.48733584086,
+        552.22463607788,
+        577.68726348877,
+        583.29399426778,
+        584.2190583547,
+        587.80805269877,
+        574.22033945719
+      ],
+      "cold_cli_ms": [
+        1684.206508,
+        1663.270219,
+        1742.795171,
+        1756.481957,
+        1759.623298,
+        1770.203684,
+        1728.952842
+      ],
+      "hash": "93cb182f811ea76936c1a762848d1809769c2adc059549d36a005f4c620f43ef",
+      "medians": {
+        "first_call_including_compile_ms": 0.08702278137207,
+        "warm_fib29_ms": 577.68726348877,
+        "cold_cli_ms": 1742.795171
+      }
+    }
+  }
+}

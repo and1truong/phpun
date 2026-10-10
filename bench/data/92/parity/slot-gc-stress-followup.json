@@ -1,0 +1,81 @@
+{
+  "reason": "30s parallel-suite threshold crossing; standalone runs use same60s threshold, CPU build activity present, not speed measurements",
+  "runs": [
+    {
+      "binary": "185-concat",
+      "threshold_seconds": 60,
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "duration_ms": 19829
+    },
+    {
+      "binary": "frame-trace",
+      "threshold_seconds": 60,
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "duration_ms": 16471
+    },
+    {
+      "binary": "slot-final",
+      "threshold_seconds": 60,
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "duration_ms": 21866
+    },
+    {
+      "binary": "capacity-strings",
+      "threshold_seconds": 60,
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "duration_ms": 20879
+    }
+  ]
+}
