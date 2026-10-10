@@ -390,3 +390,45 @@ all other individual statuses unchanged, including memory-limit/string/PCRE/
 class/hooks/lifetime selections. The GC30s threshold crossing on the earlier
 slot suite passes here. Original maps and individual followups retained; do not
 interpret changed timeout counts as full GC/JSON/generator compatibility.
+
+## Guarded scalar CV array reads (#187)
+
+Runtime6dbf71c →05804b7: DimCv reads an existing scalar at an integer key from
+the current table, avoiding canonical frame materialization/refresh. Plain CVs
+only; superglobals are excluded, and top-level global views, missing/unknown keys
+non-array/non-scalar values retain the original AST bridge. Hybrid binding remains
+canonical; reference-return functions still cannot compile. No offset cache,
+storage generation/shape change or inline packed representation is claimed.
+Current-table lookup naturally observes unset/sort/splice/unshift/CoW/ref writes.
+
+First e45b99d prototype did not unwrap parser source-line markers, so the fast
+opcode was not emitted. It was not published as an implementation. Its early
+samples overlap0.18s oracle work and are retained only as prototype history.
+05804b7 unwraps transparent source markers and has one retained runnable check
+for compiler opcode eligibility plus PHP-matching mutation/reference/global-view/
+missing-key/ArrayAccess/named-call results. Workspace tests/fmt/clippy pass;
+27VM/probes and19workload byte gates pass. Correct release core cleaned/rebuilt,
+source/runtime/hash explicit in array-read-provenance.json.
+
+Seven rotating PHP/parent-stack/new-stack reps, no builds/PHPT/profilers in parallel:
+sieve222.772→212.659ms (0.955), arrays196.298→186.877 (0.952).
+Independent seven alternating larger sieve3×200k1482.571→1363.094 (0.919).
+Other cases overlap; nine-bench geomean7.958→7.987×PHP (1.004×parent), no
+whole-suite gain claimed. PHP/config/absolute medians/raw samples all retained.
+Do not combine this dataset with the main3a→capacity dataset by multiplying steps.
+
+Seven Composer samples initially7.204→7.777ms (1.079×parent);31fresh isolated
+alternating followups7.030→7.168 (1.020). App40.718→40.927 (1.005),
+startup5.253→5.205 (0.991), ranges overlap. Both datasets retained, no app win.
+
+3390relevant PHPT:2671pass/639fail/29skip/34unsupported unchanged. Original
+baseline11crashes/6timeouts becomes13crashes/4timeouts: two range stress cases
+timeout→crash. The unchanged builtin range f64 loop cannot progress near
+PHP_INT_MIN; these files exercise no new dimension opcode. Standalone same30s
+before/after runs both crash on each case, confirming pre-existing failure mode,
+not hiding the original statuses. Other individual statuses unchanged. Raw maps,
+thresholds and range followups retained; no full PHP compatibility claim.
+
+#187 remains partial: bounded property-key cache, JSON shared sink and scalar CV
+array reads implemented. Actual packed inline storage/declared offset layouts
+remain pending evidence and ownership/lifetime gates, explicitly tracked in #92.
