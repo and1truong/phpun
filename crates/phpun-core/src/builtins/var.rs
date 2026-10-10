@@ -261,17 +261,17 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                     }
                 }
             }
-            // zend dumps DateTime's synthetic fields instead of the
-            // \0dt\0 slots: date string, timezone_type, timezone name.
-            let is_dt = matches!(
-                ob.class.name().to_lowercase().as_str(),
-                "datetime" | "datetimeimmutable"
-            );
+            // zend dumps the DateTime-family synthetic fields instead
+            // of the \0dt\0/\0tz\0 slots.
+            let is_dt = crate::builtins::datetime::dt_public_props(&ob).is_some();
             // Count live props only — unset() tombstones prop_order slots.
             let mut live = ob
                 .prop_order
                 .iter()
-                .filter(|n| ob.props.contains_key(*n) && !(is_dt && n.starts_with("\0dt\0")))
+                .filter(|n| {
+                    ob.props.contains_key(*n)
+                        && !(is_dt && (n.starts_with("\0dt\0") || n.starts_with("\0tz\0")))
+                })
                 .count();
             // Internal engine state Zend exposes in var_dump:
             // Generator's creating function and ArrayIterator's
@@ -316,55 +316,11 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                         vec![(format!("\"storage\":\"{}\":private", dcl), sv)]
                     }
                 }
-                _ if is_dt => {
-                    let ts = match ob
-                        .props
-                        .get("\0dt\0ts")
-                        .map(|c| c.borrow().clone())
-                        .unwrap_or(Value::Int(0))
-                    {
-                        Value::Int(t) => t,
-                        _ => 0,
-                    };
-                    let off = match ob
-                        .props
-                        .get("\0dt\0off")
-                        .map(|c| c.borrow().clone())
-                        .unwrap_or(Value::Int(0))
-                    {
-                        Value::Int(t) => t,
-                        _ => 0,
-                    };
-                    let tzty = match ob
-                        .props
-                        .get("\0dt\0tzty")
-                        .map(|c| c.borrow().clone())
-                        .unwrap_or(Value::Int(3))
-                    {
-                        Value::Int(t) => t,
-                        _ => 3,
-                    };
-                    let tz = match ob
-                        .props
-                        .get("\0dt\0tz")
-                        .map(|c| c.borrow().clone())
-                        .unwrap_or_else(|| Value::str("UTC"))
-                    {
-                        Value::Str(b) => crate::value::lossy(&b).to_string(),
-                        _ => "UTC".to_string(),
-                    };
-                    vec![
-                        (
-                            "\"date\"".to_string(),
-                            Value::str(format!(
-                                "{}.000000",
-                                crate::builtins::datetime::date_format("Y-m-d H:i:s", ts + off)
-                            )),
-                        ),
-                        ("\"timezone_type\"".to_string(), Value::Int(tzty)),
-                        ("\"timezone\"".to_string(), Value::str(&tz)),
-                    ]
-                }
+                _ if is_dt => crate::builtins::datetime::dt_public_props(&ob)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| (format!("\"{}\"", k), v))
+                    .collect(),
                 _ => Vec::new(),
             };
             live += internal_props.len();
@@ -383,7 +339,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 tail
             ));
             for n in &ob.prop_order {
-                if is_dt && n.starts_with("\0dt\0") {
+                if is_dt && (n.starts_with("\0dt\0") || n.starts_with("\0tz\0")) {
                     continue;
                 }
                 // Reserved-but-cellless slots are uninitialized typed
@@ -1058,6 +1014,24 @@ fn ser_value(it: &mut Interp, v: &Value, ctx: &mut SerCtx) -> Result<String, Php
                     ));
                 }
             }
+            // DateTime-family: serialize the synthetic public view
+            // (date/timezone_type/timezone), never the \0 slots.
+            if let Some(dtp) = crate::builtins::datetime::dt_public_props(&o.borrow()) {
+                let mut body = String::new();
+                let mut n = 0;
+                for (name, v) in dtp {
+                    body.push_str(&format!("s:{}:\"{}\";", name.len(), name));
+                    body.push_str(&ser_value(it, &v, ctx)?);
+                    n += 1;
+                }
+                return Ok(format!(
+                    "O:{}:\"{}\":{}:{{{}}}",
+                    o.borrow().class.name().len(),
+                    o.borrow().class.name(),
+                    n,
+                    body
+                ));
+            }
             let ob = o.borrow();
             let mut body = String::new();
             let mut n = 0;
@@ -1496,6 +1470,15 @@ pub(crate) fn php_unserialize(
                 ob.props.insert(key, v);
             }
             *pos += 1; // }
+                       // DateTime-family payloads carry the public view; rebuild
+                       // the \0dt\0/\0tz\0 internals zend keeps underneath.
+            let fix_obj = match &*this.borrow() {
+                Value::Object(o) => Some(o.clone()),
+                _ => None,
+            };
+            if let Some(o) = fix_obj {
+                crate::builtins::datetime::dt_unserialize_fixup(&mut o.borrow_mut());
+            }
             Ok(this)
         }
         _ => Err(()),

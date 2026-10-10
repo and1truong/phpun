@@ -1444,6 +1444,14 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
             // is the result; a prop missing in ht2 means ht1 > ht2.
             let x = x.borrow();
             let y = y.borrow();
+            // zend date objects compare by instant, across the
+            // DateTime/DateTimeImmutable pair.
+            if let (Some(a2), Some(b2)) = (
+                crate::builtins::datetime::dt_instant(&x),
+                crate::builtins::datetime::dt_instant(&y),
+            ) {
+                return a2.cmp(&b2);
+            }
             if x.class.name() != y.class.name() {
                 // zend_std_compare_objects: different ce → ret 1.
                 return Ordering::Greater;

@@ -1149,6 +1149,7 @@ impl<'a> Interp<'a> {
                     stub_method("setTimezone", &["timezone"]),
                     stub_method("createFromInterface", &["object"]),
                     stub_method("createFromImmutable", &["object"]),
+                    stub_method("getLastErrors", &[]),
                 ],
                 props: vec![],
                 consts: [
@@ -1316,11 +1317,30 @@ impl<'a> Interp<'a> {
                         trait_alias_of: None,
                     }),
                     stub_method("getOffset", &["datetime"]),
+                    stub_method("getLocation", &[]),
+                    stub_method("listAbbreviations", &[]),
                 ],
                 props: vec![],
-                consts: vec![ConstDecl {
-                    name: "ALL".into(),
-                    value: Expr::Int(2047),
+                consts: [
+                    ("ALL", 2047),
+                    ("ALL_WITH_BC", 4095),
+                    ("PER_COUNTRY", 4096),
+                    ("AFRICA", 1),
+                    ("AMERICA", 2),
+                    ("ANTARCTICA", 4),
+                    ("ARCTIC", 8),
+                    ("ASIA", 16),
+                    ("ATLANTIC", 32),
+                    ("AUSTRALIA", 64),
+                    ("EUROPE", 128),
+                    ("INDIAN", 256),
+                    ("PACIFIC", 512),
+                    ("UTC", 1024),
+                ]
+                .into_iter()
+                .map(|(n, v)| ConstDecl {
+                    name: n.into(),
+                    value: Expr::Int(v),
                     visibility: Visibility::Public,
                     is_final: false,
                     ty: None,
@@ -1328,7 +1348,8 @@ impl<'a> Interp<'a> {
                     decl_in: None,
                     enum_case: false,
                     line: 0,
-                }],
+                })
+                .collect(),
                 file: String::new(),
                 line: 0,
             },

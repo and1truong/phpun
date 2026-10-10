@@ -80,7 +80,8 @@ fn json_enc(_it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>) -> R
         Value::Int(i) => i.to_string(),
         Value::Float(f) => {
             if f.fract() == 0.0 && f.abs() < 1e15 {
-                format!("{}.0", *f as i64)
+                // PHP prints whole floats without a fraction in JSON
+                format!("{}", *f as i64)
             } else {
                 crate::value::format_float(*f)
             }
@@ -151,6 +152,20 @@ fn json_enc(_it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>) -> R
                             "{}:{}",
                             json_str(&key_str(k), flags),
                             json_enc(_it, &c.borrow(), flags, seen).unwrap_or("null".into())
+                        )
+                    })
+                    .collect();
+                return Ok(format!("{{{}}}", parts.join(",")));
+            }
+            // DateTime-family encode the synthetic public view.
+            if let Some(dtp) = crate::builtins::datetime::dt_public_props(&o.borrow()) {
+                let parts: Vec<String> = dtp
+                    .iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "{}:{}",
+                            json_str(k, flags),
+                            json_enc(_it, v, flags, seen).unwrap_or("null".into())
                         )
                     })
                     .collect();

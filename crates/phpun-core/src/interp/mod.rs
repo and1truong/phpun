@@ -562,6 +562,8 @@ pub struct Interp<'a> {
     /// per-handle weakref list so repeated create() calls on the same
     /// live object return the identical wrapper (`===` true).
     pub weakrefs: std::collections::HashMap<u64, std::rc::Weak<RefCell<crate::value::PhpObject>>>,
+    /// getLastErrors/date_get_last_errors log from the last date parse.
+    pub(crate) dt_errors: Option<crate::builtins::datetime::DtLog>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// Buffers opened inside a generator body past a yield — they
@@ -1836,6 +1838,7 @@ impl<'a> Interp<'a> {
             stream_filter_busy: std::collections::HashSet::new(),
             codec_states: std::collections::HashMap::new(),
             weakrefs: std::collections::HashMap::new(),
+            dt_errors: None,
             ob_stack: Vec::new(),
             suspended_obs: Vec::new(),
             ob_boot: None,
@@ -8777,8 +8780,8 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
         foreach (($pairs[1] ?? []) as $k => $v) { $this->$k = $v; }
     }
 }
-// ponytail: strong refs, not real weak refs — entries survive the
-// key's own destruction until removed. Iterating yields object keys.
+// Keys live behind WeakReference — the GC'd key's slot is reaped on
+// the next access. Iterating yields object keys.
 class WeakMap implements Countable, Iterator, ArrayAccess {
     private array $objs = [];
     private array $data = [];
@@ -8789,10 +8792,19 @@ class WeakMap implements Countable, Iterator, ArrayAccess {
         }
         return spl_object_id($obj);
     }
+    private function gc(): void {
+        foreach ($this->objs as $h => $w) {
+            if ($w->get() === null) {
+                unset($this->objs[$h], $this->data[$h]);
+            }
+        }
+    }
     public function offsetExists($obj): bool {
+        $this->gc();
         return isset($this->objs[$this->hashOf($obj)]);
     }
     public function offsetGet($obj) {
+        $this->gc();
         $h = $this->hashOf($obj);
         if (!isset($this->objs[$h])) {
             throw new Error('Object ' . get_class($obj) . '#' . spl_object_id($obj) . ' not contained in WeakMap');
@@ -8802,19 +8814,99 @@ class WeakMap implements Countable, Iterator, ArrayAccess {
     public function offsetSet($obj, $data = null): void {
         $h = $this->hashOf($obj);
         if (!isset($this->objs[$h])) {
-            $this->objs[$h] = $obj;
+            $this->objs[$h] = WeakReference::create($obj);
         }
         $this->data[$h] = $data;
     }
     public function offsetUnset($obj): void {
         unset($this->objs[$this->hashOf($obj)], $this->data[$this->hashOf($obj)]);
     }
-    public function count(): int { return count($this->objs); }
-    public function rewind(): void { $this->idx = 0; }
+    public function count(): int { $this->gc(); return count($this->objs); }
+    public function rewind(): void { $this->gc(); $this->idx = 0; }
     public function valid(): bool { return $this->idx < count($this->objs); }
     public function current() { return $this->data[array_keys($this->objs)[$this->idx]]; }
-    public function key() { return array_values($this->objs)[$this->idx]; }
+    public function key() { return array_values($this->objs)[$this->idx]->get(); }
     public function next(): void { $this->idx++; }
+}
+// DatePeriod — iterator over DateInterval steps between two dates.
+class DatePeriod implements Iterator {
+    const EXCLUDE_START_DATE = 1;
+    const INCLUDE_END_DATE = 2;
+    public $start = null;
+    public $current = null;
+    public $end = null;
+    public $interval = null;
+    public $recurrences = 0;
+    public $include_start_date = true;
+    public $include_end_date = false;
+    private static array $iter = [];
+    public function __construct($start = null, $interval = null, $end = null, int $options = 0) {
+        if (is_string($start)) {
+            // deprecated path — the warning is emitted natively at
+            // the `new` dispatch so it reports the caller's line.
+            self::initIso($this, $start, is_int($interval) ? $interval : 0, false);
+            return;
+        }
+        $this->start = $start;
+        $this->interval = $interval;
+        if (is_int($end)) {
+            // the prop counts yielded items; getRecurrences reports arg
+            $this->recurrences = $end + 1;
+        } else {
+            $this->end = $end;
+        }
+        $this->include_start_date = ($options & self::EXCLUDE_START_DATE) === 0;
+        $this->include_end_date = ($options & self::INCLUDE_END_DATE) !== 0;
+    }
+    private static function initIso($p, string $spec, int $options, bool $immutable): void {
+        $parts = explode('/', $spec);
+        $p->recurrences = (int) substr($parts[0], 1) + 1;
+        $p->start = $immutable ? new DateTimeImmutable($parts[1]) : new DateTime($parts[1]);
+        $p->interval = new DateInterval($parts[2]);
+        $p->include_start_date = ($options & self::EXCLUDE_START_DATE) === 0;
+        $p->include_end_date = ($options & self::INCLUDE_END_DATE) !== 0;
+    }
+    public static function createFromISO8601String(string $spec, int $options = 0): static {
+        $p = new static();
+        self::initIso($p, $spec, $options, true);
+        return $p;
+    }
+    public function getStartDate() { return $this->start; }
+    public function getEndDate() { return $this->end; }
+    public function getDateInterval() { return $this->interval; }
+    public function getRecurrences() { return $this->recurrences - 1; }
+    private function st(): array {
+        return self::$iter[spl_object_id($this)] ?? ['i' => 0];
+    }
+    private function step(): void {
+        $c = clone $this->current;
+        $this->current = $c->add($this->interval);
+    }
+    public function rewind(): void {
+        self::$iter[spl_object_id($this)] = ['i' => 0];
+        $this->current = clone $this->start;
+        if (!$this->include_start_date) {
+            $this->step();
+        }
+    }
+    public function valid(): bool {
+        $st = $this->st();
+        if ($this->end === null) {
+            return $st['i'] < $this->recurrences;
+        }
+        if ($this->current < $this->end) {
+            return true;
+        }
+        return $this->include_end_date && $this->current == $this->end;
+    }
+    public function current() { return $this->current; }
+    public function key() { return $this->st()['i']; }
+    public function next(): void {
+        $id = spl_object_id($this);
+        $st = self::$iter[$id] ?? ['i' => 0];
+        self::$iter[$id] = ['i' => $st['i'] + 1];
+        $this->step();
+    }
 }
 class SplFixedArray implements ArrayAccess, Iterator, Countable {
     private array $data;
