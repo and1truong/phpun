@@ -1441,6 +1441,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("allow_string", Bool(true))
         ),
         "json_validate" => bp!(("json", Req), ("depth", Int(512)), ("flags", Int(0))),
+        "json_last_error" | "json_last_error_msg" => bp!(),
         "levenshtein" => bp!(
             ("string1", Req),
             ("string2", Req),

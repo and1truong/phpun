@@ -5,12 +5,14 @@ use std::borrow::Cow;
 
 // zend JSON error codes (what json_last_error reports).
 const J_DEPTH: i64 = 1;
+const J_STATE: i64 = 2;
 const J_CTRL: i64 = 3;
 const J_SYNTAX: i64 = 4;
 const J_UTF8: i64 = 5;
 const J_RECURSION: i64 = 6;
 const J_INF_NAN: i64 = 7;
 const J_UNSUPPORTED: i64 = 8;
+const J_PROPNAME: i64 = 9;
 const J_UTF16: i64 = 10;
 
 // Encode flag bits. Decode shares zend's overlapping space —
@@ -45,10 +47,11 @@ pub(crate) fn dispatch(
             } else {
                 512
             };
-            let (s, code) = json_encode(it, &v, flags, depth);
+            let (s, code) = json_encode(it, &v, flags, depth)?;
             // THROW wins over output; json_last_error stays untouched.
-            if code != 0 && flags & F_THROW != 0 {
-                let e = it.exception("JsonException", json_err_msg(code));
+            // PARTIAL overrides THROW (zend treats them as incompatible).
+            if code != 0 && flags & F_THROW != 0 && flags & F_PARTIAL == 0 {
+                let e = it.exception_code("JsonException", json_err_msg(code), code);
                 return Err(it.throw_value(e));
             }
             it.last_json_error = code;
@@ -89,6 +92,13 @@ pub(crate) fn dispatch(
                 );
                 return Err(it.throw_value(e));
             }
+            if depth > i32::MAX as i64 {
+                let e = it.exception(
+                    "ValueError",
+                    "json_decode(): Argument #3 ($depth) must be less than 2147483647",
+                );
+                return Err(it.throw_value(e));
+            }
             let flags = arg(args, 3).to_int();
             match json_decode(it, s, assoc, depth, flags, 0) {
                 Ok(v) => {
@@ -97,7 +107,7 @@ pub(crate) fn dispatch(
                 }
                 Err(code) => {
                     if flags & F_THROW != 0 {
-                        let e = it.exception("JsonException", json_err_msg(code));
+                        let e = it.exception_code("JsonException", json_err_msg(code), code);
                         return Err(it.throw_value(e));
                     }
                     it.last_json_error = code;
@@ -129,8 +139,24 @@ pub(crate) fn dispatch(
                 );
                 return Err(it.throw_value(e));
             }
+            if depth > i32::MAX as i64 {
+                let e = it.exception(
+                    "ValueError",
+                    "json_validate(): Argument #2 ($depth) must be less than 2147483647",
+                );
+                return Err(it.throw_value(e));
+            }
             let flags = arg(args, 2).to_int();
-            Value::Bool(json_decode(it, s, true, depth, flags, 0).is_ok())
+            match json_decode(it, s, true, depth, flags, 0) {
+                Ok(_) => {
+                    it.last_json_error = 0;
+                    Value::Bool(true)
+                }
+                Err(code) => {
+                    it.last_json_error = code;
+                    Value::Bool(false)
+                }
+            }
         }
         _ => return Ok(None),
     }))
@@ -149,6 +175,7 @@ fn json_err_msg(code: i64) -> &'static str {
         6 => "Recursion detected",
         7 => "Inf and NaN cannot be JSON encoded",
         8 => "Type is not supported",
+        9 => "The decoded property name is invalid",
         10 => "Single unpaired UTF-16 surrogate in unicode escape",
         _ => "Unknown error",
     }
@@ -222,9 +249,28 @@ struct Enc<'x> {
 /// (three Rust frames per level; zend charges its own encoder frames).
 const LEVEL_BYTES: i64 = 1024;
 
+/// A json error code, or a real exception thrown by jsonSerialize —
+/// those propagate straight through the encoder (bug73113/68992), never
+/// substituted, not even under PARTIAL.
+enum EncErr {
+    Json(i64),
+    Php(PhpError),
+}
+
+impl From<i64> for EncErr {
+    fn from(code: i64) -> EncErr {
+        EncErr::Json(code)
+    }
+}
+
 /// Returns (output, zend error code) — under PARTIAL_OUTPUT_ON_ERROR the
 /// string still ships and `code` reports the LAST substituted error.
-fn json_encode(it: &mut Interp, v: &Value, flags: i64, max_depth: i64) -> (String, i64) {
+fn json_encode(
+    it: &mut Interp,
+    v: &Value,
+    flags: i64,
+    max_depth: i64,
+) -> Result<(String, i64), PhpError> {
     let esc = Esc::new(flags);
     // ponytail: fixed 4KB head start — not sized to the payload.
     let mut out = String::with_capacity(4096);
@@ -238,14 +284,18 @@ fn json_encode(it: &mut Interp, v: &Value, flags: i64, max_depth: i64) -> (Strin
         lim: if ini > 0 { ini } else { 4 << 20 },
         err: 0,
     };
-    if let Err(code) = json_enc(it, v, &mut cx, &mut out, 0) {
-        cx.err = code;
-        if flags & F_PARTIAL != 0 {
-            out.clear();
-            out.push_str(json_subst(code));
+    match json_enc(it, v, &mut cx, &mut out, 0) {
+        Err(EncErr::Php(e)) => return Err(e),
+        Err(EncErr::Json(code)) => {
+            cx.err = code;
+            if flags & F_PARTIAL != 0 {
+                out.clear();
+                out.push_str(json_subst(code));
+            }
         }
+        Ok(()) => {}
     }
-    (out, cx.err)
+    Ok((out, cx.err))
 }
 
 /// zend's PARTIAL placeholder: `0` for the one error that is a value.
@@ -263,7 +313,7 @@ fn json_enc(
     cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-) -> Result<(), i64> {
+) -> Result<(), EncErr> {
     use std::fmt::Write;
     match v {
         Value::Null => out.push_str("null"),
@@ -271,7 +321,7 @@ fn json_enc(
         Value::Int(i) => write!(out, "{i}").unwrap(),
         Value::Float(f) => {
             if f.is_nan() || f.is_infinite() {
-                return Err(J_INF_NAN);
+                return Err(J_INF_NAN.into());
             }
             json_f64(*f, cx.esc.flags, out);
         }
@@ -294,11 +344,11 @@ fn json_enc(
         Value::Array(a) => {
             let lvl = lvl + 1;
             if lvl > cx.max || lvl * LEVEL_BYTES > cx.lim {
-                return Err(J_DEPTH);
+                return Err(J_DEPTH.into());
             }
             let key = Rc::as_ptr(a) as usize;
             if it.json_enc_stack.contains(&key) {
-                return Err(J_RECURSION);
+                return Err(J_RECURSION.into());
             }
             it.json_enc_stack.push(key);
             let r = json_arr(it, a, cx, out, lvl);
@@ -308,27 +358,30 @@ fn json_enc(
         Value::Object(o) => {
             let lvl = lvl + 1;
             if lvl > cx.max || lvl * LEVEL_BYTES > cx.lim {
-                return Err(J_DEPTH);
+                return Err(J_DEPTH.into());
             }
             let key = Rc::as_ptr(o) as usize;
             if it.json_enc_stack.contains(&key) {
-                return Err(J_RECURSION);
+                return Err(J_RECURSION.into());
             }
             it.json_enc_stack.push(key);
             let r = if it
                 .find_method_in(&o.borrow().class, "jsonserialize")
                 .is_some()
             {
-                let v = it
-                    .method_invoke(o.clone(), "jsonSerialize", crate::interp::CallArgs::empty())
-                    .unwrap_or(Value::Null);
-                if matches!(&v, Value::Object(r) if Rc::ptr_eq(r, o)) {
-                    // gh10519: serialize() returning $this encodes the
-                    // property view, once. Anything else containing $this
-                    // hits the stack check above.
-                    json_obj(it, o, cx, out, lvl)
-                } else {
-                    json_enc(it, &v, cx, out, lvl)
+                match it.method_invoke(o.clone(), "jsonSerialize", crate::interp::CallArgs::empty())
+                {
+                    Err(e) => Err(EncErr::Php(e)),
+                    Ok(v) => {
+                        if matches!(&v, Value::Object(r) if Rc::ptr_eq(r, o)) {
+                            // gh10519: serialize() returning $this encodes the
+                            // property view, once. Anything else containing $this
+                            // hits the stack check above.
+                            json_obj(it, o, cx, out, lvl)
+                        } else {
+                            json_enc(it, &v, cx, out, lvl)
+                        }
+                    }
                 }
             } else {
                 json_obj(it, o, cx, out, lvl)
@@ -337,7 +390,7 @@ fn json_enc(
             return r;
         }
         Value::Callable(_) => out.push_str("{}"),
-        _ => return Err(J_UNSUPPORTED),
+        _ => return Err(J_UNSUPPORTED.into()),
     }
     Ok(())
 }
@@ -350,10 +403,10 @@ fn json_child(
     cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-) -> Result<(), i64> {
+) -> Result<(), EncErr> {
     let start = out.len();
     match json_enc(it, v, cx, out, lvl) {
-        Err(code) if cx.esc.flags & F_PARTIAL != 0 => {
+        Err(EncErr::Json(code)) if cx.esc.flags & F_PARTIAL != 0 => {
             cx.err = code;
             out.truncate(start);
             out.push_str(json_subst(code));
@@ -373,16 +426,29 @@ fn json_arr(
     cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-) -> Result<(), i64> {
-    let a = a.borrow();
-    let is_list = cx.esc.flags & F_FORCE_OBJECT == 0
-        && a.entries
+) -> Result<(), EncErr> {
+    // Snapshot the entries before any element runs: a JsonSerializable
+    // body can unset an element of this very array (bug77843) — holding
+    // the borrow across the loop would double-borrow panic. Tombstones
+    // are dead buckets, not elements (009 keeps a list after unset).
+    let (live, is_list) = {
+        let a = a.borrow();
+        let live: Vec<(ArrKey, Cell)> = a
+            .entries
             .iter()
-            .enumerate()
-            .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64));
+            .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
+            .cloned()
+            .collect();
+        let is_list = cx.esc.flags & F_FORCE_OBJECT == 0
+            && live
+                .iter()
+                .enumerate()
+                .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64));
+        (live, is_list)
+    };
     out.push(if is_list { '[' } else { '{' });
     let mut first = true;
-    for (k, c) in &a.entries {
+    for (k, c) in live {
         if !first {
             out.push(',');
         }
@@ -392,15 +458,16 @@ fn json_arr(
             indent(out, lvl);
         }
         if !is_list {
-            json_key(k, cx.esc, out)?;
+            json_key(&k, cx.esc, out)?;
             out.push(':');
             if cx.esc.pretty() {
                 out.push(' ');
             }
         }
-        json_child(it, &c.borrow(), cx, out, lvl)?;
+        let v = c.borrow().clone();
+        json_child(it, &v, cx, out, lvl)?;
     }
-    if cx.esc.pretty() && !a.entries.is_empty() {
+    if cx.esc.pretty() && !first {
         out.push('\n');
         indent(out, lvl - 1);
     }
@@ -416,7 +483,7 @@ fn json_obj(
     cx: &mut Enc,
     out: &mut String,
     lvl: i64,
-) -> Result<(), i64> {
+) -> Result<(), EncErr> {
     let ao_arr = if matches!(
         o.borrow().internal,
         Some(crate::value::ObjectInternal::ArrayIter { .. })
@@ -433,7 +500,8 @@ fn json_obj(
     out.push('{');
     let mut first = true;
     if let Some(arr) = ao_arr {
-        for (k, c) in arr.borrow().iter() {
+        let entries: Vec<(ArrKey, Cell)> = arr.borrow().iter().cloned().collect();
+        for (k, c) in entries {
             if !first {
                 out.push(',');
             }
@@ -442,12 +510,13 @@ fn json_obj(
                 out.push('\n');
                 indent(out, lvl);
             }
-            json_key(k, cx.esc, out)?;
+            json_key(&k, cx.esc, out)?;
             out.push(':');
             if cx.esc.pretty() {
                 out.push(' ');
             }
-            json_child(it, &c.borrow(), cx, out, lvl)?;
+            let v = c.borrow().clone();
+            json_child(it, &v, cx, out, lvl)?;
         }
     } else if let Some(dtp) = dtp {
         for (k, v) in dtp.iter() {
@@ -481,7 +550,16 @@ fn json_obj(
                 None => name,
             };
             let v = match &decl {
-                Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
+                Some((p, dcls)) => {
+                    let v = it.serial_entry_value(o, p, dcls, &slot);
+                    // serial_entry_value swallows a get-hook throw — the
+                    // throwable survives in pending_exception; zend
+                    // releases it out of the encoder (hooked prop test).
+                    match it.take_pending_exception() {
+                        Some(x) => return Err(EncErr::Php(it.throw_value(x))),
+                        None => v,
+                    }
+                }
                 None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
             };
             if let Some(v) = v {
@@ -590,8 +668,7 @@ fn json_str(s: &[u8], esc: &Esc, out: &mut String) -> Result<(), i64> {
                     }
                     i += n;
                 } else if esc.flags & F_UTF8_IGNORE != 0 {
-                    // zend substitutes per bad byte, not per sequence.
-                    i += 1;
+                    i += bad_seq_len(s, i);
                 } else if esc.flags & F_UTF8_SUB != 0 {
                     // The substitute is a real U+FFFD — it goes out raw
                     // under UNESCAPED_UNICODE like any other char.
@@ -600,7 +677,7 @@ fn json_str(s: &[u8], esc: &Esc, out: &mut String) -> Result<(), i64> {
                     } else {
                         out.push_str("\\ufffd");
                     }
-                    i += 1;
+                    i += bad_seq_len(s, i);
                 } else {
                     return Err(J_UTF8);
                 }
@@ -721,6 +798,11 @@ fn json_value(
                 *pos += 1;
                 return Ok(Value::Array(Rc::new(RefCell::new(a))));
             }
+            if b.get(*pos) == Some(&b'}') {
+                // A closer of the other kind where one is legal is a
+                // state mismatch (err2), not a syntax error.
+                return Err(J_STATE);
+            }
             loop {
                 let v = json_value(it, b, pos, cx, rem)?;
                 a.push(v);
@@ -731,6 +813,7 @@ fn json_value(
                         *pos += 1;
                         break;
                     }
+                    Some(b'}') => return Err(J_STATE),
                     _ => return Err(J_SYNTAX),
                 }
             }
@@ -750,6 +833,9 @@ fn json_value(
                 } else {
                     stdclass(it, HashMap::new(), Vec::new())
                 });
+            }
+            if b.get(*pos) == Some(&b']') {
+                return Err(J_STATE);
             }
             if cx.assoc {
                 let mut a = PhpArray::new();
@@ -774,6 +860,7 @@ fn json_value(
                             *pos += 1;
                             break;
                         }
+                        Some(b']') => return Err(J_STATE),
                         _ => return Err(J_SYNTAX),
                     }
                 }
@@ -796,6 +883,11 @@ fn json_value(
                     }
                     *pos += 1;
                     let v = json_value(it, b, pos, cx, rem)?;
+                    // \0-prefixed names are zend's private-prop mangling
+                    // form — illegal as a decoded member (bug68546).
+                    if k.starts_with('\0') {
+                        return Err(J_PROPNAME);
+                    }
                     if !props.contains_key(&k) {
                         order.push(k.clone());
                     }
@@ -807,6 +899,7 @@ fn json_value(
                             *pos += 1;
                             break;
                         }
+                        Some(b']') => return Err(J_STATE),
                         _ => return Err(J_SYNTAX),
                     }
                 }
@@ -1071,6 +1164,22 @@ fn hex4(b: &[u8], i: usize) -> Option<u32> {
 fn utf8_seq_len(b: &[u8], i: usize) -> Option<usize> {
     let n = utf8_len(b[i]);
     (i + n <= b.len() && std::str::from_utf8(&b[i..i + n]).is_ok()).then_some(n)
+}
+
+/// Size of one broken utf8 "sequence" at s[i] — zend's encoder charges
+/// a valid lead byte (C2-F4) plus every continuation byte after it as a
+/// single error (one FFFD / one ignored unit); anything else is 1 byte.
+/// (Decode and ws-scan still work per byte.)
+fn bad_seq_len(s: &[u8], i: usize) -> usize {
+    if !(0xc2..=0xf4).contains(&s[i]) {
+        return 1;
+    }
+    let n = utf8_len(s[i]);
+    let mut j = i + 1;
+    while j < s.len() && j - i < n && s[j] & 0xc0 == 0x80 {
+        j += 1;
+    }
+    j - i
 }
 
 fn utf8_len(b: u8) -> usize {
