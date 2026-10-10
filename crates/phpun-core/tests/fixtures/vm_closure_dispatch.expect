@@ -5,6 +5,7 @@
 7:7
 ArgumentCountError:1
 TypeError:2
-13
+13:3
+held-native-closure
 receiver-destroyed
 6,10

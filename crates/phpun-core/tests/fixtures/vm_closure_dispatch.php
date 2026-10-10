@@ -20,11 +20,15 @@ foreach ([fn() => $scalar(1), fn() => $scalar([], 2)] as $bad) {
 class ClosureReceiver {
     private int $n = 11;
     public function make() { return fn(int $x): int => $this->n + $x; }
+    public function make_scalar() { return fn(int $x): int => $x + 1; }
     public function __destruct() { echo "receiver-destroyed\n"; }
 }
 $receiver = new ClosureReceiver();
 $bound = $receiver->make();
+$scalar_bound = $receiver->make_scalar();
 unset($receiver);
-echo $bound(2), "\n";
+echo $bound(2), ':', $scalar_bound(2), "\n";
 unset($bound);
+echo "held-native-closure\n";
+unset($scalar_bound);
 echo implode(',', array_map($scalar, [1, 2], [3, 4])), "\n";

@@ -11,6 +11,7 @@ cases += [('bench/profile/strings.php', mode, '10') for mode in ('repeat', 'repl
 cases += [('bench/profile/objects.php', mode, '10') for mode in ('ctor', 'norm', 'scaled')]
 cases += [('bench/profile/fib.php', mode, '10', '2') for mode in ('typed', 'untyped')]
 cases += [('bench/profile/closures.php', '30')]
+cases += [('bench/profile/closures.php', '30', 'scalar')]
 cases += [('bench/app/cli.php', '10', '2')]
 cases += [('examples/composer/run.php',)]
 if os.environ.get('BENCH_REAL_APPS') == '1':
