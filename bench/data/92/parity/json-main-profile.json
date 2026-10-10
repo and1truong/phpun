@@ -1,0 +1,27 @@
+{
+  "runtime": "a5dc13f",
+  "merged_main_runtime_equivalent": "3a792db",
+  "samples": 1138,
+  "lost": 0,
+  "event": "cpu-clock:u",
+  "frequency": 199,
+  "dwarf_bytes": 8192,
+  "argv": [
+    "bench/60-json.php",
+    "300"
+  ],
+  "exclusive_percent": {
+    "json_value": 9.67,
+    "json_enc": 8.17,
+    "malloc": 7.82,
+    "cfree": 7.21,
+    "Utf8Chunks_next": 6.5,
+    "String_from_utf8_lossy": 4.13,
+    "json_str": 4.57
+  },
+  "limits": [
+    "sample weights and inlining; function CPU not pure allocation CPU",
+    "libc unresolved symbols retained"
+  ],
+  "command": "perf record -e cpu-clock:u -F 199 --call-graph dwarf,8192 -o DATA -- BIN bench/60-json.php 300"
+}

@@ -278,3 +278,23 @@ a speedup claim; by-reference constructors still use canonical binding.
 status unchanged including3existing crashes/4timeouts. All18ctor_promotion PHPT gain
 ctor_promotion_by_ref (6→7pass), no regressions. Workspace tests/fmt/clippy pass.
 Raw per-test maps and summary in bench/data/92/parity/promoted-reference-gates.json.
+
+## JSON allocation and ASCII decode runs (#187)
+
+Main-equivalenta5dc13f CPU profile:1138 samples, zero lost; malloc7.82%,cfree7.21%,
+Utf8Chunks6.50%,String::from_utf8_lossy4.13%exclusive. Runtime03dcdb3 streams
+encoding into one sink instead of per-child strings/Vec<String>/join and borrows
+string keys. Decoding scans ASCII runs instead of UTF8-validating/copying each byte.
+Non-ASCII/escape paths and existing child-null/serialization scopes remain canonical.
+
+Seven alternating samples beforeb2c21b3→03dcdb3: JSON30 941.365→720.657ms (0.766);
+JSON150 2966.980→1937.965 (0.653). Strings234.257→234.408,objects336.632→330.512,
+sieve246.755→242.513,app45.893→43.204: overlapping ranges, no broad gain claim.
+All reps match PHP8.5.11 exit/stdout/stderr.300JSON/hooks PHPT every status unchanged
+(218pass,73fail,3unsupported,6existing JSON recursion crashes). Workspace tests,
+fmt/clippy pass; retained oracle covers flags/unicode/surrogates/NUL/scalars/key order,
+JsonSerializable/hooked getters/nested object decode. Parent reviews00f9c7f/160643a
+were merged after these frozen timings; final-stack measurements are separate.
+
+This removes temporary string allocations, not inline packed array storage or
+shape-generation caches. Raw hashes/samples/status maps/profile in bench/data/92/parity/json-*.
