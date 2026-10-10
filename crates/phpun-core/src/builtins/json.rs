@@ -1,6 +1,7 @@
 //! json_encode/json_decode and their error reporting.
 
 use super::*;
+use std::borrow::Cow;
 
 // zend JSON error codes (what json_last_error reports).
 const J_DEPTH: i64 = 1;
@@ -58,7 +59,17 @@ pub(crate) fn dispatch(
             }
         }
         "json_decode" => {
-            let s = arg_bs(it, args, 0);
+            // Borrow the input when it's already a string — arg_bs
+            // copies the whole document otherwise.
+            let s0 = arg(args, 0);
+            let owned;
+            let s: &[u8] = match &s0 {
+                Value::Str(s) => s,
+                _ => {
+                    owned = arg_bs(it, args, 0);
+                    &owned
+                }
+            };
             // An explicit assoc wins; OBJECT_AS_ARRAY only fills the
             // default when arg 2 is null/missing (zend parity).
             let assoc = if matches!(arg(args, 1), Value::Null) {
@@ -79,7 +90,7 @@ pub(crate) fn dispatch(
                 return Err(it.throw_value(e));
             }
             let flags = arg(args, 3).to_int();
-            match json_decode(it, &s, assoc, depth, flags) {
+            match json_decode(it, s, assoc, depth, flags) {
                 Ok(v) => {
                     it.last_json_error = 0;
                     v
@@ -97,7 +108,15 @@ pub(crate) fn dispatch(
         "json_last_error" => Value::Int(it.last_json_error),
         "json_last_error_msg" => Value::str(json_err_msg(it.last_json_error).to_string()),
         "json_validate" => {
-            let s = arg_bs(it, args, 0);
+            let s0 = arg(args, 0);
+            let owned;
+            let s: &[u8] = match &s0 {
+                Value::Str(s) => s,
+                _ => {
+                    owned = arg_bs(it, args, 0);
+                    &owned
+                }
+            };
             let depth = if args.len() > 1 {
                 arg(args, 1).to_int()
             } else {
@@ -111,7 +130,7 @@ pub(crate) fn dispatch(
                 return Err(it.throw_value(e));
             }
             let flags = arg(args, 2).to_int();
-            Value::Bool(json_decode(it, &s, true, depth, flags).is_ok())
+            Value::Bool(json_decode(it, s, true, depth, flags).is_ok())
         }
         _ => return Ok(None),
     }))
@@ -651,7 +670,7 @@ fn json_value(
         Some(b'f') => json_lit(b, pos, b"false", Value::Bool(false)),
         Some(b'"') => {
             *pos += 1;
-            Ok(Value::bytes(jstr(b, pos, flags)?))
+            Ok(Value::bytes(jstr(b, pos, flags)?.into_owned()))
         }
         Some(b'[') => {
             *pos += 1;
@@ -733,7 +752,8 @@ fn json_value(
                         return Err(J_SYNTAX);
                     }
                     *pos += 1;
-                    let k = String::from_utf8(jstr(b, pos, flags)?).map_err(|_| J_UTF8)?;
+                    let k = String::from_utf8(jstr(b, pos, flags)?.into_owned())
+                        .map_err(|_| J_UTF8)?;
                     json_ws(b, pos)?;
                     if b.get(*pos) != Some(&b':') {
                         return Err(J_SYNTAX);
@@ -862,7 +882,7 @@ fn jnum(b: &[u8], pos: &mut usize, flags: i64) -> Result<Value, i64> {
 /// String-content scanner — caller consumed the opening `"`; on return
 /// `*pos` sits past the closing quote. Fast path borrows the span when no
 /// escapes; unterminated input lands in zend's CTRL bucket (err3).
-fn jstr(b: &[u8], pos: &mut usize, flags: i64) -> Result<Vec<u8>, i64> {
+fn jstr<'a>(b: &'a [u8], pos: &mut usize, flags: i64) -> Result<Cow<'a, [u8]>, i64> {
     let mut p = *pos;
     let mut hi = false;
     loop {
@@ -880,21 +900,26 @@ fn jstr(b: &[u8], pos: &mut usize, flags: i64) -> Result<Vec<u8>, i64> {
     let span = &b[*pos..p];
     *pos = p + 1;
     if !hi {
-        return Ok(span.to_vec());
+        return Ok(Cow::Borrowed(span));
     }
     match std::str::from_utf8(span) {
-        Ok(_) => Ok(span.to_vec()),
+        Ok(_) => Ok(Cow::Borrowed(span)),
         Err(_) if flags & (F_UTF8_IGNORE | F_UTF8_SUB) == 0 => Err(J_UTF8),
         Err(_) => {
             let mut out = Vec::with_capacity(span.len());
             utf8_filter(&mut out, span, flags);
-            Ok(out)
+            Ok(Cow::Owned(out))
         }
     }
 }
 
 /// Slow path once the first `\` is seen; `p` points at it.
-fn jstr_esc(b: &[u8], pos: &mut usize, mut p: usize, flags: i64) -> Result<Vec<u8>, i64> {
+fn jstr_esc<'a>(
+    b: &'a [u8],
+    pos: &mut usize,
+    mut p: usize,
+    flags: i64,
+) -> Result<Cow<'a, [u8]>, i64> {
     let mut out = Vec::with_capacity(32);
     let mut run = *pos;
     loop {
@@ -903,7 +928,7 @@ fn jstr_esc(b: &[u8], pos: &mut usize, mut p: usize, flags: i64) -> Result<Vec<u
             Some(b'"') => {
                 push_span(&mut out, &b[run..p], flags)?;
                 *pos = p + 1;
-                return Ok(out);
+                return Ok(Cow::Owned(out));
             }
             Some(b'\\') => {
                 push_span(&mut out, &b[run..p], flags)?;
