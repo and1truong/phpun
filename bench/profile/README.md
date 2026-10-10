@@ -9,6 +9,7 @@ benchmark. They live outside the nine-script rolling baseline glob.
 - `objects.php ctor|norm|scaled [size]`
 - `fib.php typed|untyped [n] [iterations]`
 - `closures.php [iterations] [captured|scalar]`: arrow creation/calls with unrelated live locals
+- `foreach.php [size]`: array traversal with a scalar loop body
 - `../app/cli.php [rows] [iterations]`: PSR-4 style autoload and a report component
   with callback sorting and JSON; an application-shaped probe, not a framework
   production benchmark.

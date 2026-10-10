@@ -38,6 +38,7 @@ pub(crate) struct Compiled {
     /// Canonical expression operations retain AST semantics inside VM control flow.
     hybrid: bool,
     top_level: bool,
+    loop_body: bool,
     /// Slot count — params occupy the first `decl.params.len()` slots.
     nslots: usize,
     /// Param name → slot index — the bound (typed/variadic/named-arg)
@@ -100,7 +101,7 @@ macro_rules! padd {
 }
 
 // Opt-in diagnostics: cache lookups are not calls or elapsed-time shares.
-const COVERAGE_NAMES: [&str; 21] = [
+const COVERAGE_NAMES: [&str; 22] = [
     "compiled-lookup",
     "executed-body",
     "reference-return",
@@ -122,9 +123,10 @@ const COVERAGE_NAMES: [&str; 21] = [
     "hybrid-lookup",
     "hybrid-body",
     "top-level-entry",
+    "loop-body-entry",
 ];
-static COVERAGE: [std::sync::atomic::AtomicU64; 21] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 21];
+static COVERAGE: [std::sync::atomic::AtomicU64; 22] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 22];
 
 fn coverage_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -149,6 +151,13 @@ enum Op {
         name: Rc<str>,
         site: usize,
         fallback: Box<Expr>,
+    },
+    Foreach {
+        arr: Box<Expr>,
+        key: Option<crate::ast::ForeachKey>,
+        val: crate::ast::ForeachTarget,
+        body: Rc<Compiled>,
+        depth: u32,
     },
     CanonicalStmt {
         stmt: Box<Stmt>,
@@ -352,14 +361,17 @@ impl Compiled {
                 }
             })
             .collect();
-        let canonical_binding = c
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::Canonical(_) | Op::CanonicalStmt { .. }));
+        let canonical_binding = c.ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::Canonical(_) | Op::CanonicalStmt { .. } | Op::Foreach { .. }
+            )
+        });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
+            loop_body: false,
             nslots: c.slots.len(),
             names: c.slots,
             ops: c.ops,
@@ -371,6 +383,46 @@ impl Compiled {
                 || decl.name.eq_ignore_ascii_case("__toString"),
             ret_fast,
             param_fast,
+        }))
+    }
+
+    fn compile_loop(
+        body: &[Stmt],
+        assigned: &std::collections::HashSet<String>,
+        top_level: bool,
+    ) -> Option<Rc<Self>> {
+        let mut c = Compiler {
+            ops: Vec::new(),
+            slots: FxMap::default(),
+            loops: Vec::new(),
+            assigned: assigned.clone(),
+            fallback: "other",
+            top_level,
+        };
+        c.stmts(body)?;
+        // ponytail: nonlocal break/continue, scope and unwind statements
+        // retain the canonical body. This subset has no relative AST jump
+        // targets; the shared iterator still owns reference/cursor semantics.
+        if c.slots.len() > u16::MAX as usize + 1
+            || c.ops.iter().all(|op| matches!(op, Op::Line(_)))
+            || c.ops
+                .iter()
+                .any(|op| matches!(op, Op::CanonicalStmt { .. }))
+        {
+            return None;
+        }
+        Some(Rc::new(Self {
+            nslots: c.slots.len(),
+            names: c.slots,
+            ops: c.ops,
+            hybrid: true,
+            top_level,
+            loop_body: true,
+            defaults: Vec::new(),
+            bind_free: false,
+            needs_bind: true,
+            ret_fast: None,
+            param_fast: Vec::new(),
         }))
     }
 }
@@ -403,8 +455,47 @@ fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>)
                 inc.iter().for_each(|e| collect_assigned_e(e, out));
                 collect_assigned(body, out);
             }
+            Stmt::Foreach {
+                arr,
+                key,
+                val,
+                body,
+            } => {
+                collect_assigned_e(arr, out);
+                if let Some(crate::ast::ForeachKey::Var(name)) = key {
+                    out.insert(name.clone());
+                }
+                collect_assigned_foreach(val, out);
+                collect_assigned(body, out);
+            }
             Stmt::Block(b) => collect_assigned(b, out),
             _ => {}
+        }
+    }
+}
+
+fn collect_assigned_foreach(
+    target: &crate::ast::ForeachTarget,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::ForeachTarget;
+    match target {
+        ForeachTarget::Var(name) => {
+            out.insert(name.clone());
+        }
+        ForeachTarget::ByRef(e) | ForeachTarget::Lvalue(e) => {
+            if let Expr::Var(name) = &**e {
+                out.insert(name.clone());
+            }
+            collect_assigned_e(e, out);
+        }
+        ForeachTarget::List(items) => {
+            for (key, target) in items.iter().flatten() {
+                if let Some(key) = key {
+                    collect_assigned_e(key, out);
+                }
+                collect_assigned_foreach(target, out);
+            }
         }
     }
 }
@@ -498,6 +589,24 @@ impl Compiler {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Bail {
+        if let Stmt::Foreach {
+            arr,
+            key,
+            val,
+            body,
+        } = s
+        {
+            if let Some(body) = Compiled::compile_loop(body, &self.assigned, self.top_level) {
+                self.emit(Op::Foreach {
+                    arr: Box::new(arr.clone()),
+                    key: key.clone(),
+                    val: val.clone(),
+                    body,
+                    depth: self.loops.len() as u32,
+                });
+                return Some(());
+            }
+        }
         self.fallback = match s {
             Stmt::Foreach { .. } => "foreach",
             Stmt::Switch { .. } => "switch",
@@ -1368,12 +1477,14 @@ impl<'a> Interp<'a> {
         slots: &mut [Slot],
         tmark: usize,
     ) -> Result<Flow, PhpError> {
-        if comp.top_level {
+        if comp.loop_body {
+            coverage_hit("loop-body-entry");
+        } else if comp.top_level {
             coverage_hit("top-level-entry");
         } else {
             coverage_hit("executed-body");
         }
-        if comp.hybrid && !comp.top_level {
+        if comp.hybrid && !comp.top_level && !comp.loop_body {
             coverage_hit("hybrid-body");
         }
         // Value-stack/argv vecs come from a per-Interp pool — a call
@@ -1584,9 +1695,36 @@ impl<'a> Interp<'a> {
         targets: &mut Vec<CachedFn>,
     ) -> Result<Flow, PhpError> {
         let mut pc = 0usize;
+        let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
+                Op::Foreach {
+                    arr,
+                    key,
+                    val,
+                    body,
+                    depth,
+                } => {
+                    self.vm_materialize(comp, slots);
+                    let previous_depth =
+                        std::mem::replace(&mut self.loop_depth, base_depth + depth);
+                    let flow = self.exec_foreach_with(arr, key, val, &mut |s| {
+                        s.loop_depth += 1;
+                        let result = s.vm_scope_exec(body, true);
+                        let flow = match result {
+                            Ok(flow) => flow,
+                            Err(error) => s.err_flow(error),
+                        };
+                        s.loop_depth -= 1;
+                        flow
+                    });
+                    self.loop_depth = previous_depth;
+                    self.vm_refresh(comp, slots);
+                    if !matches!(flow, Flow::Normal) {
+                        return Ok(flow);
+                    }
+                }
                 Op::ThisProp {
                     name,
                     site,
@@ -1838,6 +1976,10 @@ impl<'a> Interp<'a> {
     /// Slot::V. Caller converts Err through err_flow, exactly like
     /// exec_block's stmt-level failures.
     pub(in crate::interp) fn vm_bound_exec(&mut self, comp: &Compiled) -> Result<Flow, PhpError> {
+        self.vm_scope_exec(comp, comp.top_level)
+    }
+
+    fn vm_scope_exec(&mut self, comp: &Compiled, keep_vars: bool) -> Result<Flow, PhpError> {
         let mut slots = self
             .vm_slot_pool
             .pop()
@@ -1851,7 +1993,7 @@ impl<'a> Interp<'a> {
         let r = self.vm_exec(comp, &mut slots, self.expr_temps.len());
         // Slot-V objects die with the frame like a CV decref (Slot::C
         // cells are f.vars — bind's own frame teardown owns those).
-        let derr = if comp.top_level {
+        let derr = if keep_vars {
             self.vm_materialize(comp, &mut slots);
             None // Globals live until canonical request shutdown.
         } else {

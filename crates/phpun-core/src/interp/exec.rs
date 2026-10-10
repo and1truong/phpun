@@ -1235,6 +1235,16 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
+        self.exec_foreach_with(arr, key, val, &mut |s| s.exec_loop_body(body))
+    }
+
+    pub(in crate::interp) fn exec_foreach_with(
+        &mut self,
+        arr: &Expr,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &mut dyn FnMut(&mut Self) -> Flow,
+    ) -> Flow {
         if matches!(key, Some(ForeachKey::ByRef)) {
             // A compile fatal in Zend (`foreach as &$k => $v` dies at
             // compile time with a `{main}`-or-chain backtrace).
@@ -1382,7 +1392,7 @@ impl<'a> Interp<'a> {
                                 }
                             }
                         }
-                        match self.exec_loop_body(body) {
+                        match body(self) {
                             Flow::Break(0) | Flow::Break(1) => break Flow::Normal,
                             Flow::Break(n) => break Flow::Break(n - 1),
                             Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -1462,7 +1472,7 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
-                    match self.exec_loop_body(body) {
+                    match body(self) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -1759,7 +1769,7 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
-                    match self.exec_loop_body(body) {
+                    match body(self) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
@@ -1805,7 +1815,7 @@ impl<'a> Interp<'a> {
         it: Rc<RefCell<PhpObject>>,
         key: &Option<ForeachKey>,
         val: &ForeachTarget,
-        body: &[Stmt],
+        body: &mut dyn FnMut(&mut Self) -> Flow,
         iter_site: usize,
         stmt_line: usize,
     ) -> Flow {
@@ -1848,7 +1858,7 @@ impl<'a> Interp<'a> {
         it: Rc<RefCell<PhpObject>>,
         key: &Option<ForeachKey>,
         val: &ForeachTarget,
-        body: &[Stmt],
+        body: &mut dyn FnMut(&mut Self) -> Flow,
         stmt_line: usize,
     ) -> Flow {
         if let Err(e) = self.iter_call(&it, "rewind") {
@@ -1925,7 +1935,7 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            match self.exec_loop_body(body) {
+            match body(self) {
                 Flow::Break(0) | Flow::Break(1) => break,
                 Flow::Break(n) => return Flow::Break(n - 1),
                 Flow::Continue(0) | Flow::Continue(1) => {}

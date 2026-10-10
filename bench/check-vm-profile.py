@@ -35,3 +35,10 @@ root = Path('crates/phpun-core/tests/fixtures/vm_top_level.php')
 prof = subprocess.run([binary, str(root)], env=dict(os.environ, PHPUN_VMPROF='1'), capture_output=True)
 assert prof.returncode == 0 and prof.stdout == root.with_suffix('.expect').read_bytes(), prof
 assert b'vm-coverage: top-level-entry=1\n' in prof.stderr, prof.stderr
+
+loops = Path('crates/phpun-core/tests/fixtures/vm_foreach_bodies.php')
+prof = subprocess.run([binary, str(loops)], env=dict(os.environ, PHPUN_VMPROF='1'), capture_output=True)
+assert prof.returncode == 0 and prof.stdout == loops.with_suffix('.expect').read_bytes(), prof
+counters = dict(line.removeprefix('vm-coverage: ').split('=')
+                for line in prof.stderr.decode().splitlines() if line.startswith('vm-coverage: '))
+assert int(counters['loop-body-entry']) > 0, prof.stderr

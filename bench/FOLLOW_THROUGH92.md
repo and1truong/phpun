@@ -188,3 +188,89 @@ bucket summaries. The new classifier's self-check tests overlapping caller/calle
 stacks and keeps other/incomplete samples explicit.
 
 Raw data: [data/92/follow-through/array-insert-bound](data/92/follow-through/array-insert-bound).
+
+## Foreach body bytecode — runtime 0fe4140 vs bbbd74d
+
+Eligible foreach bodies compile into a separate body program while the existing
+array/reference/object/Iterator driver owns cursor, binding, append and unwind
+semantics. Locals synchronize at iteration boundaries and remain alive until the
+enclosing frame teardown, including return/error paths. There is no synthetic
+function frame or new iterator implementation. Scope/unwind statements and
+nonlocal jumps retain canonical body execution. Empty bodies remain canonical;
+root files containing only foreach do not acquire a new cold compilation path.
+Nested compiled loops preserve the enclosing loop-depth context.
+
+The new `loop-body-entry` counter records actual entries separately from function
+body, hybrid function body and root entries. It is not a CPU-time share.
+Oracle fixture covers arrays and ArrayIterator, by-reference dynamic append and
+last-variable aliases, try/finally+break/continue fallback, nested loops, early
+return and destructor/local lifetime. Workspace fmt/tests/clippy pass; all VM
+oracle fixtures plus 19 workload probes and the CPU-classifier self-check pass.
+
+1,232 foreach/ArrayAccess/switch/try/match/generator/standard-array PHPT tests run
+sequentially before/after at 30s with four workers: **858 pass, 353 existing fail,
+7 skip, 5 unsupported, 7 existing crashes, 2 existing timeouts**; every status is
+identical. Existing incompatibilities are not claimed fixed. Generators still
+use AST fallback and native iterator/unwind expansion remains conditional in #92.
+
+Seven alternating profiler-off release pairs, each exit/stdout/stderr gated
+against PHP 8.5.11 `-n`, measured after PHPT completed:
+
+| Workload | Before median [min,max] ms | After median [min,max] ms | Change |
+|---|---:|---:|---:|
+| `bench/profile/foreach.php 100000` | 63.086 [59.722, 70.210] | 55.139 [49.858, 59.711] | -12.6% |
+| `bench/30-arrays.php` | 234.972 [220.588, 239.699] | 235.135 [222.396, 244.313] | +0.1% |
+| `bench/40-objects.php` | 480.773 [435.760, 524.302] | 451.431 [427.999, 500.026] | -6.1% |
+| `bench/profile/arrays.php keys 20000` | 68.985 [63.307, 74.091] | 69.851 [64.875, 77.439] | +1.3% |
+| `examples/composer/run.php` | 8.525 [6.955, 10.498] | 10.560 [7.043, 13.480] | +23.9% |
+
+The foreach probe improves 12.6% with separated ranges in this run. Other ranges
+overlap; do not claim generic object/startup improvements from this step. The
+7-pair Composer result is noisy. A **31-pair** cold check gives Composer
+7.026→7.082 ms (+0.8%) and startup 5.057→5.079 ms (+0.4%), with raw samples retained.
+The first timing run overlapped PHPT and is archived as a rejected speed basis.
+Profiler diagnostics are separate; no claim that iterator handling is native.
+
+## Whole follow-through versus current main dd99cac
+
+Exact frozen current-main `dd99cac1c27910b331ff7cdeace545777ea3ea73` versus final
+runtime `0fe4140814a3035396c52f654277d061ce5e29cf`, same host, seven alternating
+profiler-off release reps. Every pair matches PHP 8.5.11 output, stderr and exit.
+The full CLI/real-library set uses PHP `-n` plus genuine mbstring 8.5.11; focused
+closure/foreach/Composer cases use `-n`. Runtime/binary/config hashes, argv, raw
+samples and ranges are archived; raw `source` is the working directory's benchmark
+source head, not the binary's runtime commit. Runtime provenance is explicit.
+
+| Workload | Before median [min,max] ms | After median [min,max] ms | Change |
+|---|---:|---:|---:|
+| `bench/00-startup.php` | 5.502 [4.869, 6.973] | 5.296 [4.947, 7.411] | -3.8% |
+| `bench/10-fib.php` | 208.359 [205.300, 227.041] | 207.090 [198.418, 219.554] | -0.6% |
+| `bench/11-sieve.php` | 231.072 [222.908, 241.107] | 228.990 [219.682, 245.519] | -0.9% |
+| `bench/20-strings.php` | 623.345 [608.961, 703.656] | 618.089 [607.577, 668.999] | -0.8% |
+| `bench/30-arrays.php` | 1194.238 [1144.487, 1253.653] | 234.631 [216.942, 263.061] | -80.4% |
+| `bench/40-objects.php` | 546.384 [477.785, 583.482] | 474.854 [418.097, 570.509] | -13.1% |
+| `bench/50-regex.php` | 40.562 [37.262, 47.950] | 40.377 [38.584, 45.091] | -0.5% |
+| `bench/60-json.php` | 960.846 [903.388, 1016.241] | 948.608 [923.298, 1041.432] | -1.3% |
+| `bench/70-db.php` | 138.133 [124.387, 153.955] | 131.503 [127.821, 155.565] | -4.8% |
+| `examples/doctrine-inflector/demo.php` | 48.734 [46.277, 55.253] | 49.516 [45.683, 53.512] | +1.6% |
+| `examples/symfony-console/console.php app:greet World --yell -i 2 --no-ansi` | 92.874 [87.310, 102.285] | 94.929 [89.130, 100.501] | +2.2% |
+
+Additional focused cases, a separate paired run:
+
+| Workload | Before median [min,max] ms | After median [min,max] ms | Change |
+|---|---:|---:|---:|
+| `bench/profile/foreach.php 100000` | 63.107 [59.678, 69.641] | 50.102 [48.879, 52.655] | -20.6% |
+| `bench/profile/closures.php 20000` | 244.870 [236.556, 272.306] | 155.713 [153.243, 185.799] | -36.4% |
+| `bench/profile/closures.php 20000 scalar` | 222.940 [217.607, 248.562] | 121.002 [118.234, 137.621] | -45.7% |
+| `examples/composer/run.php` | 6.548 [6.199, 10.726] | 6.379 [6.177, 7.675] | -2.6% |
+
+Arrays improve **80.4%** against the current-main baseline, objects **13.1%**;
+captured/scalar closure probes improve 36.4%/45.7% and foreach 20.6% in their
+separate paired run. Small changes in the remaining cases overlap their ranges;
+Doctrine/Symfony cold demos do not establish an application-wide win. No production
+PHP-FPM/OPcache comparison is claimed. These new paired results supersede neither
+the old frozen `308cc05` report nor its differently based historical gains.
+Do not add successive step percentages or compare PHP startup between hosts.
+
+Raw data, rejected/noisy runs and PHPT status lists:
+[data/92/follow-through/foreach-bodies](data/92/follow-through/foreach-bodies).

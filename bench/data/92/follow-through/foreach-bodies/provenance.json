@@ -1,0 +1,35 @@
+{
+  "baseline_runtime": "bbbd74d9b65d45033c4f3d831df62d7bdabb2628",
+  "candidate_runtime": "0fe4140814a3035396c52f654277d061ce5e29cf",
+  "aggregate_baseline": "dd99cac1c27910b331ff7cdeace545777ea3ea73",
+  "build": "rustc 1.99.0; cargo build --offline --release; LTO=true/codegen-units=1",
+  "benchmark_source": "0fe4140814a3035396c52f654277d061ce5e29cf (new foreach script); existing workload source in parent 57ee5c2 is identical",
+  "raw_source_field": "working directory git head, not a substitute for binary provenance",
+  "php": "8.5.11; -n; main-final.json real-app gate additionally loads mbstring 8.5.11",
+  "mbstring_sha256": "faf63a2fd2e88e1c52c5de9acf583e8cececb46100d3dd5d36438010ba637e0d",
+  "initial_run": "timings.json overlapped the final PHPT runner; retained but not used to establish speed claims",
+  "repeat_run": "timings-isolated.json after PHPT finished; cold Composer/startup repeated 31 pairs due noisy 7-rep Composer result",
+  "checks": {
+    "foreach-depth-build.log": {
+      "sha256": "993a68888ab24b5389b19df50aa594757c0668d5ac322c263f129d5d62392932",
+      "tail": "   Compiling phpun-core v0.0.0 (/workspace/phpun-foreach/crates/phpun-core)\n   Compiling phpun v0.0.0 (/workspace/phpun-foreach/crates/phpun)\n    Finished `release` profile [optimized] target(s) in 1m 39s\n"
+    },
+    "foreach-depth-test.log": {
+      "sha256": "f8537a71cbf12721cc18e28b19c97cc5b2a1795ff60659ccfa7e278afb119eff",
+      "tail": "\ntest inline_html ... ok\ntest declare_and_use ... ok\ntest match_arms ... ok\ntest shebang ... ok\ntest named_args_and_attrs ... ok\ntest statements_and_indent ... ok\ntest switch_case ... ok\ntest operators ... ok\ntest try_catch ... ok\ntest unified_diff_basic ... ok\ntest types ... ok\n\ntest result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running tests/runtime.rs (/workspace/phpun/target/debug/deps/runtime-100d555ae9b14e44)\n\nrunning 8 tests\ntest globals_view_aliases ... ok\ntest closure_bind_scope_isolation ... ok\ntest attribute_reflection_new_instance ... ok\ntest named_args_func_get_args ... ok\ntest named_args_positional_after_named_is_compile_fatal ... ok\ntest static_prop_default_dir_is_declaring_file ... ok\ntest trampoline_frames_hidden ... ok\ntest fixtures ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s\n\n     Running unittests src/lib.rs (/workspace/phpun/target/debug/deps/phpun_phpt-5d9625530d5aecc0)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Doc-tests phpun_core\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Doc-tests phpun_phpt\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+    },
+    "foreach-depth-clippy.log": {
+      "sha256": "6b7c8fe3b02b33867f147792b5906d1dc4210d43d582c4427c2ba09bcd364de1",
+      "tail": "    Checking phpun-core v0.0.0 (/workspace/phpun-foreach/crates/phpun-core)\n    Checking phpun v0.0.0 (/workspace/phpun-foreach/crates/phpun)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.27s\n"
+    }
+  },
+  "sha256": {
+    "main-final.json": "a296f12084a6d56d4ceed3349b27121397fb86c6cd7a1f32561874670870899f",
+    "phpt-summary.json": "318ba5cbb8cdf834641aa50a6ab9ccd3f0e8467a8ab00552bd822567f925c5dc",
+    "timings-isolated.json": "9cbb180e904eced97efbb25de5328cc8c6af0599b1a98c4cdc9ef9d595575d4e",
+    "timings.json": "2e9952d113faf04912bae3be9cd444b2dd3a6d5a93ae23cfae02020f7b718570",
+    "main-final-focused.json": "3254e09a6c9f0c47d73b4ab641294fe83423cadc4776491e60a279080be32c1f",
+    "cold-check-31.json": "ab2cafbb5aafbb5eb3c0ec2665de95fb1d25f1d6de12ae2205a972077ef268f6",
+    "diagnostics.json": "bc3daafec077bd3312b10662efce26448a08904da443d029ca333c2816229f50"
+  }
+}
