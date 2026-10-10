@@ -21,6 +21,8 @@ parser.add_argument('--after-build', required=True)
 parser.add_argument('--reps', type=int, default=7)
 parser.add_argument('--save', type=Path, required=True)
 parser.add_argument('--phases', action='store_true')
+parser.add_argument('--real-apps', action='store_true', help='requires PHP mbstring')
+parser.add_argument('--php-arg', action='append', default=[])
 args = parser.parse_args()
 if args.reps < 2:
     parser.error('at least two repetitions')
@@ -37,18 +39,22 @@ if args.phases:
     cases += [('bench/11-sieve.php', '1', n) for n in ('10000', '20000', '40000', '80000')]
     cases += [('bench/50-regex.php', '1'), ('bench/60-json.php', '1'), ('bench/70-db.php', '1')]
     cases += [('bench/app/cli.php', '100', '1'), ('bench/app/cli.php', '100', '20')]
+    cases += [('examples/composer/run.php',)]
+if args.real_apps:
+    cases += [('examples/doctrine-inflector/demo.php',),
+              ('examples/symfony-console/console.php', 'app:greet', 'World', '--yell', '-i', '2', '--no-ansi')]
 report = {'host': platform.platform(), 'cpu_count': os.cpu_count(),
           'source': metadata(['git', 'rev-parse', 'HEAD']),
           'dirty': bool(metadata(['git', 'status', '--porcelain'])),
           'before': {'build': args.before_build, 'binary': before},
           'after': {'build': args.after_build, 'binary': after},
-          'php': {'binary': php, 'args': ['-n'], 'version': metadata([php, '-n', '-r', 'echo PHP_VERSION;'])},
+          'php': {'binary': php, 'args': ['-n', *args.php_arg], 'version': metadata([php, '-n', '-r', 'echo PHP_VERSION;'])},
           'metric': 'cold startup + parse + execution; median [min,max] ms; profiler off', 'cases': []}
 for key in ('before', 'after', 'php'):
     report[key]['sha256'] = hashlib.sha256(Path(report[key]['binary']).read_bytes()).hexdigest()
 for case in cases:
     samples = [[], []]
-    oracle = capture([php, '-n', *case], 300)
+    oracle = capture([php, '-n', *args.php_arg, *case], 300)
     assert oracle[1] == 0, (case, oracle[1:])
     for rep in range(args.reps):
         for index in (0, 1) if rep % 2 == 0 else (1, 0):

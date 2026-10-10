@@ -18,7 +18,12 @@ small byte/exit oracle checks. Run `compare.py --before /path/baseline --after
 'commit and flags' --save /tmp/comparison.json [--phases]` for alternating,
 unprofiled comparisons. It saves every sample and rejects invalid outputs;
 `--phases` also includes typed/untyped long runs, sieve scaling and native wrapper
-cases. Use seven reps and inspect min/max before interpreting small differences.
+cases plus the existing Composer example. `--real-apps` also measures the
+existing Doctrine Inflector and Symfony Console examples; the PHP oracle must
+have mbstring enabled (use `--php-arg=-d --php-arg=extension=/path/mbstring.so`
+when running with `-n`). For their smoke checks, set `BENCH_REAL_APPS=1` and
+`PHP_ARGS="-n -d extension=/path/mbstring.so"`.
+No new package installation is required. Use seven reps and inspect min/max before interpreting small differences.
 
 Run the same argv with `PHPUN_ALLOC=1` or `PHPUN_VMPROF=1` separately. Allocation
 bytes are cumulative requested bytes, not peak live memory. VM counters report
