@@ -74,13 +74,19 @@ fn key_str(k: &ArrKey) -> String {
 }
 
 fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from > hay.len() {
-        return None;
+    let first = *needle.first()?;
+    let last = hay.len().checked_sub(needle.len())?;
+    let mut at = from;
+    // ponytail: first-byte filter avoids a full comparison at every byte;
+    // repetitive long needles still have O(n*m) cost (future two-way search).
+    while at <= last {
+        let p = at + hay[at..=last].iter().position(|b| *b == first)?;
+        if hay[p..].starts_with(needle) {
+            return Some(p);
+        }
+        at = p + 1;
     }
-    hay[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + from)
+    None
 }
 
 /// Replace every non-overlapping `from` with `to` (byte version of
@@ -1740,4 +1746,41 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
             .map(|(n, t)| (n.to_string(), t.to_string()))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod byte_search_tests {
+    #[test]
+    fn filtered_search_matches_naive_binary_search_at_every_offset() {
+        // Exhaustive small binary alphabets include NUL and non-UTF8 bytes.
+        for len in 0..=7 {
+            for bits in 0..(1 << len) {
+                let hay: Vec<u8> = (0..len)
+                    .map(|i| if bits & (1 << i) == 0 { 0 } else { 255 })
+                    .collect();
+                for nlen in 0..=4 {
+                    for nbits in 0..(1 << nlen) {
+                        let needle: Vec<u8> = (0..nlen)
+                            .map(|i| if nbits & (1 << i) == 0 { 0 } else { 255 })
+                            .collect();
+                        for at in 0..=len + 1 {
+                            let expected = if needle.is_empty() || at > len {
+                                None
+                            } else {
+                                hay[at..]
+                                    .windows(needle.len())
+                                    .position(|w| w == needle)
+                                    .map(|i| i + at)
+                            };
+                            assert_eq!(
+                                super::bfind(&hay, &needle, at),
+                                expected,
+                                "{hay:?} {needle:?} {at}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
