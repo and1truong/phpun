@@ -361,6 +361,7 @@ pub(crate) const BUILTIN_NAMES: &[&str] = &[
     "date",
     "date_default_timezone_get",
     "date_default_timezone_set",
+    "date_get_last_errors",
     "date_parse",
     "date_sun_info",
     "date_sunrise",

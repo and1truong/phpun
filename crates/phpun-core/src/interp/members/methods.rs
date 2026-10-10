@@ -2473,6 +2473,18 @@ impl<'a> Interp<'a> {
         // DateTimeZone: the ctor validates the identifier against zend's
         // accepted shapes — unknown names throw
         // DateInvalidTimeZoneException.
+        // ISO-string DatePeriod ctor is deprecated — emit natively so
+        // the report lands on the user's `new` call site, not the
+        // prelude's eval frame. The PHP ctor does its own parsing.
+        if cls.name().eq_ignore_ascii_case("dateperiod")
+            && name.eq_ignore_ascii_case("__construct")
+            && matches!(
+                args.cells.first().map(|c| c.borrow().clone()),
+                Some(Value::Str(_))
+            )
+        {
+            self.deprecated("Calling DatePeriod::__construct(string $isostr, int $options = 0) is deprecated, use DatePeriod::createFromISO8601String() instead")?;
+        }
         if cls.name().eq_ignore_ascii_case("datetimezone") {
             match name.to_lowercase().as_str() {
                 "__construct" => {
@@ -2488,10 +2500,30 @@ impl<'a> Interp<'a> {
                             0,
                         ));
                     }
-                    obj.borrow_mut()
-                        .props
-                        .insert("\0tz\0name".into(), cell(Value::str(tz)));
+                    {
+                        let ty = if tz.starts_with('+') || tz.starts_with('-') {
+                            1
+                        } else {
+                            3
+                        };
+                        let mut o = obj.borrow_mut();
+                        o.props.insert("\0tz\0name".into(), cell(Value::str(tz)));
+                        o.props.insert("\0tz\0ty".into(), cell(Value::Int(ty)));
+                    }
                     return Ok(Value::Null);
+                }
+                "getlocation" => {
+                    let n = obj
+                        .borrow()
+                        .props
+                        .get("\0tz\0name")
+                        .map(|c| c.borrow().clone())
+                        .map(|v| match v {
+                            Value::Str(s) => crate::value::lossy(&s).to_string(),
+                            _ => String::new(),
+                        })
+                        .unwrap_or_default();
+                    return Ok(crate::builtins::datetime::tz_location(&n));
                 }
                 "getname" => {
                     return Ok(obj
@@ -2570,7 +2602,13 @@ impl<'a> Interp<'a> {
             // (`#0 DateTime->modify('bogus')`); push then pop around
             // fail() so the snapshot captures it.
             let dt_malformed = |it: &mut Interp, s: &str| -> Result<Value, PhpError> {
-                let first = s.chars().next().unwrap_or(' ');
+                let l = crate::builtins::datetime::ctor_parse_log(s);
+                let (pos, msg) = l
+                    .errors
+                    .first()
+                    .map(|(p, m)| (*p, m.clone()))
+                    .unwrap_or((0, "Unexpected data found.".into()));
+                let first = s[pos as usize..].chars().next().unwrap_or(' ');
                 it.call_trace.push(TraceFrame {
                     args_frame: None,
                     file: it.diag_file_shared(),
@@ -2590,10 +2628,8 @@ impl<'a> Interp<'a> {
                     gen_resume: false,
                     gen_body: false,
                 });
-                // ponytail: position is always 0 — the parse tracks no
-                // failing offset inside a partially-valid spec. The
-                // Cls::method(): prefix only rides modify; the ctor's
-                // message has none.
+                // The Cls::method(): prefix only rides modify; the
+                // ctor's message has none.
                 let prefix = if name.eq_ignore_ascii_case("modify") {
                     format!("{}::{}(): ", cls.name(), name)
                 } else {
@@ -2602,7 +2638,7 @@ impl<'a> Interp<'a> {
                 let r = it.fail(PhpError::uncaught(
                     "DateMalformedStringException",
                     format!(
-                        "{prefix}Failed to parse time string ({s}) at position 0 ({first}): The timezone could not be found in the database"
+                        "{prefix}Failed to parse time string ({s}) at position {pos} ({first}): {msg}"
                     ),
                     0,
                 ));
@@ -2616,36 +2652,105 @@ impl<'a> Interp<'a> {
                         .first()
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
-                    let ts = match &spec {
+                    // arg2: a DateTimeZone object — display zone when the
+                    // spec doesn't carry its own.
+                    let arg_tz = args
+                        .get(1)
+                        .map(|c| c.borrow().clone())
+                        .and_then(|v| match v {
+                            Value::Object(o) => {
+                                let b = o.borrow();
+                                Some(
+                                    b.props
+                                        .get("\0tz\0name")
+                                        .map(|c| c.borrow().clone())
+                                        .and_then(|v| match v {
+                                            Value::Str(s) => {
+                                                Some(crate::value::lossy(&s).to_string())
+                                            }
+                                            _ => None,
+                                        })
+                                        .unwrap_or_else(|| "UTC".to_string()),
+                                )
+                            }
+                            _ => None,
+                        });
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    // (ts, tzty, tz, off, us) — defaults: now/UTC/0.
+                    let (ts, tzty, tz, off, us) = match &spec {
                         Value::Str(s) => {
-                            let s = crate::value::lossy(s);
-                            match s.strip_prefix('@') {
-                                Some(num) => num.trim().parse::<i64>().unwrap_or(0),
-                                None => {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() as i64)
-                                        .unwrap_or(0);
-                                    match crate::builtins::datetime::strtotime_parse(&s, now) {
-                                        Some(t) => t,
-                                        None => return dt_malformed(self, &s),
+                            let s = crate::value::lossy(s).to_string();
+                            if let Some(num) = s.strip_prefix('@') {
+                                (
+                                    num.trim().parse::<i64>().unwrap_or(0),
+                                    1,
+                                    "+00:00".to_string(),
+                                    0,
+                                    0,
+                                )
+                            } else {
+                                match crate::builtins::datetime::strtotime_parse_full(&s, now) {
+                                    Some((t, Some((ty, n, o)), u)) => (t, ty, n, o, u),
+                                    Some((t, None, u)) => match &arg_tz {
+                                        // no spec zone — the wall was
+                                        // read in the arg zone
+                                        Some(n) => {
+                                            let o = crate::builtins::datetime::tz_offset_at(
+                                                n,
+                                                t - crate::builtins::datetime::tz_offset_at(n, t),
+                                            );
+                                            (
+                                                t - o,
+                                                if n.starts_with('+') || n.starts_with('-') {
+                                                    1
+                                                } else {
+                                                    3
+                                                },
+                                                n.clone(),
+                                                o,
+                                                u,
+                                            )
+                                        }
+                                        None => (t, 3, "UTC".to_string(), 0, u),
+                                    },
+                                    None => {
+                                        self.dt_errors =
+                                            Some(crate::builtins::datetime::ctor_parse_log(&s));
+                                        return dt_malformed(self, &s);
                                     }
                                 }
                             }
                         }
-                        Value::Null => std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0),
-                        _ => 0,
+                        Value::Null => match &arg_tz {
+                            Some(n) => {
+                                let o = crate::builtins::datetime::tz_offset_at(n, now);
+                                (
+                                    now,
+                                    if n.starts_with('+') || n.starts_with('-') {
+                                        1
+                                    } else {
+                                        3
+                                    },
+                                    n.clone(),
+                                    o,
+                                    0,
+                                )
+                            }
+                            None => (now, 3, "UTC".to_string(), 0, 0),
+                        },
+                        _ => (0, 3, "UTC".to_string(), 0, 0),
                     };
                     {
                         let mut ob = obj.borrow_mut();
                         for (k, v) in [
                             ("\0dt\0ts", Value::Int(ts)),
-                            ("\0dt\0off", Value::Int(0)),
-                            ("\0dt\0tzty", Value::Int(3)),
-                            ("\0dt\0tz", Value::str("UTC")),
+                            ("\0dt\0off", Value::Int(off)),
+                            ("\0dt\0tzty", Value::Int(tzty)),
+                            ("\0dt\0us", Value::Int(us)),
+                            ("\0dt\0tz", Value::str(tz)),
                         ] {
                             ob.props.insert(k.into(), cell(v));
                         }
@@ -2688,12 +2793,26 @@ impl<'a> Interp<'a> {
                         };
                         (name, ty)
                     };
-                    // named zones abbreviate via tzname(3); offset
-                    // zones print the `±HH:MM` string for T as well
-                    let t_name = if t_name == 3 {
-                        crate::builtins::datetime::tz_abbr_at(&e_name, ts)
-                    } else {
-                        e_name.clone()
+                    // T: named zones abbreviate via tzname(3), offset
+                    // zones print "GMT±HHMM", abbreviations print as-is.
+                    let t_name = match t_name {
+                        3 => crate::builtins::datetime::tz_abbr_at(&e_name, ts),
+                        1 => format!(
+                            "GMT{}{:02}{:02}",
+                            if off < 0 { '-' } else { '+' },
+                            off.abs() / 3600,
+                            off.abs() % 3600 / 60
+                        ),
+                        _ => e_name.clone(),
+                    };
+                    let us = match obj
+                        .borrow()
+                        .props
+                        .get("\0dt\0us")
+                        .map(|c| c.borrow().clone())
+                    {
+                        Some(Value::Int(n)) => n,
+                        _ => 0,
                     };
                     return Ok(Value::str(crate::builtins::datetime::date_format_tz(
                         &fmt,
@@ -2701,6 +2820,7 @@ impl<'a> Interp<'a> {
                         off,
                         &e_name,
                         &t_name,
+                        us,
                     )));
                 }
                 "modify" => {
@@ -2852,7 +2972,13 @@ impl<'a> Interp<'a> {
                     let secs = arg(0) * 3600 + arg(1) * 60 + arg(2);
                     let cur = dt_ts(&obj);
                     let day = cur.div_euclid(86400) + secs.div_euclid(86400);
-                    return self.dt_store(&obj, day * 86400 + secs.rem_euclid(86400), immutable);
+                    let v = self.dt_store(&obj, day * 86400 + secs.rem_euclid(86400), immutable)?;
+                    if let Value::Object(no) = &v {
+                        no.borrow_mut()
+                            .props
+                            .insert("\0dt\0us".into(), cell(Value::Int(arg(3))));
+                    }
+                    return Ok(v);
                 }
                 "setisodate" => {
                     let arg = |i: usize| {
@@ -2906,7 +3032,16 @@ impl<'a> Interp<'a> {
                             let mut nb = no.borrow_mut();
                             nb.props.insert("\0dt\0off".into(), cell(Value::Int(off)));
                             nb.props.insert("\0dt\0tz".into(), cell(Value::str(&name)));
-                            nb.props.insert("\0dt\0tzty".into(), cell(Value::Int(3)));
+                            nb.props.insert(
+                                "\0dt\0tzty".into(),
+                                cell(Value::Int(
+                                    if name.starts_with('+') || name.starts_with('-') {
+                                        1
+                                    } else {
+                                        3
+                                    },
+                                )),
+                            );
                         }
                         return Ok(v);
                     }
@@ -2954,9 +3089,10 @@ impl<'a> Interp<'a> {
                         ob.prop_order.push(k.into());
                     }
                     for (k, v) in [
-                        ("f", Value::Int(0)),
+                        ("f", Value::Float(0.0)),
                         ("invert", Value::Int(0)),
                         ("days", Value::Bool(false)),
+                        ("from_string", Value::Bool(false)),
                     ] {
                         ob.props.insert(k.into(), cell(v));
                         ob.prop_order.push(k.into());
@@ -3286,7 +3422,12 @@ impl<'a> Interp<'a> {
         let mut order = Vec::new();
         let (mut mo, mut dy, mut sc) = (0i64, 0i64, 0i64);
         for (k, v) in &fields {
-            props.insert((*k).to_string(), cell(Value::Int(*v)));
+            let cv = if *k == "f" {
+                Value::Float(*v as f64)
+            } else {
+                Value::Int(*v)
+            };
+            props.insert((*k).to_string(), cell(cv));
             order.push((*k).to_string());
             match *k {
                 "y" => mo += v * 12,
@@ -3298,6 +3439,8 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+        props.insert("from_string".into(), cell(Value::Bool(false)));
+        order.push("from_string".into());
         props.insert("\0di\0months".into(), cell(Value::Int(mo)));
         props.insert("\0di\0days".into(), cell(Value::Int(dy)));
         props.insert("\0di\0secs".into(), cell(Value::Int(sc)));
@@ -3997,6 +4140,9 @@ impl<'a> Interp<'a> {
 /// ponytail: accepts any city name under a known continent; only the
 /// shape is checked, not the ~600-entry tz db.
 fn tz_name_ok(s: &str) -> bool {
+    if crate::builtins::datetime::tz_name_ok(s) {
+        return true;
+    }
     if s.eq_ignore_ascii_case("utc") {
         return true;
     }
@@ -4145,11 +4291,28 @@ fn parse_date_interval(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
 /// on spec-built intervals (days === false), the total on diff'd ones.
 fn dt_interval_format(obj: &Rc<RefCell<PhpObject>>, fmt: &str) -> String {
     let f = |k: &str| -> Value {
-        obj.borrow()
-            .props
-            .get(k)
-            .map(|c| c.borrow().clone())
-            .unwrap_or(Value::Int(0))
+        let o = obj.borrow();
+        if let Some(c) = o.props.get(k) {
+            return c.borrow().clone();
+        }
+        // from_string intervals carry no public fields — derive them
+        // from the \0di\0 slots the way zend resolves lazily.
+        let slot = |n: &str| -> i64 {
+            match o.props.get(n).map(|c| c.borrow().clone()) {
+                Some(Value::Int(v)) => v,
+                _ => 0,
+            }
+        };
+        match k {
+            "y" => Value::Int(slot("\0di\0months").div_euclid(12)),
+            "m" => Value::Int(slot("\0di\0months").rem_euclid(12)),
+            "d" => Value::Int(slot("\0di\0days")),
+            "h" => Value::Int(slot("\0di\0secs").div_euclid(3600)),
+            "i" => Value::Int(slot("\0di\0secs").rem_euclid(3600).div_euclid(60)),
+            "s" => Value::Int(slot("\0di\0secs").rem_euclid(60)),
+            "days" => Value::Bool(false),
+            _ => Value::Int(0),
+        }
     };
     let fi = |k: &str| -> i64 {
         match f(k) {

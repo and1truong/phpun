@@ -106,6 +106,7 @@ pub(crate) fn dispatch(
             }
         }
         "date_parse" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "date_get_last_errors" => dt_errors_value(it.dt_errors.as_ref()),
         "microtime_float" => Value::Float(0.0),
         "date_sunrise" | "date_sunset" | "date_sun_info" => Value::Bool(false),
         _ => return Ok(None),
@@ -115,13 +116,26 @@ pub(crate) fn dispatch(
 // ----- helpers -----
 
 pub(crate) fn date_format(fmt: &str, ts: i64) -> String {
-    date_format_tz(fmt, ts, 0, "UTC", "UTC")
+    date_format_tz(fmt, ts, 0, "UTC", "UTC", 0)
+}
+
+/// Wall-clock "YYYY-MM-DD HH:MM:SS.ffffff" used by var_dump/serialize/
+/// json — the shared `date` prop shape for DateTime-family objects.
+pub(crate) fn dt_date_str(ts: i64, off: i64, us: i64) -> String {
+    format!("{}.{:06}", date_format("Y-m-d H:i:s", ts + off), us)
 }
 
 /// `ts` here is the WALL seconds (instant + off). `off` feeds O/P/Z,
 /// `e_name`/`t_name` the e/T letters (zone name vs abbreviation —
 /// for numeric-offset zones both are the `±HH:MM` string).
-pub(crate) fn date_format_tz(fmt: &str, ts: i64, off: i64, e_name: &str, t_name: &str) -> String {
+pub(crate) fn date_format_tz(
+    fmt: &str,
+    ts: i64,
+    off: i64,
+    e_name: &str,
+    t_name: &str,
+    us: i64,
+) -> String {
     // minimal strftime-ish for the common tokens
     let days = ts.div_euclid(86400);
     let secs = ts.rem_euclid(86400);
@@ -190,6 +204,8 @@ pub(crate) fn date_format_tz(fmt: &str, ts: i64, off: i64, e_name: &str, t_name:
                     "December",
                 ][(m - 1) as usize],
             ),
+            'u' => out.push_str(&format!("{:06}", us)),
+            'v' => out.push_str(&format!("{:03}", us / 1000)),
             'U' => out.push_str(&ts.to_string()),
             'e' => out.push_str(e_name),
             'T' => out.push_str(t_name),
@@ -462,6 +478,11 @@ impl Bag {
 struct StrtoP {
     dt: Dt,
     tz_off: Option<i64>,
+    /// (tzty, display name, off) of a spec-embedded zone; off=0 for
+    /// named zones — resolved at the end against the parsed wall.
+    tz: Option<(i64, String, i64)>,
+    tz_name: Option<String>,
+    us: i64,
     slot: Option<(i64, SlotBeh)>,
     post: Vec<PostOp>,
     bag: Bag,
@@ -543,10 +564,22 @@ fn strto_unit(w: &str) -> Option<Unit> {
     })
 }
 
+/// "+05:30"-style canonical name for an offset in seconds.
+fn offset_name(off: i64) -> String {
+    let sgn = if off < 0 { '-' } else { '+' };
+    format!(
+        "{}{:02}:{:02}",
+        sgn,
+        off.abs() / 3600,
+        off.abs() % 3600 / 60
+    )
+}
+
 fn strto_tz_abbr(w: &str) -> Option<i64> {
     // seconds east of UTC
     Some(match w {
         "utc" | "ut" | "gmt" | "z" | "zulu" => 0,
+        "jst" => 9 * 3600,
         "est" => -5 * 3600,
         "edt" => -4 * 3600,
         "cst" => -6 * 3600,
@@ -572,14 +605,28 @@ fn year_2dig(n: i64) -> i64 {
 /// Parse `s` as a relative/absolute date-time per Zend's strtotime.
 /// Returns the resulting Unix timestamp, or None (PHP false).
 pub(crate) fn strtotime_parse(s: &str, base: i64) -> Option<i64> {
+    strtotime_parse_full(s, base).map(|r| r.0)
+}
+
+/// strtotime plus the zone the spec embedded: Some((ts, Some((tzty,
+/// name, off)))) — the DateTime ctor stamps off/tzty/tz from it;
+/// function callers use `strtotime_parse` and keep just the ts.
+type StrtoFull = (i64, Option<(i64, String, i64)>, i64);
+pub(crate) fn strtotime_parse_full(s: &str, base: i64) -> Option<StrtoFull> {
     let toks = strto_toks(s.as_bytes());
     if toks.is_empty() {
-        // "" → false, but whitespace/empty-token-only → base unchanged
-        return if s.is_empty() { None } else { Some(base) };
+        return if s.is_empty() {
+            None
+        } else {
+            Some((base, None, 0))
+        };
     }
     let mut p = StrtoP {
         dt: Dt::from_ts(base),
         tz_off: None,
+        tz: None,
+        tz_name: None,
+        us: 0,
         slot: None,
         post: Vec::new(),
         bag: Bag::default(),
@@ -589,7 +636,19 @@ pub(crate) fn strtotime_parse(s: &str, base: i64) -> Option<i64> {
         return None;
     }
     let dt = p.resolve();
-    Some(dt.days * 86400 + dt.secs - p.tz_off.unwrap_or(0))
+    let wall = dt.days * 86400 + dt.secs;
+    let tz = match p.tz_name {
+        Some(n) => {
+            let off = tz_offset_at(&n, wall);
+            Some((3, n, off))
+        }
+        None => p.tz,
+    };
+    Some((
+        wall - tz.as_ref().map(|t| t.2).or(p.tz_off).unwrap_or(0),
+        tz,
+        p.us,
+    ))
 }
 
 impl StrtoP {
@@ -648,6 +707,7 @@ impl StrtoP {
                 if let Some((n, _)) = self.at_i(t, k) {
                     self.dt = Dt::from_ts(neg * n);
                     self.tz_off = Some(0);
+                    self.tz = Some((1, "+00:00".into(), 0));
                     self.i += k + 1;
                     true
                 } else {
@@ -685,7 +745,9 @@ impl StrtoP {
                 n * 3600
             };
             if self.tz_off.is_none() {
-                self.tz_off = Some(sgn * off);
+                let o = sgn * off;
+                self.tz_off = Some(o);
+                self.tz = Some((1, offset_name(o), o));
             }
             self.i += 3;
             return true;
@@ -695,7 +757,9 @@ impl StrtoP {
             if let Some((m, _)) = self.at_i(t, 3) {
                 if m < 60 {
                     if self.tz_off.is_none() {
-                        self.tz_off = Some(sgn * (n * 3600 + m * 60));
+                        let o = sgn * (n * 3600 + m * 60);
+                        self.tz_off = Some(o);
+                        self.tz = Some((1, offset_name(o), o));
                     }
                     self.i += 4;
                     return true;
@@ -710,7 +774,9 @@ impl StrtoP {
             n * 3600
         };
         if self.tz_off.is_none() {
-            self.tz_off = Some(sgn * off);
+            let o = sgn * off;
+            self.tz_off = Some(o);
+            self.tz = Some((1, offset_name(o), o));
         }
         self.i += 2;
         true
@@ -894,9 +960,12 @@ impl StrtoP {
                 }
                 sec = s;
                 used = 5;
-                // optional .fraction — ignored
-                if self.at_c(t, 5, b'.') && self.at_i(t, 6).is_some() {
-                    used = 7;
+                // optional .fraction → microseconds
+                if self.at_c(t, 5, b'.') {
+                    if let Some((fr, w)) = self.at_i(t, 6) {
+                        self.us = fr * 10i64.pow(6 - w.min(6) as u32);
+                        used = 7;
+                    }
                 }
             }
             if h == 24 && sec > 0 {
@@ -1155,6 +1224,12 @@ impl StrtoP {
                     if self.tz_off.is_none() {
                         self.tz_off = Some(off);
                     }
+                    self.tz = Some(match w {
+                        "utc" | "ut" => (3, "UTC".into(), off),
+                        "gmt" => (3, "GMT".into(), off),
+                        "z" | "zulu" => (1, "+00:00".into(), off),
+                        _ => (2, w.to_uppercase(), off),
+                    });
                     self.i += 1;
                     // GMT+5 / UTC-3
                     if w == "gmt" || w == "utc" {
@@ -1168,6 +1243,7 @@ impl StrtoP {
                                         n * 3600
                                     };
                                     self.tz_off = Some(sgn * off);
+                                    self.tz = Some((1, offset_name(sgn * off), sgn * off));
                                     self.i += 2;
                                 }
                             }
@@ -1175,7 +1251,7 @@ impl StrtoP {
                     }
                     true
                 } else {
-                    false
+                    self.tz_word(t, w)
                 }
             }
         }
@@ -1324,6 +1400,9 @@ impl StrtoP {
             return false;
         };
         let mut sub = StrtoP {
+            tz: None,
+            tz_name: None,
+            us: 0,
             dt: self.dt,
             tz_off: None,
             slot: None,
@@ -1378,6 +1457,33 @@ impl StrtoP {
                 true
             }
         }
+    }
+
+    /// `Area/City` IANA zone — tokens arrive lowercased
+    /// (W / '/' / W / ...), matched case-insensitively against the
+    /// tzdb; ponytail: oracle rejects lowercase names, phpun accepts.
+    fn tz_word(&mut self, t: &[STok], w: &str) -> bool {
+        let mut name = w.to_string();
+        let mut k = 1;
+        while let (Some(STok::C(b'/')), Some(STok::W(seg))) =
+            (t.get(self.i + k), t.get(self.i + k + 1))
+        {
+            name.push('/');
+            name.push_str(seg);
+            k += 2;
+        }
+        if !name.contains('/') {
+            return false;
+        }
+        let Some(canon) = crate::tzdata::TZ_BC
+            .iter()
+            .find(|z| z.eq_ignore_ascii_case(&name))
+        else {
+            return false;
+        };
+        self.tz_name = Some(canon.to_string());
+        self.i += k;
+        true
     }
 
     /// Apply the collected slot, post-ops, then the bag.
@@ -1457,21 +1563,50 @@ pub(crate) struct DtNew {
     pub off: i64,
     pub tzty: i64,
     pub tz: String,
+    pub us: i64,
 }
 
-pub(crate) fn date_create_from_format(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
-    let first = cff_inner(fmt, val, now)?;
+/// zend date parse log: duplicated (pos=>msg) keys collapse on array
+/// insert but the counts keep every diagnostic.
+#[derive(Default)]
+pub(crate) struct DtLog {
+    pub warn_count: i64,
+    pub warnings: Vec<(i64, String)>,
+    pub err_count: i64,
+    pub errors: Vec<(i64, String)>,
+}
+
+impl DtLog {
+    fn err(&mut self, pos: i64, msg: &str) {
+        self.err_count += 1;
+        self.errors.push((pos, msg.into()));
+    }
+    fn warn(&mut self, pos: i64, msg: &str) {
+        self.warn_count += 1;
+        self.warnings.push((pos, msg.into()));
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.err_count == 0 && self.warn_count == 0
+    }
+}
+
+pub(crate) fn date_create_from_format(fmt: &str, val: &str, now: i64) -> (Option<DtNew>, DtLog) {
     // zend fills unparsed fields from `now` in the TARGET zone, so
     // run once to learn the offset, then again with it applied —
     // a no-op second pass when the input carries its own zoneless
     // fields or the zone is UTC.
+    let mut sink = DtLog::default();
+    let Some(first) = cff_inner(fmt, val, now, &mut sink) else {
+        return (None, sink);
+    };
     if first.off == 0 && first.tz == "UTC" {
-        return Some(first);
+        return (Some(first), sink);
     }
-    cff_inner(fmt, val, now + first.off)
+    let mut log = DtLog::default();
+    (cff_inner(fmt, val, now + first.off, &mut log), log)
 }
 
-fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
+fn cff_inner(fmt: &str, val: &str, now: i64, log: &mut DtLog) -> Option<DtNew> {
     let (ny, nm, nd) = civil_from_days(now.div_euclid(86400));
     let nsec = now.rem_euclid(86400);
     // (y, m, d, h, i, s, off, z) — None = take from `now` unless reset.
@@ -1480,9 +1615,11 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
     let mut twelve: Option<i64> = None;
     let mut meridiem: Option<bool> = None; // true = pm
     let mut epoch: Option<i64> = None;
+    let mut us: i64 = 0;
     let mut tz_name: Option<String> = None;
     let mut off_named = true;
     let mut trailing_ok = false;
+    let mut bad = false;
     let fb = fmt.as_bytes();
     let vb = val.as_bytes();
     let mut fi = 0usize;
@@ -1522,14 +1659,53 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
         }
         vb[start..*vi].to_vec()
     };
-    // one directive; returns false on hard mismatch
+    // hard-fail the parse at `pos` with `msg`
+    macro_rules! bail {
+        ($pos:expr, $msg:expr) => {{
+            log.err($pos, $msg);
+            return None;
+        }};
+    }
+    // exhausted input mid-format → the generic trailer, single error
+    macro_rules! bail_or_empty {
+        ($pos:expr, $msg:expr) => {{
+            if vi >= vb.len() {
+                bail!(
+                    vb.len() as i64,
+                    "Not enough data available to satisfy format"
+                );
+            }
+            bail!($pos, $msg);
+        }};
+    }
+    // numeric directive failure: exhausted → not-enough; non-digit
+    // char → unexp + the directive's own message, same position.
     macro_rules! need {
-        ($e:expr) => {
+        ($e:expr, $msg:expr) => {
             match $e {
                 Some(x) => x,
-                None => return None,
+                None => {
+                    if vi >= vb.len() {
+                        bail!(vi as i64, "Not enough data available to satisfy format");
+                    }
+                    if !vb[vi].is_ascii_digit() {
+                        log.err(vi as i64, "Unexpected data found.");
+                    }
+                    bail!(vi as i64, $msg);
+                }
             }
         };
+    }
+    // literal/separator mismatch: zend records the separator error
+    // (plus "unexpected" when the char isn't a digit) and steps over.
+    macro_rules! sep {
+        () => {{
+            log.err(vi as i64, "The format separator does not match");
+            if vi < vb.len() && !vb[vi].is_ascii_digit() {
+                log.err(vi as i64, "Unexpected data found.");
+            }
+            vi += 1;
+        }};
     }
     while fi < fb.len() {
         let c = fb[fi];
@@ -1542,6 +1718,7 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
                 twelve = None;
                 meridiem = None;
                 epoch = None;
+                us = 0;
                 reset_seen = true;
             }
             b'|' => {
@@ -1551,15 +1728,19 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
             b'+' => trailing_ok = true,
             b'?' => {
                 if vi >= vb.len() {
-                    return None;
+                    bail!(vi as i64, "Not enough data available to satisfy format");
                 }
                 vi += 1;
             }
             b'#' => {
-                if vi >= vb.len() || !b";:/.,-".contains(&vb[vi]) {
-                    return None;
+                if vi >= vb.len() {
+                    bail!(vi as i64, "Not enough data available to satisfy format");
                 }
-                vi += 1;
+                if !b";:/.,-".contains(&vb[vi]) {
+                    sep!();
+                } else {
+                    vi += 1;
+                }
             }
             b'*' => {
                 // consume until the next fmt literal would match
@@ -1573,31 +1754,51 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
                 }
             }
             b'\\' => {
-                let l = *fb.get(fi)?;
+                let Some(&l) = fb.get(fi) else {
+                    bail!(vi as i64, "The format separator does not match");
+                };
                 fi += 1;
-                if vb.get(vi) != Some(&l) {
-                    return None;
+                if vi >= vb.len() {
+                    bail!(vi as i64, "Not enough data available to satisfy format");
                 }
-                vi += 1;
+                if vb[vi] != l {
+                    sep!();
+                } else {
+                    vi += 1;
+                }
             }
             b' ' => {
                 while vi < vb.len() && vb[vi].is_ascii_whitespace() {
                     vi += 1;
                 }
             }
-            b'Y' | b'o' => f[0] = Some(need!(num(vb, &mut vi, 6))),
+            b'Y' | b'o' => match num(vb, &mut vi, 6) {
+                Some(n) => f[0] = Some(n),
+                None => {
+                    if vi < vb.len() && !vb[vi].is_ascii_digit() {
+                        log.err(vi as i64, "Unexpected data found.");
+                    }
+                    bail_or_empty!(vi as i64, "A four digit year could not be found");
+                }
+            },
             b'y' => {
-                let n = need!(num(vb, &mut vi, 2));
-                f[0] = Some(if n < 70 { 2000 + n } else { 1900 + n });
+                f[0] = Some({
+                    let n = need!(num(vb, &mut vi, 2), "A two digit year could not be found");
+                    if n < 70 {
+                        2000 + n
+                    } else {
+                        1900 + n
+                    }
+                })
             }
             b'm' | b'n' => {
-                let n = need!(num(vb, &mut vi, 2));
-                if !(1..=12).contains(&n) {
-                    return None;
-                }
-                f[1] = Some(n);
+                f[1] = Some(need!(
+                    num(vb, &mut vi, 2),
+                    "A two digit month could not be found"
+                ))
             }
             b'M' | b'F' => {
+                let st = vi;
                 let w = word(vb, &mut vi);
                 let lw: Vec<u8> = w.iter().map(|b| b.to_ascii_lowercase()).collect();
                 let hit = months.iter().position(|m| {
@@ -1606,115 +1807,171 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
                         && lw[..k.min(lw.len())] == m[..k.min(lw.len())]
                         && if c == b'M' { lw.len() == 3 } else { lw == **m }
                 });
-                f[1] = Some(hit? as i64 + 1);
+                match hit {
+                    Some(h) => f[1] = Some(h as i64 + 1),
+                    None => bail_or_empty!(st as i64, "A textual month could not be found"),
+                }
             }
             b'd' | b'j' => {
-                let n = need!(num(vb, &mut vi, 2));
-                if !(1..=31).contains(&n) {
-                    return None;
-                }
-                f[2] = Some(n);
+                f[2] = Some(need!(
+                    num(vb, &mut vi, 2),
+                    "A two digit day could not be found"
+                ))
             }
-            b'z' => f[7] = Some(need!(num(vb, &mut vi, 3))),
+            b'z' => {
+                f[7] = Some(need!(
+                    num(vb, &mut vi, 3),
+                    "A three digit day-of-year could not be found"
+                ))
+            }
             b'D' | b'l' | b'N' | b'w' | b'W' | b't' | b'S' => {
                 // weekday/month trivia — consume, set nothing
                 let w = word(vb, &mut vi);
                 if w.is_empty() && num(vb, &mut vi, 3).is_none() {
-                    return None;
+                    bail_or_empty!(vi as i64, "Unexpected data found.");
                 }
             }
             b'H' | b'G' => {
-                let n = need!(num(vb, &mut vi, 2));
-                if n > 23 {
-                    return None;
-                }
-                f[3] = Some(n);
+                f[3] = Some(need!(
+                    num(vb, &mut vi, 2),
+                    "A two digit hour could not be found"
+                ))
             }
             b'h' | b'g' => {
-                let n = need!(num(vb, &mut vi, 2));
+                let st = vi;
+                let n = need!(num(vb, &mut vi, 2), "A two digit hour could not be found");
                 if !(1..=12).contains(&n) {
-                    return None;
+                    // the only hard range error zend has; parse keeps going
+                    log.err(st as i64, "Hour cannot be higher than 12");
+                    bad = true;
                 }
                 twelve = Some(n);
             }
             b'i' => {
-                let n = need!(num(vb, &mut vi, 2));
-                if n > 59 {
-                    return None;
-                }
-                f[4] = Some(n);
+                f[4] = Some(need!(
+                    num(vb, &mut vi, 2),
+                    "A two digit minute could not be found"
+                ))
             }
             b's' => {
-                let n = need!(num(vb, &mut vi, 2));
-                if n > 59 {
-                    return None;
-                }
-                f[5] = Some(n);
+                f[5] = Some(need!(
+                    num(vb, &mut vi, 2),
+                    "A two digit second could not be found"
+                ))
             }
             b'u' => {
-                let _ = num(vb, &mut vi, 6);
+                let st = vi;
+                us = need!(num(vb, &mut vi, 6), "Unexpected data found.")
+                    * 10i64.pow(6 - (vi - st) as u32);
             }
             b'v' => {
-                let _ = num(vb, &mut vi, 3);
+                let st = vi;
+                us = need!(num(vb, &mut vi, 3), "Unexpected data found.")
+                    * 10i64.pow(3 - (vi - st) as u32)
+                    * 1000;
             }
             b'a' | b'A' => {
+                let st = vi;
                 let w = word(vb, &mut vi);
                 let lw: Vec<u8> = w.iter().map(|b| b.to_ascii_lowercase()).collect();
                 match lw.as_slice() {
                     b"am" => meridiem = Some(false),
                     b"pm" => meridiem = Some(true),
-                    _ => return None,
+                    _ => bail_or_empty!(st as i64, "A meridian could not be found"),
                 }
             }
-            b'U' => epoch = Some(need!(num(vb, &mut vi, 20))),
+            b'U' => epoch = Some(need!(num(vb, &mut vi, 20), "Unexpected data found.")),
             b'e' | b'T' => {
                 // timezone name — sets the render offset + display name
                 let st = vi;
+                if tz_name.is_some() || f[6].is_some() {
+                    log.err(st as i64, "Double timezone specification");
+                    bad = true;
+                }
                 while vi < vb.len()
                     && (vb[vi].is_ascii_alphanumeric()
                         || matches!(vb[vi], b'/' | b'_' | b'+' | b'-' | b':'))
                 {
                     vi += 1;
                 }
+                let nm = String::from_utf8_lossy(&vb[st..vi]).to_string();
                 if vi == st {
-                    return None;
+                    bail!(st as i64, "Not enough data available to satisfy format");
                 }
-                tz_name = Some(String::from_utf8_lossy(&vb[st..vi]).to_string());
+                if !tz_name_ok_loose(&nm) {
+                    bail!(st as i64, "The timezone could not be found in the database");
+                }
+                tz_name = Some(nm);
             }
             b'O' | b'P' => {
+                if tz_name.is_some() || f[6].is_some() {
+                    log.err(vi as i64, "Double timezone specification");
+                    bad = true;
+                }
                 off_named = false;
                 let sgn = match vb.get(vi) {
                     Some(b'+') => 1,
                     Some(b'-') => -1,
-                    _ => return None,
+                    _ => bail_or_empty!(vi as i64, "Unexpected data found."),
                 };
                 vi += 1;
-                let h = need!(num(vb, &mut vi, 2));
+                let h = need!(num(vb, &mut vi, 2), "A two digit hour could not be found");
                 if c == b'P' {
-                    if vb.get(vi) != Some(&b':') {
-                        return None;
+                    if vi >= vb.len() {
+                        bail!(vi as i64, "Not enough data available to satisfy format");
+                    }
+                    if vb[vi] != b':' {
+                        bail!(vi as i64, "The format separator does not match");
                     }
                     vi += 1;
                 }
-                let m = need!(num(vb, &mut vi, 2));
+                let m = need!(num(vb, &mut vi, 2), "A two digit minute could not be found");
                 f[6] = Some(sgn * (h * 3600 + m * 60));
             }
             b'Z' => {
                 // oracle rejects Z in createFromFormat outright
-                return None;
+                bail_or_empty!(vi as i64, "Unexpected data found.");
             }
-            b'c' => return date_create_from_format("Y-m-d\\TH:i:sP", val, now),
-            b'r' => return date_create_from_format("D, d M Y H:i:s O", val, now),
             _ => {
                 if vb.get(vi) != Some(&c) {
-                    return None;
+                    sep!();
+                } else {
+                    vi += 1;
                 }
-                vi += 1;
             }
         }
     }
     // trailing input is an error unless `+` permitted it
     if vi < vb.len() && !trailing_ok {
+        log.err(vi as i64, "Trailing data");
+        bad = true;
+    }
+    // range overflow is a WARNING with rollover, not a failure
+    let mut end = vb.len() as i64;
+    if end < 4 {
+        // ponytail: zend's warn pos is its scan cursor, which for a
+        // 1-3 char input lands len+4 — observed quirk, no visible rule.
+        end += 4;
+    }
+    if f[0].is_some() && f[1].is_some() && f[2].is_some() {
+        let (y, m, d) = (f[0].unwrap(), f[1].unwrap(), f[2].unwrap());
+        let dim = if (1..=12).contains(&m) {
+            days_from_civil(y, m + 1, 1) - days_from_civil(y, m, 1)
+        } else {
+            0
+        };
+        if !(1..=12).contains(&m) || !(1..=dim).contains(&d) {
+            log.warn(end, "The parsed date was invalid");
+        }
+    }
+    if (f[3].is_some() || f[4].is_some() || f[5].is_some())
+        && (f[3].is_some_and(|h| !(0..=23).contains(&h))
+            || f[4].is_some_and(|i| !(0..=59).contains(&i))
+            || f[5].is_some_and(|s| !(0..=59).contains(&s)))
+    {
+        log.warn(end, "The parsed time was invalid");
+    }
+    if bad {
         return None;
     }
     if let Some(u) = epoch {
@@ -1723,6 +1980,7 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
             off: 0,
             tzty: 3,
             tz: "UTC".into(),
+            us,
         });
     }
     // Field-wise defaults: unset date fields come from today, and
@@ -1755,8 +2013,9 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
             Some(DtNew {
                 ts: wall - off,
                 off,
-                tzty: 3,
+                tzty: if is_offset_name(&name) { 1 } else { 3 },
                 tz: name,
+                us,
             })
         }
         _ => {
@@ -1781,9 +2040,31 @@ fn cff_inner(fmt: &str, val: &str, now: i64) -> Option<DtNew> {
                 off,
                 tzty,
                 tz,
+                us,
             })
         }
     }
+}
+
+fn is_offset_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    (b.first() == Some(&b'+') || b.first() == Some(&b'-')) && s.len() == 6 && b[3] == b':'
+}
+
+/// createFromFormat `e`/`T` accepts IANA names, `±HH:MM`, and a few
+/// abbreviations (phpun resolves offsets via the tz db regardless).
+fn tz_name_ok_loose(name: &str) -> bool {
+    if is_offset_name(name) {
+        return true;
+    }
+    let lw = name.to_ascii_lowercase();
+    crate::tzdata::TZ_BC
+        .iter()
+        .any(|z| z.eq_ignore_ascii_case(&lw))
+        || matches!(lw.as_str(), "utc" | "gmt" | "z" | "zulu")
+        || crate::tzdata::TZ_ABBR
+            .iter()
+            .any(|(a, _)| a.eq_ignore_ascii_case(&lw))
 }
 
 /// tz abbreviation ("JST", "UTC") of a named zone at `ts` — same
@@ -1862,4 +2143,458 @@ pub(crate) fn tz_offset_at(name: &str, ts: i64) -> i64 {
     }
     unsafe { tzset() };
     off
+}
+
+/// {date, timezone_type, timezone} — the public property view zend
+/// exposes for DateTime/DateTimeImmutable/DateTimeZone (var_dump,
+/// serialize, json_encode all share it).
+pub(crate) fn dt_public_props(
+    ob: &crate::value::PhpObject,
+) -> Option<Vec<(String, crate::value::Value)>> {
+    let g = |k: &str| ob.props.get(k).map(|c| c.borrow().clone());
+    let gi = |k: &str, d: i64| match g(k) {
+        Some(crate::value::Value::Int(n)) => n,
+        _ => d,
+    };
+    let gs = |k: &str, d: &str| match g(k) {
+        Some(crate::value::Value::Str(s)) => crate::value::lossy(&s).to_string(),
+        _ => d.to_string(),
+    };
+    match ob.class.name().to_lowercase().as_str() {
+        "datetime" | "datetimeimmutable" | "dateinterface" => Some(vec![
+            (
+                "date".into(),
+                crate::value::Value::str(dt_date_str(
+                    gi("\0dt\0ts", 0),
+                    gi("\0dt\0off", 0),
+                    gi("\0dt\0us", 0),
+                )),
+            ),
+            (
+                "timezone_type".into(),
+                crate::value::Value::Int(gi("\0dt\0tzty", 3)),
+            ),
+            (
+                "timezone".into(),
+                crate::value::Value::str(gs("\0dt\0tz", "UTC")),
+            ),
+        ]),
+        "datetimezone" => {
+            let name = gs("\0tz\0name", "");
+            let ty = gi("\0tz\0ty", if is_offset_name(&name) { 1 } else { 3 });
+            Some(vec![
+                ("timezone_type".into(), crate::value::Value::Int(ty)),
+                ("timezone".into(), crate::value::Value::str(name)),
+            ])
+        }
+        _ => None,
+    }
+}
+
+/// Instant identity for object ==: (ts, us). zend compares date
+/// objects by instant, across DateTime/DateTimeImmutable.
+pub(crate) fn dt_instant(ob: &crate::value::PhpObject) -> Option<(i64, i64)> {
+    match ob.class.name().to_lowercase().as_str() {
+        "datetime" | "datetimeimmutable" => {
+            let g = |k: &str| match ob.props.get(k).map(|c| c.borrow().clone()) {
+                Some(crate::value::Value::Int(n)) => n,
+                _ => 0,
+            };
+            Some((g("\0dt\0ts"), g("\0dt\0us")))
+        }
+        _ => None,
+    }
+}
+
+/// Rebuild `\0dt\0*` internals after unserialize filled the three
+/// public props — returns true when the class is a dt object.
+pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
+    let cn = ob.class.name().to_lowercase();
+    let g = |k: &str, obb: &crate::value::PhpObject| obb.props.get(k).map(|c| c.borrow().clone());
+    if cn == "datetime" || cn == "datetimeimmutable" {
+        let (mut ts, mut us) = (0i64, 0i64);
+        if let Some(crate::value::Value::Str(s)) = g("date", ob) {
+            let s = crate::value::lossy(&s).to_string();
+            // "YYYY-MM-DD HH:MM:SS.ffffff"
+            let (main, frac) = s.split_once('.').unwrap_or((s.as_str(), ""));
+            us = frac
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .take(6)
+                .collect::<String>()
+                .parse::<i64>()
+                .unwrap_or(0);
+            us *= 10i64.pow(6 - frac.len().min(6) as u32);
+            let (y, rest) = main.split_once('-').unwrap_or(("1970", main));
+            let parts: Vec<i64> = rest
+                .split(['-', ' ', ':'])
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            let y: i64 = y.parse().unwrap_or(1970);
+            let p = |i: usize, d: i64| parts.get(i).copied().unwrap_or(d);
+            ts = days_from_civil(y, p(0, 1), p(1, 1)) * 86400
+                + p(2, 0) * 3600
+                + p(3, 0) * 60
+                + p(4, 0);
+        }
+        let tzty = match g("timezone_type", ob) {
+            Some(crate::value::Value::Int(n)) => n,
+            _ => 3,
+        };
+        let tz = match g("timezone", ob) {
+            Some(crate::value::Value::Str(s)) => crate::value::lossy(&s).to_string(),
+            _ => "UTC".into(),
+        };
+        let off = match tzty {
+            1 => parse_offset_name(&tz).unwrap_or(0),
+            3 => tz_offset_at(&tz, ts),
+            _ => strto_tz_abbr(&tz.to_ascii_lowercase()).unwrap_or(0),
+        };
+        ts -= off;
+        for k in ["date", "timezone_type", "timezone"] {
+            ob.props.remove(k);
+            ob.prop_order.retain(|x| x != k);
+        }
+        for (k, v) in [
+            ("\0dt\0ts", ts),
+            ("\0dt\0off", off),
+            ("\0dt\0tzty", tzty),
+            ("\0dt\0us", us),
+        ] {
+            ob.props.insert(
+                k.to_string(),
+                std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::Int(v))),
+            );
+            ob.prop_order.push(k.to_string());
+        }
+        ob.props.insert(
+            "\0dt\0tz".to_string(),
+            std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::str(tz))),
+        );
+        ob.prop_order.push("\0dt\0tz".to_string());
+    } else if cn == "dateinterval" {
+        // rebuild \0di\0{months,days,secs} from the public fields, or
+        // re-parse a from_string payload's date_string.
+        let gi = |k: &str, obb: &crate::value::PhpObject| match g(k, obb) {
+            Some(crate::value::Value::Int(n)) => n,
+            _ => 0,
+        };
+        let (mut mo, mut dy, mut sc) = (0i64, 0i64, 0i64);
+        match g("date_string", ob) {
+            Some(crate::value::Value::Str(s)) => {
+                let spec = crate::value::lossy(&s).to_string();
+                if let Some(fields) = parse_interval_spec(&spec) {
+                    for (k, v) in fields {
+                        match k {
+                            "y" => mo += v * 12,
+                            "m" => mo += v,
+                            "d" => dy += v,
+                            "h" => sc += v * 3600,
+                            "i" => sc += v * 60,
+                            "s" => sc += v,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {
+                mo = gi("y", ob) * 12 + gi("m", ob);
+                dy = gi("d", ob);
+                sc = gi("h", ob) * 3600 + gi("i", ob) * 60 + gi("s", ob);
+            }
+        }
+        for (k, v) in [("\0di\0months", mo), ("\0di\0days", dy), ("\0di\0secs", sc)] {
+            ob.props.insert(
+                k.to_string(),
+                std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::Int(v))),
+            );
+        }
+    } else if cn == "datetimezone" {
+        let tz = match g("timezone", ob) {
+            Some(crate::value::Value::Str(s)) => crate::value::lossy(&s).to_string(),
+            _ => "UTC".into(),
+        };
+        let ty = match g("timezone_type", ob) {
+            Some(crate::value::Value::Int(n)) => n,
+            _ => 3,
+        };
+        for k in ["timezone_type", "timezone"] {
+            ob.props.remove(k);
+            ob.prop_order.retain(|x| x != k);
+        }
+        for (k, v) in [("\0tz\0name", tz), ("\0tz\0ty", ty.to_string())] {
+            let val = if k.ends_with("ty") {
+                crate::value::Value::Int(v.parse().unwrap_or(3))
+            } else {
+                crate::value::Value::str(v)
+            };
+            ob.props.insert(
+                k.to_string(),
+                std::rc::Rc::new(std::cell::RefCell::new(val)),
+            );
+            ob.prop_order.push(k.to_string());
+        }
+    }
+}
+
+fn parse_offset_name(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if s.len() == 6 && matches!(b[0], b'+' | b'-') {
+        let h: i64 = s.get(1..3)?.parse().ok()?;
+        let m: i64 = s.get(4..6)?.parse().ok()?;
+        return Some((h * 3600 + m * 60) * if b[0] == b'-' { -1 } else { 1 });
+    }
+    None
+}
+
+/// getLastErrors()/date_get_last_errors() shape — or `false` when the
+/// last parse was clean/never ran.
+pub(crate) fn dt_errors_value(log: Option<&DtLog>) -> Value {
+    let Some(l) = log else {
+        return Value::Bool(false);
+    };
+    if l.is_empty() {
+        return Value::Bool(false);
+    }
+    let mk = |v: &[(i64, String)]| {
+        let mut a = PhpArray::new();
+        for (pos, msg) in v {
+            a.set(ArrKey::Int(*pos), Value::str(msg.clone()));
+        }
+        Value::Array(Rc::new(RefCell::new(a)))
+    };
+    let mut a = PhpArray::new();
+    a.set(
+        ArrKey::Str("warning_count".into()),
+        Value::Int(l.warn_count),
+    );
+    a.set(ArrKey::Str("warnings".into()), mk(&l.warnings));
+    a.set(ArrKey::Str("error_count".into()), Value::Int(l.err_count));
+    a.set(ArrKey::Str("errors".into()), mk(&l.errors));
+    Value::Array(Rc::new(RefCell::new(a)))
+}
+
+/// listIdentifiers(group, country) — oracle snapshot in tzdata.rs.
+/// None = bad args.
+pub(crate) fn tz_ids(which: i64, country: Option<&str>) -> Option<Vec<String>> {
+    const ALL: i64 = 2047;
+    const ALL_WITH_BC: i64 = 4095;
+    const PER_COUNTRY: i64 = 4096;
+    match which {
+        ALL => Some(
+            crate::tzdata::TZ_ALL
+                .iter()
+                .map(|z| z.0.to_string())
+                .collect(),
+        ),
+        ALL_WITH_BC => Some(crate::tzdata::TZ_BC.iter().map(|z| z.to_string()).collect()),
+        PER_COUNTRY => {
+            let cc = country?.to_uppercase();
+            Some(
+                crate::tzdata::TZ_CC
+                    .iter()
+                    .find(|(c, _)| *c == cc)
+                    .map(|(_, v)| v.iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default(),
+            )
+        }
+        w if w > 0 && w < 2048 => Some(
+            crate::tzdata::TZ_ALL
+                .iter()
+                .filter(|(_, g)| g & w as u16 != 0)
+                .map(|z| z.0.to_string())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// listAbbreviations() — {abbr => [{dst,offset,timezone_id}]}.
+pub(crate) fn tz_abbrevs() -> Value {
+    let mut out = PhpArray::new();
+    for (abbr, lst) in crate::tzdata::TZ_ABBR {
+        let mut a = PhpArray::new();
+        for (dst, off, tzid) in *lst {
+            let mut e = PhpArray::new();
+            e.set(ArrKey::Str("dst".into()), Value::Bool(*dst));
+            e.set(ArrKey::Str("offset".into()), Value::Int(*off));
+            e.set(ArrKey::Str("timezone_id".into()), Value::str(*tzid));
+            a.push(Value::Array(Rc::new(RefCell::new(e))));
+        }
+        out.set(
+            ArrKey::Str((*abbr).into()),
+            Value::Array(Rc::new(RefCell::new(a))),
+        );
+    }
+    Value::Array(Rc::new(RefCell::new(out)))
+}
+
+/// getLocation() on a DateTimeZone name — oracle snapshot.
+pub(crate) fn tz_location(name: &str) -> Value {
+    use crate::tzdata::TzLoc;
+    let rec = crate::tzdata::TZ_LOC
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name));
+    match rec {
+        Some((
+            _,
+            TzLoc::Loc {
+                cc,
+                lat,
+                lon,
+                comments,
+            },
+        )) => {
+            let mut a = PhpArray::new();
+            a.set(ArrKey::Str("country_code".into()), Value::str(*cc));
+            a.set(ArrKey::Str("latitude".into()), Value::Float(*lat));
+            a.set(ArrKey::Str("longitude".into()), Value::Float(*lon));
+            a.set(ArrKey::Str("comments".into()), Value::str(*comments));
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        Some((_, TzLoc::Unknown)) => {
+            // named zone with no geonames row (UTC etc): oracle emits
+            // the placeholder record rather than false
+            let mut a = PhpArray::new();
+            a.set(ArrKey::Str("country_code".into()), Value::str("??"));
+            a.set(ArrKey::Str("latitude".into()), Value::Float(-90.0));
+            a.set(ArrKey::Str("longitude".into()), Value::Float(-180.0));
+            a.set(ArrKey::Str("comments".into()), Value::str(""));
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        _ => Value::Bool(false),
+    }
+}
+
+/// Zone validity for `new DateTimeZone`/`e`-format — oracle accepts
+/// IANA names (exact case; ponytail: phpun is case-insensitive) plus
+/// `±HH:MM`.
+pub(crate) fn tz_name_ok(s: &str) -> bool {
+    is_offset_name(s)
+        || crate::tzdata::TZ_BC
+            .iter()
+            .any(|z| z.eq_ignore_ascii_case(s))
+}
+
+/// The ctor/modify failure log: zend treats each unrecognized word
+/// in the spec as a failed timezone lookup — first one is an error,
+/// a second is a "double specification" warning, further ones are
+/// errors again. pos = the word's byte offset in the spec.
+pub(crate) fn ctor_parse_log(spec: &str) -> DtLog {
+    let mut log = DtLog::default();
+    let b = spec.as_bytes();
+    let mut i = 0;
+    let mut bad = 0usize;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() {
+            let st = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            let w = spec[st..i].to_ascii_lowercase();
+            let known = strto_month(&w).is_some()
+                || strto_dow(&w).is_some()
+                || strto_ord(&w).is_some()
+                || strto_tz_abbr(&w).is_some()
+                || strto_unit(&w).is_some()
+                || matches!(
+                    w.as_str(),
+                    "now"
+                        | "today"
+                        | "midnight"
+                        | "noon"
+                        | "tomorrow"
+                        | "yesterday"
+                        | "ago"
+                        | "next"
+                        | "last"
+                        | "previous"
+                        | "this"
+                        | "first"
+                        | "second"
+                        | "third"
+                        | "fourth"
+                        | "fifth"
+                        | "sixth"
+                        | "am"
+                        | "pm"
+                        | "of"
+                        | "the"
+                        | "back"
+                        | "front"
+                        | "sec"
+                        | "secs"
+                        | "weekday"
+                        | "fortnight"
+                );
+            if !known {
+                bad += 1;
+                match bad {
+                    1 => log.err(st as i64, "The timezone could not be found in the database"),
+                    2 => log.warn(st as i64, "Double timezone specification"),
+                    _ => log.err(st as i64, "Double timezone specification"),
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if log.is_empty() {
+        log.err(0, "Unexpected data found.");
+        log.err(
+            spec.len() as i64,
+            "Not enough data available to satisfy format",
+        );
+    }
+    log
+}
+
+pub(crate) fn parse_interval_spec(s: &str) -> Option<Vec<(&'static str, i64)>> {
+    let mut y = 0i64;
+    let mut mo = 0i64;
+    let mut d = 0i64;
+    let mut h = 0i64;
+    let mut i = 0i64;
+    let mut sec = 0i64;
+    let mut it = s.split_whitespace().peekable();
+    let mut any = false;
+    while let Some(w) = it.next() {
+        if w.eq_ignore_ascii_case("ago") {
+            // zend negates the field values, not `invert`
+            y = -y;
+            mo = -mo;
+            d = -d;
+            h = -h;
+            i = -i;
+            sec = -sec;
+            continue;
+        }
+        let n: i64 = w.parse().ok()?;
+        let unit = it.next()?.trim_end_matches('s').to_lowercase();
+        any = true;
+        match unit.as_str() {
+            "year" => y += n,
+            "month" => mo += n,
+            "week" => d += n * 7,
+            "fortnight" => d += n * 14,
+            "day" => d += n,
+            "hour" => h += n,
+            "min" | "minute" => i += n,
+            "sec" | "second" => sec += n,
+            _ => return None,
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(vec![
+        ("y", y),
+        ("m", mo),
+        ("d", d),
+        ("h", h),
+        ("i", i),
+        ("s", sec),
+        ("f", 0),
+        ("invert", 0),
+    ])
 }

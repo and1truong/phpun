@@ -15,6 +15,7 @@ pub mod parser;
 mod pcre;
 pub mod pdo;
 pub mod serve;
+mod tzdata;
 pub mod value;
 
 pub use error::PhpError;
