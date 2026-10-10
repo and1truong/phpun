@@ -26,5 +26,40 @@
   "status_changes": [],
   "existing_timeouts": [
     "/workspace/phpun/vendor/php-tests/Zend/tests/concat/concat_003.phpt"
-  ]
+  ],
+  "php_config_followup": {
+    "binary_sha256": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f",
+    "args": [
+      "-n"
+    ],
+    "settings": {
+      "version": "8.5.11",
+      "debug": false,
+      "zts": false,
+      "ini": false,
+      "opcache_loaded": true,
+      "enable_cli": "0",
+      "jit": "disable",
+      "jit_buffer_size": "64M",
+      "extensions": [
+        "Core",
+        "date",
+        "pcre",
+        "sqlite3",
+        "hash",
+        "json",
+        "lexbor",
+        "Zend OPcache",
+        "uri",
+        "SPL",
+        "PDO",
+        "pdo_sqlite",
+        "random",
+        "Reflection",
+        "tokenizer",
+        "standard"
+      ]
+    },
+    "note": "Config follow-up on the same frozen oracle binary; seven-rep timing samples are unchanged."
+  }
 }
