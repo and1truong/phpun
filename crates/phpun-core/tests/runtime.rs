@@ -721,3 +721,35 @@ string(4) "12.5"
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn pooled_frames_snapshot_method_context_args_and_release_receivers() {
+    let (out, err, code) = eval(
+        "frame.php",
+        r#"<?php
+function trace_leaf(int $n) { return debug_backtrace(0, 4); }
+function trace_recur(int $n) { return $n ? trace_recur($n - 1) : trace_leaf($n); }
+class TraceOwner {
+    function run(int $n) { return trace_recur($n); }
+    static function fail(int $n): int { throw new Exception('kept'); }
+}
+$o = new TraceOwner;
+$weak = WeakReference::create($o);
+$trace = $o->run(1);
+foreach ($trace as $f) echo ($f['class'] ?? ''), ($f['type'] ?? ''), $f['function'], ':', json_encode($f['args']), "\n";
+unset($trace, $f, $o);
+var_dump($weak->get());
+try { TraceOwner::fail(7); } catch (Exception $e) { $kept = $e; }
+trace_recur(2);
+foreach ($kept->getTrace() as $f) echo ($f['class'] ?? ''), ($f['type'] ?? ''), $f['function'], ':', json_encode($f['args']), "\n";
+set_error_handler(function ($n, $m) { $f = debug_backtrace(0, 2); echo $f[1]['function'], ':', json_encode($f[1]['args']), "\n"; return true; });
+function trace_warn(int $n) { $x = []; return $x[$n]; }
+trace_warn(9);
+restore_error_handler();
+"#,
+        &[],
+    );
+    assert_eq!(out, "trace_leaf:[0]\ntrace_recur:[0]\ntrace_recur:[1]\nTraceOwner->run:[1]\nNULL\nTraceOwner::fail:[7]\ntrace_warn:[9]\n");
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}

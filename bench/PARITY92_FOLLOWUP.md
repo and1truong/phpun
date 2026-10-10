@@ -237,3 +237,28 @@ Property/dim storage (#187) is partial: guarded key resolution is implemented,
 actual inline packed storage/offset caches await JSON/array allocation attribution.
 Promoted fixed by-value binding is implemented; broad method ICs remain conditional
 and existing by-ref promotion compatibility is tracked separately in #197.
+
+## Stable call frames and deferred VM class/type context (#184)
+
+Merged main3a792db has the same runtime as frozen a5dc13f (only comments differ).
+Runtime943eae5 keeps pooled call frames in Box ownership, so stack/pool/teardown
+transfer pointers instead of copying the large frame shell. Proven VM calls defer
+class/type strings to snapshot_trace_frame alongside their already-lazy arguments.
+Callsite/function metadata remains shared Rc strings; named/coercing/failing binder
+paths keep eager context. The SPL-stub check avoids scanning plain function files.
+
+Seven alternating PHP-byte-gated samples: default fib197.219→163.765ms (0.830),
+typed fib29 789.184→655.135 (0.830); independent untyped followup800.596→633.333
+(0.791). Objects initial420.574→384.585 but followup333.736→336.126: no object
+gain claim. Sieve medians worsen242.233→255.214 and230.820→244.833 (~6%, ranges
+overlap); keep this visible and test subsequent dispatch work against this head.
+31 small samples: startup4.805→4.816, app42.911→43.497, Composer7.340→7.546;
+no startup/app improvement claim. All speed samples isolated from builds/profiling.
+
+2,160 class/binding/hooks/lifetime/generator/exception PHPT:1824pass,290fail,
+16skip,23unsupported,3 existing generator crashes,4 existing 30s timeouts. Every
+individual status unchanged. Workspace tests/fmt/clippy pass; regression oracle
+checks recursive live args, instance/static class context, retained exception after
+frame reuse, nested handler trace, and receiver WeakReference lifetime. Existing
+backtrace option semantics are unchanged; this does not claim to fix all trace
+compatibility gaps. Raw timings/status maps and hashes in bench/data/92/parity/frame-*.

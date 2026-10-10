@@ -1,0 +1,44 @@
+{
+  "before_runtime": "a5dc13f",
+  "after_runtime": "943eae5",
+  "before": {
+    "total": 2160,
+    "passed": 1824,
+    "failed": 290,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 16,
+    "unsupported": 23,
+    "borked": 0,
+    "crashed": 3,
+    "timed_out": 4,
+    "applicable": 2121,
+    "compatibility_pct": 86.0
+  },
+  "after": {
+    "total": 2160,
+    "passed": 1824,
+    "failed": 290,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 16,
+    "unsupported": 23,
+    "borked": 0,
+    "crashed": 3,
+    "timed_out": 4,
+    "applicable": 2121,
+    "compatibility_pct": 86.0
+  },
+  "status_deltas": [],
+  "command": "BIN phpt PATHS --sut BIN --timeout 30 -j 4 --json SAVE",
+  "ceilings": [
+    "3 existing generator crashes",
+    "4 existing timeouts, 30 sec"
+  ],
+  "checks": [
+    "cargo fmt --all",
+    "cargo test --offline --workspace",
+    "cargo clippy --offline --workspace --all-targets -- -D warnings",
+    "pooled_frames_snapshot_method_context_args_and_release_receivers; PHP8.5.11 -n matching stdout/exit/stderr"
+  ]
+}

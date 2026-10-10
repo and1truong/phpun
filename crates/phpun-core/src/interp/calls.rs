@@ -259,11 +259,10 @@ impl<'a> Interp<'a> {
         let caller_is_spl_stub = self.stack.iter().rev().nth(1).is_some_and(|f| {
             // Executing prelude code too — a userland override in
             // an SPL subclass keeps real call sites.
-            f.file.contains("eval()'d code")
-                && f.decl_class
-                    .as_ref()
-                    .or(f.scope_class.as_ref())
-                    .is_some_and(|c| self.class_is_spl_prelude(c))
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .is_some_and(|c| f.file.contains("eval()'d code") && self.class_is_spl_prelude(c))
         });
         let from_builtin = caller_is_spl_stub
             || (self.internal_cb > 0
@@ -1289,7 +1288,7 @@ impl<'a> Interp<'a> {
                             decl.file.clone()
                         };
                         let decl = decl.clone();
-                        self.stack.push(frame);
+                        self.stack.push(Box::new(frame));
                         // Reuse the existing scalar VM binder after establishing
                         // closure context. Captures and missing/default/named/ref
                         // arguments retain the canonical binder. The scalar slot
@@ -2831,7 +2830,7 @@ impl<'a> Interp<'a> {
             }
             t
         };
-        // Context is eager; positional trace vectors reuse pooled capacity.
+        // Proven VM frames keep class/type context live alongside deferred args.
         // Named normalization retains its canonical ordering/default handling.
         if let Some(f) = self.stack.last() {
             // fn_name is already the Zend scope name —
@@ -2840,25 +2839,30 @@ impl<'a> Interp<'a> {
             // A closure bound to $this without a real scope runs
             // on the "dummy scope" — traces show `Closure->`
             // (closure_038).
-            fr.class = f
-                .scope_class
-                .as_ref()
-                .map(|c| c.name().to_string())
-                .or_else(|| {
-                    if f.fn_name.starts_with("{closure:") && f.this_obj.is_some() {
-                        Some("Closure".to_string())
-                    } else {
-                        None
-                    }
-                });
+            fr.class = (!defer_args)
+                .then(|| {
+                    f.scope_class
+                        .as_ref()
+                        .map(|c| c.name().to_string())
+                        .or_else(|| {
+                            if f.fn_name.starts_with("{closure:") && f.this_obj.is_some() {
+                                Some("Closure".to_string())
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .flatten();
             fr.ty.clear();
-            fr.ty.push_str(if f.this_obj.is_some() {
-                "->"
-            } else if f.scope_class.is_some() {
-                "::"
-            } else {
-                ""
-            });
+            if !defer_args {
+                fr.ty.push_str(if f.this_obj.is_some() {
+                    "->"
+                } else if f.scope_class.is_some() {
+                    "::"
+                } else {
+                    ""
+                });
+            }
             // A generator body resumed by a `Generator->{m}()`
             // call isn't a userland call — Zend stamps its trace
             // frame at the internal site (`[internal function]:
@@ -2889,10 +2893,11 @@ impl<'a> Interp<'a> {
         // Zend runs FilterIterator's accept loop in internal C — its
         // `fetch` frame never reaches a PHP trace.
         if fr.function.eq_ignore_ascii_case("fetch")
-            && fr
-                .class
-                .as_deref()
-                .is_some_and(|c| self.is_a_str(c, "FilterIterator"))
+            && self
+                .stack
+                .last()
+                .and_then(|f| f.scope_class.clone())
+                .is_some_and(|c| self.is_a_str(c.name(), "FilterIterator"))
         {
             fr.visible = false;
         }
@@ -5181,7 +5186,7 @@ impl<'a> Interp<'a> {
                 .clone()
                 .or_else(|| scope_class.clone());
             crate::interp::util::alloc_hit(4);
-            self.stack.push(frame);
+            self.stack.push(Box::new(frame));
             let fr = self.call_site_frame(decl, &args, false);
             self.call_trace.push(fr);
             let fname = self.decl_fname(decl);
@@ -5269,7 +5274,7 @@ impl<'a> Interp<'a> {
         let pending_caps = std::mem::take(&mut self.pending_gen_captures);
         frame.gen_body = self.pending_gen_body;
         self.pending_gen_body = false;
-        self.stack.push(frame);
+        self.stack.push(Box::new(frame));
         if let Some(top) = self.stack.last_mut() {
             for (n, c, by_ref) in pending_caps {
                 let c2 = if by_ref { c } else { cell(c.borrow().clone()) };

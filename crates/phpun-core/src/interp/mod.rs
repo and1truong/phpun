@@ -367,7 +367,9 @@ type StaticDeclSites =
 pub struct Interp<'a> {
     pub file: &'a str,
     globals: Frame,
-    stack: Vec<Frame>,
+    // Stable pooled frame ownership avoids copying the large shell on call/return.
+    #[allow(clippy::vec_box)]
+    stack: Vec<Box<Frame>>,
     pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
     /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
     /// the stored Rc keeps the decl alive so the pointer can't recycle.
@@ -385,7 +387,8 @@ pub struct Interp<'a> {
     vm_scalar_cell_pool: Vec<Cell>,
     vm_site_pool: Vec<Rc<VmSite>>,
     /// Popped VM frames — Frame::new/vars-map alloc per call avoided.
-    vm_frame_pool: Vec<Frame>,
+    #[allow(clippy::vec_box)]
+    vm_frame_pool: Vec<Box<Frame>>,
     /// Popped trace frames — keeps String/Vec capacity alive so the
     /// steady-state call path stops allocating (`site`/`post` phases).
     trace_pool: Vec<crate::value::TraceFrame>,
@@ -938,7 +941,7 @@ pub struct Interp<'a> {
     /// Frame popped inside `bind_and_run_inner`, handed off to the
     /// `bind_and_run` wrapper which runs its deferred __destruct
     /// pass after the call-trace pop (bug52361).
-    last_popped_frame: Option<Frame>,
+    last_popped_frame: Option<Box<Frame>>,
     /// Container addresses currently being var_dumped — a re-entrant
     /// dump prints `*RECURSION*` (closure_034/035).
     pub dump_stack: std::collections::HashSet<usize>,
@@ -3549,7 +3552,10 @@ impl<'a> Interp<'a> {
     }
 
     fn cur(&mut self) -> &mut Frame {
-        self.stack.last_mut().unwrap_or(&mut self.globals)
+        self.stack
+            .last_mut()
+            .map(Box::as_mut)
+            .unwrap_or(&mut self.globals)
     }
 
     /// PHP auto-globals resolve in every scope; first access links the
@@ -4577,7 +4583,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Pop a call frame and free its vm_stack span.
-    fn stack_pop(&mut self) -> Option<Frame> {
+    fn stack_pop(&mut self) -> Option<Box<Frame>> {
         let f = self.stack.pop();
         if let Some(f) = &f {
             self.vm_frame_free(&f.vm_sites);

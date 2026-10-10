@@ -1096,7 +1096,7 @@ impl<'a> Interp<'a> {
                     seed_frame.scope_class = callable.scope_class.clone();
                     seed_frame.called_class = callable.called_class.clone();
                     let saved_line = self.cur_line;
-                    self.stack.push(seed_frame);
+                    self.stack.push(Box::new(seed_frame));
                     for (n, d, sline) in sv {
                         // Only literal-only defaults are bound at
                         // creation — consts, `new`, calls and anything

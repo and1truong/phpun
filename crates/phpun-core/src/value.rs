@@ -2339,7 +2339,7 @@ pub struct TraceFrame {
     /// is a builtin (e.g. a userland callback invoked from ob_end_clean).
     pub file: Rc<str>,
     pub line: u32,
-    /// Live VM frame index until a trace read snapshots its argument cells.
+    /// Live VM frame index until observation snapshots argument cells and class/type context.
     pub args_frame: Option<usize>,
     /// Call args (rendered with trace_arg).
     pub args: Vec<Cell>,
