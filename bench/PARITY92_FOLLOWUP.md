@@ -88,3 +88,24 @@ adversarial/repeated-prefix workloads. No new dependency or builtin-only shortcu
 Validation: exhaustive small binary haystack/needle/all-offset check, workspace
 tests/fmt/clippy/release, 24 VM/standalone oracle probes, 19 workload checks;
 59 relevant PHPT unchanged (26pass/33existingfail), zero crashes/timeouts.
+
+## Class names and float positive proofs (#186)
+
+Objects profile after shared replacement: cpu-clock:u199Hz, DWARF8192, 1,024
+samples, zero lost. Exclusive StrSearcher::new6.84%, below PhpClass::name;
+to_lowercase2.44%. Inclusive stack presence (overlapping): property plain-read98,
+property-key51, hooks61, binder242, instantiate71, method_invoke320, new_instance218.
+This does not isolate pure method lookup; find_method_in appears in only31stacks.
+
+Runtime9961ea5 →6bbe9e0: avoid anonymous marker search for ordinary class names;
+reuse existing compiled positive type gates for already-float values (int widening
+stays canonical); construct return-diagnostic names only when needed in binder.
+Seven PHP-gated alternating release pairs: objects497.716→428.740ms (0.861×),
+ctor phase131.357→115.492 (0.879×), norm192.739→168.065 (0.872×). Fib/strings/app
+ranges overlap; no benefit claimed. Full promoted binding remains canonical.
+
+Validation: workspace tests/fmt/clippy/release, float widening/null/invalid-return
+and anonymous-class regression; 26 VM/standalone oracle probes. 1,965 selected
+class/hooks/type/lifetime PHPT:1,710pass/214existingfail/16skip/23unsupported/2existing
+GC timeouts at30s, zero crashes; every status unchanged across before/after.
+The two timeouts are retained in validation data, not counted as passes.
