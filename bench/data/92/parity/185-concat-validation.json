@@ -1,0 +1,30 @@
+{
+  "runtime": "a5dc13f",
+  "checks": [
+    "workspace tests",
+    "fmt",
+    "clippy",
+    "release",
+    "binary bytes/aliases/LHS-RHS mutation/conversion/throw order regression",
+    "29 VM/standalone oracle probes",
+    "19 workload oracle checks"
+  ],
+  "phpt": {
+    "total": 1557,
+    "passed": 1390,
+    "failed": 136,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 15,
+    "unsupported": 15,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 1,
+    "applicable": 1527,
+    "compatibility_pct": 91.03
+  },
+  "status_changes": [],
+  "existing_timeouts": [
+    "/workspace/phpun/vendor/php-tests/Zend/tests/concat/concat_003.phpt"
+  ]
+}

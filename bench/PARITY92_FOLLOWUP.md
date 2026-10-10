@@ -167,3 +167,73 @@ unpack/hooks/readonly/error regression; 28 oracle probes. 1,974 selected class/
 hooks/binding/lifetime PHPT unchanged (1,716pass/217existingfail/16skip/23unsupported/
 2existingGC30s timeouts), zero crashes. Existing by-ref promoted-property alias
 difference #197 is present on main too; those calls remain canonical, not fixed here.
+
+## Borrowed shared concat (#185)
+
+After byte-search improvements, 504 CPU samples/zero lost on strings200: vm_binary
+in125stacks, replacement61 (overlapping stack presence). Shared concat now borrows
+string operands, converts other values in canonical left-to-right order, allocates
+combined output once. AST binary/compound assignment and VM share the helper;
+existing memory-accounting/growth checks stay at their call sites. Storage remains
+Rc<[u8]>; final Vec→Rc copying and growing-prefix copies are not eliminated.
+
+Runtimef4a5c04 →a5dc13f, seven PHP-gated release pairs: strings243.260→239.897ms
+(0.986×), concat400015.460→15.074 (0.975×), concat1600066.681→55.506 (0.832×).
+Small/default cases overlap; benefit on larger concat phase is not a claim of
+whole-workload improvement. Whole strings improvement below primarily comes from
+shared replacement/search. No capacity-storage rewrite or new key interning claimed.
+
+Validation: workspace tests/fmt/clippy/release, binary/alias/LHS-RHS mutation/
+conversion/throw-order check; 29 oracle probes and 19 workload checks. 1,557 relevant
+core/string/concat/memory-limit PHPT unchanged (1,390pass/136existingfail/15skip/
+15unsupported/1existing30s timeout), zero crashes.
+
+## Fresh main → complete stack comparison
+
+Frozen main5b227c0 →a5dc13f, same host, 7 rotating-order reps of native PHP/main/stack,
+all exit/stdout/stderr byte-identical each rep, profiler off. PHP8.5.11 release
+(non-debug, non-ZTS), -n, OPcache CLI0/JITdisabled; Rust1.99.0 release/LTO/
+codegen-units1. Direct process timing via subprocess.run/perf_counter_ns; cold
+startup+parse+execution. No wrapper/container-exec timing. Raw hashes/config/samples
+and runnable comparison script are committed.
+
+| Bench | PHP / main / stack median ms | Main/PHP | Stack/PHP | Stack/main |
+|---|---:|---:|---:|---:|
+| 00-startup | 5.243 / 5.906 / 6.180 | 1.13× | 1.18× | 1.046× |
+| 10-fib | 12.891 / 216.288 / 199.412 | 16.78× | 15.47× | 0.922× |
+| 11-sieve | 8.072 / 242.473 / 234.809 | 30.04× | 29.09× | 0.968× |
+| 20-strings | 14.650 / 629.537 / 242.834 | 42.97× | 16.58× | 0.386× |
+| 30-arrays | 19.470 / 232.041 / 219.825 | 11.92× | 11.29× | 0.947× |
+| 40-objects | 7.922 / 451.854 / 348.824 | 57.04× | 44.03× | 0.772× |
+| 50-regex | 7.553 / 40.285 / 40.392 | 5.33× | 5.35× | 1.003× |
+| 60-json | 168.980 / 911.274 / 921.135 | 5.39× | 5.45× | 1.011× |
+| 70-db | 28.682 / 120.852 / 115.973 | 4.21× | 4.04× | 0.960× |
+
+Nine-bench geomean10.81→9.29×; stack/main0.860.
+This is a separate baseline/configuration from the user-reported geomean3.62.
+The earlier user result remains attributed to its source, not overwritten or
+combined. Differences are not explained without the user's raw build/timing
+provenance. PHP parity is not reached; objects/fib/sieve still have large gaps.
+Startup/small-workload dispersion is substantial.
+
+Seven-pair cold application medians were slightly higher with overlapping ranges,
+so31 further isolated alternating main/stack pairs were run (no builds/profilers/
+PHPT in parallel). App41.711→41.433ms (0.993×), Composer6.927→6.954 (1.004×),
+startup4.981→4.756 (0.955×); ranges overlap. Both7/31 datasets retained. No app
+speedup or reliable cold-start change claimed. Repeat/slice phase samples also
+have overlapping ranges; no specific improvement claimed.
+
+Final fib CPU profile:1,626samples/zero lost, call_site_frame10.947%weighted
+inclusive (2.95%exclusive), vm_exec36.96%exclusive/vm_run11.01%. Context fields
+are already mainly shared Rc strings; positional args are deferred, vectors pooled.
+Full trace rendering rewrite (#184) is deferred for this stack: even hypothetical
+removal of the entire ~10.95%bucket cannot close the measured fib gap. It remains
+open for a compact live-call-record prototype with equivalent observation/unwind.
+
+Register/native tier (#188) is not selected here. Function buckets include value
+operations, bookkeeping and frame movement; unresolved libc addresses/depth limits
+remain. Next evidence must separate instruction dispatch from frame/value copying.
+Property/dim storage (#187) is partial: guarded key resolution is implemented,
+actual inline packed storage/offset caches await JSON/array allocation attribution.
+Promoted fixed by-value binding is implemented; broad method ICs remain conditional
+and existing by-ref promotion compatibility is tracked separately in #197.
