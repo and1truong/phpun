@@ -740,11 +740,26 @@ impl<'a> Interp<'a> {
         r
     }
 
+    pub(in crate::interp) fn snapshot_trace_frame(&self, frame: &TraceFrame) -> TraceFrame {
+        let mut snapshot = frame.clone();
+        if let Some(index) = snapshot.args_frame.take() {
+            snapshot.args = self.stack[index].args.clone();
+        }
+        snapshot
+    }
+
+    pub(in crate::interp) fn snapshot_call_trace(&self) -> Vec<TraceFrame> {
+        self.call_trace
+            .iter()
+            .map(|f| self.snapshot_trace_frame(f))
+            .collect()
+    }
+
     /// Backtrace frames (innermost first) for an E_ERROR raised inside a
     /// builtin — Zend attaches the call stack to runtime fatals.
     pub fn fatal_frames(&self) -> Vec<String> {
-        let frames: Vec<&crate::value::TraceFrame> = self
-            .call_trace
+        let snapshot = self.snapshot_call_trace();
+        let frames: Vec<&crate::value::TraceFrame> = snapshot
             .iter()
             .rev()
             .filter(|f| !trace_frame_hidden(f))

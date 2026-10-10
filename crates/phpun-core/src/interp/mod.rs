@@ -7122,7 +7122,9 @@ impl<'a> Interp<'a> {
             if crate::value::trace_frame_hidden(fr) {
                 continue;
             }
-            frames.push(crate::value::trace_frame_str(fr));
+            frames.push(crate::value::trace_frame_str(
+                &self.snapshot_trace_frame(fr),
+            ));
         }
         frames
     }
@@ -7221,7 +7223,9 @@ impl<'a> Interp<'a> {
                     if dup {
                         continue;
                     }
-                    parts.push(crate::value::trace_frame_str(fr));
+                    parts.push(crate::value::trace_frame_str(
+                        &self.snapshot_trace_frame(fr),
+                    ));
                 }
                 parts.extend(frames.iter().cloned());
                 let mut t = String::new();
@@ -7344,7 +7348,7 @@ impl<'a> Interp<'a> {
                 full_msg: String::new(),
                 eval_ctx: 0,
                 frames: {
-                    let mut fr = self.call_trace.clone();
+                    let mut fr = self.snapshot_call_trace();
                     if std::mem::take(&mut self.exc_frameless) {
                         fr.pop();
                     }
@@ -7363,7 +7367,7 @@ impl<'a> Interp<'a> {
     /// Raise `throw $v` as an error result.
     fn throw(&mut self, v: Value) -> PhpError {
         if self.gen_run_state.is_some() {
-            self.gen_raise_ctx = self.call_trace.clone();
+            self.gen_raise_ctx = self.snapshot_call_trace();
         }
         self.pending_exception = Some(v);
         PhpError {
@@ -7425,6 +7429,7 @@ impl<'a> Interp<'a> {
             ),
         };
         self.call_trace.push(TraceFrame {
+            args_frame: None,
             function: name.to_string().into(),
             class: None,
             ty: String::new(),
@@ -8252,7 +8257,7 @@ impl<'a> Interp<'a> {
             );
         }
         if self.gen_run_state.is_some() {
-            self.gen_raise_ctx = self.call_trace.clone();
+            self.gen_raise_ctx = self.snapshot_call_trace();
         }
         self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
@@ -8263,6 +8268,7 @@ impl<'a> Interp<'a> {
             let const_frame = self.class_const_ctx > 0;
             if const_frame {
                 self.call_trace.push(TraceFrame {
+                    args_frame: None,
                     function: "[constant expression]".to_string().into(),
                     class: None,
                     ty: String::new(),

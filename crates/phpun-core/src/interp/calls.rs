@@ -2479,7 +2479,7 @@ impl<'a> Interp<'a> {
         // otherwise take the silent by-ref bucket path and swallow
         // the missing-key warning zend emits on a normal read.
         let saved_dim_by_ref = std::mem::replace(&mut self.dim_by_ref, false);
-        let fr = self.call_site_frame(decl, &args);
+        let fr = self.call_site_frame(decl, &args, false);
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
         let r = self.bind_and_run_inner(decl, args, unused);
@@ -2602,6 +2602,7 @@ impl<'a> Interp<'a> {
         &mut self,
         decl: &FunctionDecl,
         args: &CallArgs,
+        defer_args: bool,
     ) -> TraceFrame {
         crate::interp::util::alloc_hit(3);
         // The callee's argline markers overwrite `send_line`; after
@@ -2636,7 +2637,9 @@ impl<'a> Interp<'a> {
         // Named args collected by a variadic stay keyed
         // (`test(1, 2, x: 3, y: 4)` in named_params/backtrace).
         let mut targs_named: Vec<(String, Cell)> = Vec::new();
-        let targs: Vec<Cell> = if args.named.is_empty() {
+        let targs: Vec<Cell> = if defer_args {
+            Vec::new()
+        } else if args.named.is_empty() {
             args.cells.clone()
         } else {
             let mut last: i64 = -1;
@@ -2706,6 +2709,7 @@ impl<'a> Interp<'a> {
             .stack
             .last()
             .map(|f| TraceFrame {
+                args_frame: None,
                 // fn_name is already the Zend scope name —
                 // `{closure:Foo::m():L}`/`{closure:FILE:L}` included.
                 function: f.fn_name.clone(),
@@ -2752,6 +2756,7 @@ impl<'a> Interp<'a> {
                 gen_body: f.gen_body,
             })
             .unwrap_or_else(|| TraceFrame {
+                args_frame: None,
                 function: decl.name.clone(),
                 class: None,
                 ty: String::new(),
@@ -2765,6 +2770,9 @@ impl<'a> Interp<'a> {
                 gen_resume: false,
                 gen_body: false,
             });
+        if defer_args {
+            fr.args_frame = Some(self.stack.len() - 1);
+        }
         fr.args = targs;
         fr.named_args = targs_named;
         // Zend runs FilterIterator's accept loop in internal C — its
@@ -4492,7 +4500,9 @@ impl<'a> Interp<'a> {
                     if crate::value::trace_frame_hidden(fr) {
                         continue;
                     }
-                    frs.push(crate::value::trace_frame_str(fr));
+                    frs.push(crate::value::trace_frame_str(
+                        &self.snapshot_trace_frame(fr),
+                    ));
                 }
                 self.stack_pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
@@ -5057,7 +5067,7 @@ impl<'a> Interp<'a> {
                 .or_else(|| scope_class.clone());
             crate::interp::util::alloc_hit(4);
             self.stack.push(frame);
-            let fr = self.call_site_frame(decl, &args);
+            let fr = self.call_site_frame(decl, &args, false);
             self.call_trace.push(fr);
             let fname = self.decl_fname(decl);
             self.stack_pop();

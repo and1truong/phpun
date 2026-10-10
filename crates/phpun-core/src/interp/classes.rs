@@ -3929,7 +3929,7 @@ impl<'a> Interp<'a> {
                 full_msg: String::new(),
                 eval_ctx: 0,
                 previous: None,
-                frames: Rc::new(self.call_trace.clone()),
+                frames: Rc::new(self.snapshot_call_trace()),
             })
         } else {
             None

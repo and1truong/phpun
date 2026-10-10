@@ -1,0 +1,13 @@
+native_trace:7
+7:7
+native_recur:0
+native_recur:1
+native_recur:2
+DivisionByZeroError
+intdiv:[5,0]
+native_div:[5]
+TypeError
+native_ret:[5]
+alive
+destroy
+done

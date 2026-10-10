@@ -1091,7 +1091,15 @@ impl<'a> Interp<'a> {
             prop_ov: self.last_prop_ov.take(),
             dim_by_ref: std::mem::replace(&mut self.dim_by_ref, false),
         };
-        let fr = self.call_site_frame(decl, &args);
+        // Only defer when every provided param is check-free or proven to
+        // pass. Rebinding/coercion errors retain eager send-time arguments.
+        let defer_args = args.named.is_empty()
+            && args.cells.len() >= decl.params.len()
+            && decl.params.iter().enumerate().all(|(i, p)| {
+                p.ty.is_none()
+                    || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
+            });
+        let fr = self.call_site_frame(decl, &args, defer_args);
         self.call_trace.push(fr);
         padd!(2, __p);
         let __p = pnow!();
