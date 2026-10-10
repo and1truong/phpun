@@ -45,7 +45,7 @@ Exclusive samples rolled up by function group; top symbols verbatim in
 | libc | 2.0 |
 | other/unsymbolized | 23.3 |
 
-`PHPUN_CALLPROF`: `pre`+`cells`+`site`+`bind`+`post` = 108.9 ms over 392,835
+`PHPUN_CALLPROF`: `pre`+`cells`+`site`+`bind`+`post` = 108.66 ms over 392,835
 calls ≈ 277 ns of measured per-call overhead; `exec` (inclusive body) is the
 rest. Allocation profile (n=24 uprobe): 86.9% of mallocs are
 `RawVec::finish_grow` at ~40 B each ≈ one tiny Vec grow per frame (arg/vars
@@ -69,7 +69,7 @@ the dim-write interpreter machinery, not function dispatch.
 
 Allocations (lim=20000 uprobe, 320k events): `assign_inner` 29.2% +
 `assign_index_path` 19.5% + `dim_self_root` 9.7% + `dim_var_key` 9.7% +
-`String::clone` 9.9% ≈ 68% of all mallocs — tiny (1–15 B) key/scratch churn
+`String::clone` 9.9% ≈ 78.1% of all mallocs — tiny (1–15 B) key/scratch churn
 per index write. `builtins::cell` (array_fill cells) 5.9%. Element cells are
 NOT the problem: new `array_new` counter reads 79 for the whole run; the
 table is already sequential-int keyed and writes update slots in place.
@@ -136,7 +136,7 @@ The dominant cost is not JSON code — it is the zend memory-limit emulation:
 every `PhpArray` append/realloc walks the meter, and the `mem_realloc`
 closure alone is 21.6% of CPU. Allocations (reps=1 uprobe, 783k events,
 34.5 MB): `finish_grow` Vec growth 37.7% (element Vec reallocation),
-`PhpStr::new` 11.4%, `PhpArray::set`+`push` 8.8%, `json_*` funcs ~18.5%,
+`PhpStr::new` 11.4%, `PhpArray::set`+`push` 8.8%, `json_*` funcs ~18.2%,
 `to_key` 6.8%. New counters: `to_string` 1,308,179 + `array_new` 1,113,079 ≈
 2.4M of 15.1M host mallocs — the rest is Vec growth inside decode/encode.
 
@@ -145,7 +145,7 @@ closure alone is 21.6% of CPU. Allocations (reps=1 uprobe, 783k events,
 | bench | next lane | why |
 |---|---|---|
 | 10-fib | R4 (VM ABI) | 63.6% dispatch + ~11% call machinery; ~1 frame Vec-grow per call. Nothing else registers. |
-| 11-sieve | R4 (VM ABI / hot-path) | AST-path dim-write machinery + global name resolution ≈ 45% CPU and ~68% of mallocs; element cells ≈ 0 — packed storage cannot help. Needs dim-assign fast path (top-level coverage is the `executed-body=0` gap). |
+| 11-sieve | R4 (VM ABI / hot-path) | AST-path dim-write machinery + global name resolution ≈ 45% CPU and ~78% of mallocs; element cells ≈ 0 — packed storage cannot help. Needs dim-assign fast path (top-level coverage is the `executed-body=0` gap). |
 | 40-objects | R2 (objects) | Dispatch/name normalization ≈ 17.6% CPU + ~45% of mallocs (`to_lowercase` 32%); property HashMap/Vec churn. R2's method/property caches + declared-slot props target exactly this. Largest single gap (10.51×). |
 | 30-arrays | R4 (VM ABI) | ~63% of mallocs + ~13% CPU in per-call callback machinery; element cells <1%. `usort`/`map`/`filter` pay per call, not per element. |
 | 60-json | R3 (arrays-json), gated | Element cells/Vec growth ≈ 46% of mallocs (real R3 target), BUT the meter (`mem_realloc`/`mem_track`/`mem_sweep`) is 42% CPU — a cross-cutting accounting cost that also taxes arrays/objects. Any lane that grows `PhpArray` must fix the meter path first or it keeps eating the win. |
