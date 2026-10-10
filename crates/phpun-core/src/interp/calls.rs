@@ -127,10 +127,9 @@ impl<'a> Interp<'a> {
                             0,
                         ));
                     };
-                    let params = self
-                        .find_method_in(&cls, mn)
-                        .map(|(m, _)| m.decl.params.clone())
-                        .unwrap_or_default();
+                    let fm = self.find_method_in(&cls, mn);
+                    let names_ok = fm.is_some();
+                    let params = fm.map(|(m, _)| m.decl.params.clone()).unwrap_or_default();
                     let vals = self.arg_cells(
                         args,
                         &params,
@@ -138,6 +137,7 @@ impl<'a> Interp<'a> {
                         false,
                         site,
                         false,
+                        names_ok,
                     )?;
                     return self.static_invoke_vis(cls, mn, vals, None, true);
                 }
@@ -147,11 +147,10 @@ impl<'a> Interp<'a> {
                 // `C::$var()` — dynamic static method call.
                 let cls = self.class_of(class)?;
                 let mn = Self::nul_trunc(&self.prop_name(name)?);
-                let params = self
-                    .find_method_in(&cls, &mn)
-                    .map(|m| m.0.decl.params.clone())
-                    .unwrap_or_default();
-                let vals = self.arg_cells(args, &params, &mn, false, site, false)?;
+                let fm = self.find_method_in(&cls, &mn);
+                let names_ok = fm.is_some();
+                let params = fm.map(|m| m.0.decl.params.clone()).unwrap_or_default();
+                let vals = self.arg_cells(args, &params, &mn, false, site, false, names_ok)?;
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
                 return self.static_invoke_vis(cls, &mn, vals, None, fwd);
             }
@@ -164,7 +163,9 @@ impl<'a> Interp<'a> {
                     Value::Callable(_) => {
                         let params = self.callable_params(&v);
                         let ctx = self.callable_ctx_name(&v);
-                        let vals = self.arg_cells(args, &params, &ctx, false, site, false)?;
+                        let names_ok = !params.is_empty();
+                        let vals =
+                            self.arg_cells(args, &params, &ctx, false, site, false, names_ok)?;
                         return self.call_value(&v, vals);
                     }
                     Value::Object(o) => {
@@ -186,7 +187,9 @@ impl<'a> Interp<'a> {
                         }
                         let params = self.callable_params(&v);
                         let ctx = self.callable_ctx_name(&v);
-                        let vals = self.arg_cells(args, &params, &ctx, false, site, false)?;
+                        let names_ok = !params.is_empty();
+                        let vals =
+                            self.arg_cells(args, &params, &ctx, false, site, false, names_ok)?;
                         return self.call_value(&v, vals);
                     }
                     Value::Array(_) => {
@@ -201,7 +204,9 @@ impl<'a> Interp<'a> {
                         }
                         let params = self.callable_params(&c);
                         let ctx = self.callable_ctx_name(&c);
-                        let vals = self.arg_cells(args, &params, &ctx, false, site, false)?;
+                        let names_ok = !params.is_empty();
+                        let vals =
+                            self.arg_cells(args, &params, &ctx, false, site, false, names_ok)?;
                         return self.call_value(&c, vals);
                     }
                     Value::Str(_) => self.conv_str(&v).unwrap_or_default(),
@@ -406,6 +411,63 @@ impl<'a> Interp<'a> {
 
     /// By-ref slot lookup for arg `i`/named — the delayed-append gate
     /// skips args a by-ref param binds as write targets.
+    /// Named-arg validity at the arg's own position, mirroring the
+    /// bind-time check: `Some((cls, msg))` is the throwable to raise
+    /// ("Unknown named parameter"/"overwrites previous argument", or
+    /// ArgumentCountError for variadic builtins). `n_pos` counts
+    /// positional args sent so far; `named` the named keys already
+    /// pushed (unpack included).
+    fn named_arg_err(
+        decl: &[Param],
+        internal: bool,
+        ctx: &str,
+        n_pos: usize,
+        named: &[(String, Cell, bool, bool)],
+        n: &str,
+    ) -> Option<(&'static str, String)> {
+        if internal {
+            // Builtins check against real arginfo names (zend does —
+            // `decl` here is only the synthesized by-ref table). A fn
+            // with no recorded signature accepts any name here; the
+            // bind path applies its own rules.
+            let lname = ctx
+                .trim_start_matches('\u{1}')
+                .trim_start_matches('\\')
+                .to_lowercase();
+            let names: Vec<String> = crate::builtins::builtin_sig(&lname)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.into_iter().map(|(nm, _)| nm).collect())
+                .or_else(|| {
+                    crate::builtins::builtin_params(&lname)
+                        .map(|ps| ps.iter().map(|(nm, _)| nm.to_string()).collect())
+                })
+                .or_else(|| {
+                    (!decl.is_empty()).then(|| decl.iter().map(|p| p.name.clone()).collect())
+                })
+                .unwrap_or_default();
+            // Variadic tails collect named args — the callee decides
+            // (call_user_func forwards them; array_merge raises its own
+            // ArgumentCountError at bind). Only fixed-arginfo builtins
+            // reject a name at send time.
+            let variadic = crate::builtins::builtin_params(&lname)
+                .is_some_and(|ps| matches!(ps.last(), Some((_, crate::builtins::BDef::Var))))
+                || decl.iter().any(|p| p.variadic);
+            if variadic || names.iter().any(|k| k == n) {
+                return None;
+            }
+            return Some(("Error", format!("Unknown named parameter ${}", n)));
+        }
+        match decl.iter().position(|p| !p.variadic && p.name == *n) {
+            Some(j) if j < n_pos || named.iter().any(|(n2, ..)| n2 == n) => Some((
+                "Error",
+                format!("Named parameter ${} overwrites previous argument", n),
+            )),
+            Some(_) => None,
+            None if decl.iter().any(|p| p.variadic) => None,
+            None => Some(("Error", format!("Unknown named parameter ${}", n))),
+        }
+    }
+
     fn arg_by_ref(decl: &[Param], name: &Option<String>, pos: usize) -> bool {
         match name {
             Some(n) => decl
@@ -437,6 +499,12 @@ impl<'a> Interp<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// `names_ok` — the decl is an authoritative signature, so named
+    /// args can be checked at their own position (zend SEND order).
+    /// False when the callee's params are unresolved (magic __call
+    /// targets, incomplete builtin tables): named args stay deferred
+    /// to whatever the callee does with them.
     pub(in crate::interp) fn arg_cells(
         &mut self,
         args: &[Expr],
@@ -445,6 +513,7 @@ impl<'a> Interp<'a> {
         internal: bool,
         site: Option<usize>,
         delayed_catchable: bool,
+        names_ok: bool,
     ) -> Result<CallArgs, PhpError> {
         // `[]` append reads inside call args are zend's delayed
         // compile error: raised after callee resolution but before any
@@ -609,6 +678,27 @@ impl<'a> Interp<'a> {
                 self.vm_call_push(&mut out);
                 continue;
             }
+            // Named args check validity at their own position (zend's
+            // SEND order): a bare-CV value checks BEFORE the read so a
+            // rejected name can't leak an undefined-variable warning;
+            // every other operand evaluates first (side effects still
+            // fire) and checks right after.
+            let bare_cv_named =
+                names_ok && name.is_some() && matches!(Self::unmark_rhs(expr), Expr::Var(_));
+            if let (Some(n), true) = (name.as_deref(), bare_cv_named) {
+                if let Some((cls, msg)) =
+                    Self::named_arg_err(decl, internal, ctx, pos, &out.named, n)
+                {
+                    return self.fail(PhpError::uncaught(cls, msg, self.cur_line));
+                }
+            }
+            // `name` gets partially moved by the eval arms below —
+            // keep the copy the post-eval check needs.
+            let named_check: Option<String> = if !names_ok || bare_cv_named {
+                None
+            } else {
+                name.clone()
+            };
             let by_ref = match &name {
                 // Unknown named args land in the variadic — a by-ref
                 // `&...$refs` variadic binds them as cells
@@ -772,6 +862,17 @@ impl<'a> Interp<'a> {
                     crate::interp::util::alloc_hit(6);
                     out.cells.push(cell(v));
                     pos += 1;
+                }
+            }
+            if let Some(n) = &named_check {
+                // The just-pushed named entry is the current arg —
+                // overwrite only collides with EARLIER named args.
+                let prior = &out.named[..out.named.len().saturating_sub(1)];
+                if let Some((cls, msg)) = Self::named_arg_err(decl, internal, ctx, pos, prior, n) {
+                    // Pop the just-pushed named entry — the callee
+                    // never sees the rejected arg.
+                    out.named.pop();
+                    return self.fail(PhpError::uncaught(cls, msg, self.cur_line));
                 }
             }
         }
@@ -944,10 +1045,9 @@ impl<'a> Interp<'a> {
                     0,
                 ));
             };
-            let params = self
-                .find_method_in(&cls, mn)
-                .map(|(m, _)| m.decl.params.clone())
-                .unwrap_or_default();
+            let fm = self.find_method_in(&cls, mn);
+            let names_ok = fm.is_some();
+            let params = fm.map(|(m, _)| m.decl.params.clone()).unwrap_or_default();
             let vals = self.arg_cells(
                 args,
                 &params,
@@ -955,6 +1055,7 @@ impl<'a> Interp<'a> {
                 false,
                 site,
                 false,
+                names_ok,
             )?;
             return self.static_invoke_vis(cls, mn, vals, None, false);
         }
@@ -1002,6 +1103,10 @@ impl<'a> Interp<'a> {
         } else {
             Vec::new()
         };
+        // Internal decls validate names only when the synthesized
+        // by-ref table actually covers the builtin (array_slice has
+        // no by-ref params → empty → unknown-name checks would be
+        // bogus); userland decls are authoritative even when empty.
         let argvals = self.arg_cells(
             args,
             decl.as_deref()
@@ -1011,6 +1116,10 @@ impl<'a> Interp<'a> {
             decl.is_none(),
             site,
             false,
+            decl.is_some()
+                || !builtin_params.is_empty()
+                || crate::builtins::builtin_sig(lname.as_ref()).is_some_and(|sg| !sg.is_empty())
+                || crate::builtins::builtin_params(lname.as_ref()).is_some(),
         )?;
         if !ns_resolved {
             // zend's ZEND_FRAMELESS_FUNCTION for a compile-time-bound
