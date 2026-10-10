@@ -11,7 +11,7 @@ use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, Param, Stmt};
 use crate::builtins;
 use crate::error::PhpError;
-use crate::value::{compare, identical, Cell, FxMap, PhpArray, Value};
+use crate::value::{compare, identical, Cell, FxMap, PhpArray, PhpClass, Value};
 
 use super::{Flow, Interp};
 
@@ -146,6 +146,14 @@ fn coverage_hit(reason: &str) {
     }
 }
 
+/// Cache metadata only; never pin a receiver or a mutable property cell.
+struct CachedProp {
+    class: Rc<PhpClass>,
+    scope: Option<Rc<PhpClass>>,
+    key: String,
+    private_candidate: Option<String>,
+}
+
 enum Op {
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
@@ -153,6 +161,7 @@ enum Op {
     ThisProp {
         name: Rc<str>,
         site: usize,
+        cache: std::cell::RefCell<Option<CachedProp>>,
         fallback: Box<Expr>,
     },
     Foreach {
@@ -1099,6 +1108,7 @@ impl Compiler {
                 self.emit(Op::ThisProp {
                     name: Rc::from(name.as_str()),
                     site: *site,
+                    cache: std::cell::RefCell::new(None),
                     fallback: Box::new(e.clone()),
                 });
             }
@@ -1755,12 +1765,57 @@ impl<'a> Interp<'a> {
                 Op::ThisProp {
                     name,
                     site,
+                    cache,
                     fallback,
                 } => {
                     self.cur_line = *site;
                     self.send_line = Some(*site);
                     let receiver = self.stack.last().and_then(|f| f.this_obj.clone());
-                    let plain = receiver.and_then(|o| self.prop_read_plain(&o, name));
+                    let plain = receiver.and_then(|o| {
+                        let frame = self.stack.last().unwrap();
+                        let scope = frame
+                            .decl_class
+                            .as_ref()
+                            .or(frame.scope_class.as_ref())
+                            .cloned();
+                        let can_cache = frame.hook_prop.is_none();
+                        if can_cache {
+                            let ob = o.borrow();
+                            if let Some(hit) = cache.borrow().as_ref() {
+                                let same_scope = match (&hit.scope, &scope) {
+                                    (None, None) => true,
+                                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                                    _ => false,
+                                };
+                                // A public fallback key cannot shadow a private
+                                // scope slot that exists in a different instance.
+                                let same_resolution =
+                                    hit.private_candidate.as_ref().is_none_or(|private| {
+                                        private == &hit.key || !ob.props.contains_key(private)
+                                    });
+                                if Rc::ptr_eq(&hit.class, &ob.class)
+                                    && same_scope
+                                    && same_resolution
+                                {
+                                    if let Some(c) = ob.props.get(&hit.key) {
+                                        return Some(c.borrow().clone());
+                                    }
+                                }
+                            }
+                        }
+                        let (value, key) = self.prop_read_plain_key(&o, name)?;
+                        if can_cache {
+                            let private_candidate =
+                                scope.as_ref().map(|c| format!("\0{}\0{}", c.name(), name));
+                            *cache.borrow_mut() = Some(CachedProp {
+                                class: o.borrow().class.clone(),
+                                scope,
+                                key,
+                                private_candidate,
+                            });
+                        }
+                        Some(value)
+                    });
                     if let Some(value) = plain {
                         vs.push(value);
                     } else {

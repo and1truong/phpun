@@ -1518,6 +1518,15 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
     ) -> Option<Value> {
+        self.prop_read_plain_key(o, pn).map(|(value, _)| value)
+    }
+
+    /// Positive read proof plus its resolved backing key for guarded VM caches.
+    pub(in crate::interp) fn prop_read_plain_key(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+    ) -> Option<(Value, String)> {
         if !self.in_own_hook(o, pn) && self.hooked_prop(o, pn).is_some() {
             return None;
         }
@@ -1526,7 +1535,8 @@ impl<'a> Interp<'a> {
         if !self.prop_visible(&cls, pn) {
             return None;
         }
-        Some(o.borrow().props.get(&k).unwrap().borrow().clone())
+        let value = o.borrow().props.get(&k)?.borrow().clone();
+        Some((value, k))
     }
 
     /// prop_read with a pre-bound name — zend binds the operand once,

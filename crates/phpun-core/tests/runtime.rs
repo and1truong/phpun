@@ -484,3 +484,48 @@ anonymous 4
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn plain_property_cache_guards_class_scope_missing_slots_and_hooks() {
+    let (out, err, code) = eval(
+        "property-cache.php",
+        r#"<?php
+class BaseSlot { public int $x=5; public function read(): int { return $this->x; } }
+class ChildSlot extends BaseSlot { public int $x=8; }
+class HookSlot extends BaseSlot { public int $x=9 { get { echo "hook\n"; return $this->x; } } }
+$a=new BaseSlot();$b=new ChildSlot();$h=new HookSlot();
+foreach([$a,$a,$b,$a,$h,$a] as $o) { echo $o->read(),"\n"; }
+class MagicSlot { public int $x=10; public function read(): int {return $this->x;} public function clear() {unset($this->x);} public function put($v) {$this->x=$v;} public function __get($n) {return 42;} }
+$m=new MagicSlot();echo $m->read(),' ',$m->read(),"\n";$m->clear();echo $m->read(),"\n";$m->put(12);echo $m->read(),"\n";
+class UninitSlot { public int $x; public function read(): int {return $this->x;} public function put($v) {$this->x=$v;} }
+$u=new UninitSlot();try{$u->read();}catch(Throwable $e){echo $e->getMessage(),"\n";} $u->put(3); echo $u->read(),' ',$u->read(),"\n";
+class PrivateParent { private int $x=4; public function reader(){return fn()=>$this->x;} }
+class PrivateChild extends PrivateParent {private int $x=14;}
+$p=new PrivateChild();$f=$p->reader();echo $f(),' ',$f(),"\n";$g=$f->bindTo($p,PrivateChild::class);echo $g(),' ',$f(),' ',$g(),"\n";
+$t=new BaseSlot();$w=WeakReference::create($t);echo $t->read(),"\n";unset($t);var_dump($w->get());
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"5
+5
+8
+5
+hook
+9
+5
+10 10
+42
+12
+Typed property UninitSlot::$x must not be accessed before initialization
+3 3
+4 4
+14 4 14
+5
+NULL
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
