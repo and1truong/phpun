@@ -23,6 +23,8 @@ pub(in crate::interp) enum Slot {
     Uninit,
     V(Value),
     C(Cell),
+    /// Read-only parameter in the live frame value vector.
+    Arg(u16),
 }
 
 pub(in crate::interp) type CompileCacheEntry =
@@ -69,6 +71,7 @@ pub(crate) struct Compiled {
     /// Same proof per param (variadic params get `None` — their
     /// extras take the full gate each).
     param_fast: Vec<Option<ScalarGate>>,
+    value_abi: bool,
 }
 
 pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
@@ -368,6 +371,15 @@ impl Compiled {
             )
         });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
+        // ponytail: scalar, read-only params only. Writable/by-ref/hybrid
+        // bodies keep cells until lazy promotion supports their full lifetime.
+        let value_abi = !hybrid
+            && !needs_bind
+            && !decl.params.iter().any(|p| p.variadic)
+            && !c.ops.iter().any(|op| match op {
+                Op::Store(i) | Op::IncDec { slot: i, .. } => (*i as usize) < decl.params.len(),
+                _ => false,
+            });
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -383,6 +395,7 @@ impl Compiled {
                 || decl.name.eq_ignore_ascii_case("__toString"),
             ret_fast,
             param_fast,
+            value_abi,
         }))
     }
 
@@ -423,6 +436,7 @@ impl Compiled {
             needs_bind: true,
             ret_fast: None,
             param_fast: Vec::new(),
+            value_abi: false,
         }))
     }
 }
@@ -1231,12 +1245,14 @@ impl<'a> Interp<'a> {
         };
         // Only defer when every provided param is check-free or proven to
         // pass. Rebinding/coercion errors retain eager send-time arguments.
-        let defer_args = args.named.is_empty()
-            && args.cells.len() >= decl.params.len()
-            && decl.params.iter().enumerate().all(|(i, p)| {
-                p.ty.is_none()
-                    || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
-            });
+        let value_abi = !self.cur().value_args.is_empty();
+        let defer_args = value_abi
+            || args.named.is_empty()
+                && args.cells.len() >= decl.params.len()
+                && decl.params.iter().enumerate().all(|(i, p)| {
+                    p.ty.is_none()
+                        || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
+                });
         let fr = self.call_site_frame(decl, &args, defer_args);
         self.call_trace.push(fr);
         padd!(2, __p);
@@ -1255,7 +1271,9 @@ impl<'a> Interp<'a> {
             .vm_slot_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
-        if comp.bind_free {
+        if value_abi {
+            slots.extend((0..decl.params.len()).map(|i| Slot::Arg(i as u16)));
+        } else if comp.bind_free {
             for (i, _) in decl.params.iter().enumerate() {
                 let c = match fa.get(i) {
                     Some(c) => c.clone(),
@@ -1413,6 +1431,7 @@ impl<'a> Interp<'a> {
             // clear+pool it like the slots vec so the next call's arg
             // materialization costs no malloc.
             let mut fa = std::mem::take(&mut f.args);
+            f.value_args.clear();
             slots.clear();
             // Pooled frames retain capacity, not PHP owners. Methods and
             // closures also use vm_run, so release their receiver/captures
@@ -1633,6 +1652,9 @@ impl<'a> Interp<'a> {
 
     fn vm_materialize(&mut self, comp: &Compiled, slots: &mut [Slot]) {
         let frame = self.cur();
+        if !frame.value_args.is_empty() {
+            frame.args.extend(frame.value_args.drain(..).map(cell));
+        }
         for (name, index) in &comp.names {
             let slot = &mut slots[*index as usize];
             // Move the handle out: it must not look like a PHP alias while
@@ -1640,6 +1662,7 @@ impl<'a> Interp<'a> {
             let c = match std::mem::replace(slot, Slot::Uninit) {
                 Slot::Uninit => continue,
                 Slot::C(c) => c,
+                Slot::Arg(i) => frame.args[i as usize].clone(),
                 Slot::V(v) => cell(v),
             };
             if frame
@@ -1673,6 +1696,7 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         Ok(match &slots[index as usize] {
             Slot::V(v) => v.clone(),
+            Slot::Arg(i) => self.stack.last().unwrap().value_args[*i as usize].clone(),
             Slot::C(c) => c.borrow().clone(),
             Slot::Uninit => {
                 let name = comp
@@ -1781,6 +1805,7 @@ impl<'a> Interp<'a> {
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
                 Op::Store(s) => {
                     match &mut slots[*s as usize] {
+                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
                         Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
                         Slot::V(v) => {
                             let old = std::mem::replace(v, vs.last().unwrap().clone());
@@ -1860,6 +1885,7 @@ impl<'a> Interp<'a> {
                     let old = self.vm_slot_value(comp, slots, *slot)?;
                     let new = self.incdec_value(&old, *delta)?;
                     match &mut slots[*slot as usize] {
+                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
                         Slot::Uninit => slots[*slot as usize] = Slot::V(new),
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
@@ -2312,6 +2338,7 @@ impl<'a> Interp<'a> {
         frame.statics_unit = None;
         frame.vars.clear();
         frame.args.clear();
+        frame.value_args.clear();
         frame.vm_sites.clear();
         let pending_caps = std::mem::take(&mut self.pending_gen_captures);
         for (n, c, by_ref) in pending_caps {
@@ -2322,6 +2349,25 @@ impl<'a> Interp<'a> {
         padd!(0, __p);
         let __p = pnow!();
         let mut args = super::CallArgs::empty();
+        let value_abi = comp.value_abi
+            && !argv.is_empty()
+            && argv.len() == decl.params.len()
+            && argv.iter().all(|v| {
+                matches!(
+                    v,
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                )
+            })
+            && decl.params.iter().enumerate().all(|(i, p)| {
+                p.ty.is_none() || comp.param_fast[i].is_some_and(|gate| gate(&argv[i]))
+            });
+        if value_abi {
+            let n = argv.len() as u64;
+            std::mem::swap(&mut self.cur().value_args, argv);
+            self.vm_call_reserve(&mut args, n);
+            padd!(1, __p);
+            return self.vm_run(decl, comp, args);
+        }
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(|value| {
             if matches!(

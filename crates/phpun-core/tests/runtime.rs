@@ -320,3 +320,58 @@ string(4) "keep"
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn scalar_value_calls_preserve_observed_arguments_and_cell_fallbacks() {
+    let (out, err, code) = eval("scalar-value.php", r#"<?php
+function recur(int $n): int { return $n < 2 ? $n : recur($n-1) + recur($n-2); }
+function untyped($n) { return $n < 2 ? $n : untyped($n-1) + untyped($n-2); }
+function introspect(int $n) { return func_get_arg(0) + func_num_args() + count(func_get_args()); }
+function capture() { return debug_backtrace(); }
+function parent_arg(int $n) { return capture(); }
+function bump(&$n) { $n++; }
+function promote(int $n) { bump($n); return $n + func_get_arg(0); }
+function overwrite(int $n) { $n=8; return func_get_arg(0); }
+function bad_return(int $n): int { return 'bad'; }
+function failure(int $n) { return bad_return($n); }
+function divide(int $n) { return 10 / $n; }
+function observe_error(int $n) { return trigger_error('probe'); }
+function extra(int $n) { return func_num_args(); }
+function optional(int $n=3) { return $n; }
+function decimal(float $n): float { return $n; }
+echo recur(12), ' ', untyped(12), ' ', introspect(7), ' ', promote(7), ' ', overwrite(7), "\n";
+$t = parent_arg(9); var_dump($t[1]['args']);
+try { failure(11); } catch (Throwable $e) { $t=$e->getTrace(); var_dump($t[0]['args'], $t[1]['args']); }
+try { divide(0); } catch (Throwable $e) { $t=$e->getTrace(); var_dump($t[0]['args']); }
+set_error_handler(function($n,$m) { $t=debug_backtrace(); var_dump($t[2]['args']); return true; });
+observe_error(13);
+echo extra(3,4), ' ', optional(), ' ', optional(n:5), ' ', decimal(7), "\n";
+try { recur('not numeric'); } catch (Throwable $e) { echo "type-error\n"; }
+"#, &[]);
+    assert_eq!(out, r#"144 144 9 16 8
+array(1) {
+  [0]=>
+  int(9)
+}
+array(1) {
+  [0]=>
+  int(11)
+}
+array(1) {
+  [0]=>
+  int(11)
+}
+array(1) {
+  [0]=>
+  int(0)
+}
+array(1) {
+  [0]=>
+  int(13)
+}
+2 3 5 7
+type-error
+"#);
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}

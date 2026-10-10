@@ -173,6 +173,8 @@ pub struct Frame {
     vars: crate::value::FxMap<String, Cell>,
     /// Actual call args for func_get_args().
     args: Vec<Cell>,
+    /// Read-only scalar direct-call args, promoted only when cells are observed.
+    value_args: Vec<Value>,
     /// Enclosing function name (for `static`/`__FUNCTION__`).
     fn_name: Rc<str>,
     /// `$this` in method calls.
@@ -236,6 +238,7 @@ impl Frame {
         Self {
             vars: crate::value::FxMap::default(),
             args: Vec::new(),
+            value_args: Vec::new(),
             fn_name: fn_name.into(),
             this_obj: None,
             scope_class: None,

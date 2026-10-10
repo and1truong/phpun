@@ -80,7 +80,7 @@ pub(crate) fn dispatch(
                 }
                 _ => {
                     let mut a = PhpArray::new();
-                    for c in fa {
+                    for c in fa.iter() {
                         a.push(c.borrow().clone());
                     }
                     Value::Array(Rc::new(RefCell::new(a)))

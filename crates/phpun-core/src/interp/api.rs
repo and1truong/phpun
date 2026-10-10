@@ -619,8 +619,17 @@ impl<'a> Interp<'a> {
         !self.stack.is_empty()
     }
 
-    pub fn frame_args(&self) -> &[Cell] {
-        self.stack.last().map(|f| f.args.as_slice()).unwrap_or(&[])
+    pub fn frame_args(&self) -> std::borrow::Cow<'_, [Cell]> {
+        self.stack
+            .last()
+            .map(|f| {
+                if f.value_args.is_empty() {
+                    std::borrow::Cow::Borrowed(f.args.as_slice())
+                } else {
+                    std::borrow::Cow::Owned(f.value_args.iter().cloned().map(cell).collect())
+                }
+            })
+            .unwrap_or(std::borrow::Cow::Borrowed(&[]))
     }
     pub fn define_const(&mut self, name: &str, v: Value) -> Result<bool, PhpError> {
         // 8.5: a duplicate `const`/`define` keeps the first value and
@@ -743,7 +752,12 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn snapshot_trace_frame(&self, frame: &TraceFrame) -> TraceFrame {
         let mut snapshot = frame.clone();
         if let Some(index) = snapshot.args_frame.take() {
-            snapshot.args = self.stack[index].args.clone();
+            let f = &self.stack[index];
+            snapshot.args = if f.value_args.is_empty() {
+                f.args.clone()
+            } else {
+                f.value_args.iter().cloned().map(cell).collect()
+            };
         }
         snapshot
     }
