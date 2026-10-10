@@ -1275,11 +1275,25 @@ impl<'a> Interp<'a> {
             // clear+pool it like the slots vec so the next call's arg
             // materialization costs no malloc.
             let mut fa = std::mem::take(&mut f.args);
-            fa.clear();
+            slots.clear();
+            for c in fa.drain(..) {
+                // Only uniquely owned, untracked scalar cells can be reused.
+                // Trace snapshots, references and captures keep their cells.
+                if self.vm_scalar_cell_pool.len() < 256
+                    && Rc::strong_count(&c) == 1
+                    && Rc::weak_count(&c) == 0
+                    && matches!(
+                        &*c.borrow(),
+                        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                    )
+                {
+                    *c.borrow_mut() = Value::Null;
+                    self.vm_scalar_cell_pool.push(c);
+                }
+            }
             if self.vm_cell_pool.len() < 64 {
                 self.vm_cell_pool.push(fa);
             }
-            slots.clear();
             if self.vm_slot_pool.len() < 64 {
                 self.vm_slot_pool.push(std::mem::take(&mut slots));
             }
@@ -2087,7 +2101,18 @@ impl<'a> Interp<'a> {
         let __p = pnow!();
         let mut args = super::CallArgs::empty();
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
-        cells.extend(argv.drain(..).map(cell));
+        cells.extend(argv.drain(..).map(|value| {
+            if matches!(
+                value,
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+            ) {
+                if let Some(c) = self.vm_scalar_cell_pool.pop() {
+                    *c.borrow_mut() = value;
+                    return c;
+                }
+            }
+            cell(value)
+        }));
         args.cells = cells;
         let n = args.cells.len() as u64;
         self.vm_call_reserve(&mut args, n);

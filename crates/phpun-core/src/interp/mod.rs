@@ -379,6 +379,7 @@ pub struct Interp<'a> {
     /// Recycled slot frames + arg-cell vecs for the same reason.
     vm_slot_pool: Vec<Vec<crate::interp::vm::Slot>>,
     vm_cell_pool: Vec<Vec<Cell>>,
+    vm_scalar_cell_pool: Vec<Cell>,
     /// Popped VM frames — Frame::new/vars-map alloc per call avoided.
     vm_frame_pool: Vec<Frame>,
     classes: crate::value::FxMap<String, Rc<PhpClass>>,
@@ -1745,6 +1746,7 @@ impl<'a> Interp<'a> {
             vm_target_pool: Vec::new(),
             vm_slot_pool: Vec::new(),
             vm_cell_pool: Vec::new(),
+            vm_scalar_cell_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
             classes: crate::value::FxMap::default(),
             traits: HashMap::new(),
