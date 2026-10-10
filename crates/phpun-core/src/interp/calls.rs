@@ -5162,11 +5162,10 @@ pub(in crate::interp) fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         | "shuffle" | "reset" | "end" | "next" | "prev" | "array_push" | "array_unshift"
         | "array_splice" => &[true],
         "preg_match" | "preg_match_all" => &[false, false, true],
-        "preg_replace"
-        | "preg_replace_callback"
-        | "preg_filter"
-        | "str_replace"
-        | "str_ireplace" => &[false, false, false, false, true],
+        "preg_replace" | "preg_replace_callback" | "preg_filter" => {
+            &[false, false, false, false, true]
+        }
+        "str_replace" | "str_ireplace" => &[false, false, false, true],
         "preg_replace_callback_array" => &[false, false, false, true],
         "parse_str" => &[false, true],
         "getopt" => &[false, false, true],
