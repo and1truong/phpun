@@ -4887,12 +4887,17 @@ impl<'a> Interp<'a> {
             // (error_2_exception_001).
             let is_ctor = decl.name.eq_ignore_ascii_case("__construct");
             let this_obj = frame.this_obj.clone();
-            let mut promoted_writes: Vec<(Rc<RefCell<PhpObject>>, String, Value)> = Vec::new();
+            let mut promoted_writes = Vec::new();
             for (i, p) in decl.params.iter().enumerate() {
                 if p.promoted && is_ctor {
                     if let Some(obj) = &this_obj {
                         let v = binds[i].1.borrow().clone();
-                        promoted_writes.push((obj.clone(), p.name.clone(), v));
+                        promoted_writes.push((
+                            obj.clone(),
+                            p.name.clone(),
+                            v,
+                            p.by_ref.then(|| binds[i].1.clone()),
+                        ));
                     }
                 }
             }
@@ -4900,10 +4905,26 @@ impl<'a> Interp<'a> {
                 frame.vars.insert(n, c);
             }
             frame.args = fa;
-            for (obj, pname, v) in promoted_writes {
-                // Promoted assignment goes through prop write semantics —
-                // hooked promoted props run their set hook (gh15438_1).
-                let _ = self.store_prop(Value::Object(obj), &pname, v)?;
+            for (obj, pname, v, reference) in promoted_writes {
+                if let Some(src) = reference {
+                    // Promotion aliases the bound parameter, with the same
+                    // property reference/type gates as an explicit =& write.
+                    if self.hooked_prop(&obj, &pname).is_some() {
+                        self.prop_read_value(Value::Object(obj.clone()), &pname, false)?;
+                    }
+                    self.bind_cell(
+                        &Expr::Prop {
+                            obj: Box::new(Expr::Var("this".into())),
+                            name: PropName::Name(pname),
+                            nullsafe: false,
+                            site: decl.line,
+                        },
+                        src,
+                    )?;
+                } else {
+                    // Hooked by-value promotion still runs the set hook.
+                    self.store_prop(Value::Object(obj), &pname, v)?;
+                }
             }
         }
         // The body is its own compile unit — loop/switch depth for
