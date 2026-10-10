@@ -372,6 +372,7 @@ pub struct Interp<'a> {
     /// Recycled value vecs for VM frames (exec stacks + call argv) —
     /// a call mallocs zero vecs once warm. Bounded by vm_exec's cap.
     vm_val_pool: Vec<Vec<Value>>,
+    vm_target_pool: Vec<Vec<vm::CachedFn>>,
     /// Recycled slot frames + arg-cell vecs for the same reason.
     vm_slot_pool: Vec<Vec<crate::interp::vm::Slot>>,
     vm_cell_pool: Vec<Vec<Cell>>,
@@ -1738,6 +1739,7 @@ impl<'a> Interp<'a> {
             functions: crate::value::FxMap::default(),
             compiled_fns: crate::value::FxMap::default(),
             vm_val_pool: Vec::new(),
+            vm_target_pool: Vec::new(),
             vm_slot_pool: Vec::new(),
             vm_cell_pool: Vec::new(),
             vm_frame_pool: Vec::new(),

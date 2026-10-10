@@ -126,14 +126,11 @@ enum Op {
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
-    /// Direct literal name call. `lname` is the lowercase,
-    /// `\u{1}`-stripped lookup name; `raw` is the spelling for
-    /// diagnostics and `ns\name` fallback candidates. `cache` is the
-    /// inline cache: a resolution that can never change is pinned —
-    /// a userland decl (functions can't be redeclared) or a builtin
-    /// in an empty caller ns (no `ns\name` can appear later to win
-    /// the fallback). Late-definable resolutions stay uncached and
-    /// re-resolve each call.
+    /// Direct literal-name call with Zend's persistent call-site cache.
+    /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
+    /// for diagnostics. InitCall pins the target before args run.
+    // Resolve and pin the target before any argument op executes.
+    InitCall(usize),
     Call {
         lname: Rc<str>,
         raw: Rc<str>,
@@ -163,7 +160,7 @@ enum Op {
 /// Per-call-site resolution (zend's INIT_FCALL cache slot). `Direct`
 /// skips not just the name lookup but the whole `invoke_fn` preamble
 /// — the compiled callee is run straight from the op.
-enum CachedFn {
+pub(in crate::interp) enum CachedFn {
     Direct(Rc<FunctionDecl>, Rc<Compiled>),
     Decl(Rc<FunctionDecl>),
     Builtin,
@@ -750,6 +747,7 @@ impl Compiler {
                 {
                     return None;
                 }
+                let init = self.emit(Op::InitCall(usize::MAX));
                 for a in args {
                     match Interp::unmark_arg(a) {
                         Expr::Unpack(_) => return None,
@@ -766,7 +764,7 @@ impl Compiler {
                         _ => u16::MAX,
                     })
                     .collect();
-                self.emit(Op::Call {
+                let call = self.emit(Op::Call {
                     lname,
                     raw: Rc::from(raw.trim_start_matches('\u{1}')),
                     argc: args.len() as u16,
@@ -775,6 +773,7 @@ impl Compiler {
                     arg_slots: arg_slots.into_boxed_slice(),
                     cache: std::cell::RefCell::new(None),
                 });
+                self.ops[init] = Op::InitCall(call);
             }
             _ => return None,
         };
@@ -1036,7 +1035,12 @@ impl<'a> Interp<'a> {
             .vm_val_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(16));
-        let r = self.vm_exec_ops(comp, slots, tmark, &mut vs);
+        let mut targets = self.vm_target_pool.pop().unwrap_or_default();
+        let r = self.vm_exec_ops(comp, slots, tmark, &mut vs, &mut targets);
+        targets.clear();
+        if self.vm_target_pool.len() < 64 {
+            self.vm_target_pool.push(targets);
+        }
         vs.clear();
         if self.vm_val_pool.len() < 64 {
             self.vm_val_pool.push(vs);
@@ -1154,6 +1158,7 @@ impl<'a> Interp<'a> {
         slots: &mut [Slot],
         mut tmark: usize,
         vs: &mut Vec<Value>,
+        targets: &mut Vec<CachedFn>,
     ) -> Result<Flow, PhpError> {
         let mut pc = 0usize;
         while pc < comp.ops.len() {
@@ -1274,14 +1279,26 @@ impl<'a> Interp<'a> {
                     self.send_line = None;
                 }
                 Op::Return => return Ok(Flow::Return(vs.pop().unwrap_or(Value::Null))),
+                Op::InitCall(at) => {
+                    let Op::Call {
+                        lname,
+                        raw,
+                        callee,
+                        cache,
+                        ..
+                    } = &comp.ops[*at]
+                    else {
+                        unreachable!("InitCall always points to its Call");
+                    };
+                    targets.push(self.vm_resolve(lname, raw, *callee, cache)?);
+                }
                 Op::Call {
                     lname,
                     raw,
                     argc,
                     site,
-                    callee,
                     arg_slots,
-                    cache,
+                    ..
                 } => {
                     let n = *argc as usize;
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
@@ -1292,19 +1309,12 @@ impl<'a> Interp<'a> {
                     // for the callee's trace-frame line (review
                     // finding: skipped it attributed callee traces to
                     // the previous call's site).
-                    let hit = cache.borrow().clone();
-                    let v = if let Some(CachedFn::Direct(d, c)) = &hit {
+                    let target = targets.pop().expect("InitCall resolved this call");
+                    let v = if let CachedFn::Direct(d, c) = &target {
                         self.send_line = Some(*site);
                         self.vm_run_direct(d, c, &mut argv)?
                     } else {
-                        self.vm_call(
-                            lname,
-                            raw,
-                            &mut argv,
-                            (*site, *callee),
-                            (slots, arg_slots),
-                            cache,
-                        )?
+                        self.vm_call(lname, raw, &mut argv, *site, (slots, arg_slots), &target)?
                     };
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -1671,21 +1681,15 @@ impl<'a> Interp<'a> {
         self.vm_run(decl, comp, args)
     }
 
-    /// VM-path callee dispatch: userland decls re-enter `invoke_fn`
-    /// (which lands back on `vm_run` when the callee compiles),
-    /// builtins take `call_builtin`, anything else is the same
-    /// undefined-function fatal `call_named` raises. Arg cells are
-    /// still materialized — the callee frame's dtor pass needs them.
-    fn vm_call(
+    /// Resolve and cache at INIT, before args can declare overrides.
+    fn vm_resolve(
         &mut self,
         lname: &str,
         raw: &str,
-        argv: &mut Vec<Value>,
-        (site, callee): (usize, usize),
-        (slots, arg_slots): (&mut [Slot], &[u16]),
+        callee: usize,
         cache: &std::cell::RefCell<Option<CachedFn>>,
-    ) -> Result<Value, PhpError> {
-        self.send_line = Some(site);
+    ) -> Result<CachedFn, PhpError> {
+        self.send_line = Some(callee);
         if lname == "__halt_compiler" {
             return Err(PhpError {
                 trace: None,
@@ -1696,63 +1700,67 @@ impl<'a> Interp<'a> {
                 line: 0,
             });
         }
-        let hit = cache.borrow().clone();
-        let mut decl: Option<Rc<FunctionDecl>> = match &hit {
-            Some(CachedFn::Decl(d)) => Some(d.clone()),
-            Some(CachedFn::Builtin) => None,
-            _ => None,
-        };
-        let resolved = hit.is_some();
+        if let Some(hit) = cache.borrow().clone() {
+            return Ok(hit);
+        }
+        let mut decl = self.functions.get(lname).cloned();
         let mut miss_name: Option<String> = None;
-        if !resolved {
-            let direct = self.functions.get(lname).cloned();
-            decl = direct.clone();
-            if decl.is_none() {
-                let ns = self.caller_ns();
-                if !ns.is_empty() {
-                    let cand = format!("{}\\{}", ns.to_lowercase(), lname);
-                    decl = self.functions.get(&cand).cloned();
-                    if decl.is_none() {
-                        miss_name = Some(format!("{}\\{}", ns, raw));
-                    }
+        if decl.is_none() {
+            let ns = self.caller_ns();
+            if !ns.is_empty() {
+                let cand = format!("{}\\{}", ns.to_lowercase(), lname);
+                decl = self.functions.get(&cand).cloned();
+                if decl.is_none() {
+                    miss_name = Some(format!("{}\\{}", ns, raw));
                 }
-            }
-            // Resolution happens at INIT — an unresolvable name aborts
-            // before the (already-evaluated) args would matter.
-            if decl.is_none()
-                && !builtins::is_builtin(lname)
-                && builtins::builtin_params(lname).is_none()
-                && builtin_byref(lname).is_none()
-            {
-                self.send_line = Some(callee);
-                return self.fail(PhpError::uncaught(
-                    "Error",
-                    format!(
-                        "Call to undefined function {}()",
-                        miss_name.as_deref().unwrap_or(raw)
-                    ),
-                    0,
-                ));
-            }
-            // Pin only resolutions that can't change: a direct-hit
-            // userland decl (no redeclares — and when it also compiles,
-            // Direct skips invoke_fn next time), or a builtin reached
-            // with an empty caller ns (no ns\name can appear later).
-            // ns-fallback decls and namespaced builtin hits re-resolve.
-            let stable = if let Some(d) = direct {
-                match self.vm_compiled(&d) {
-                    Some(c) if !c.needs_bind => Some(CachedFn::Direct(d, c)),
-                    _ => Some(CachedFn::Decl(d)),
-                }
-            } else if decl.is_none() && self.caller_ns().is_empty() {
-                Some(CachedFn::Builtin)
-            } else {
-                None
-            };
-            if stable.is_some() {
-                *cache.borrow_mut() = stable;
             }
         }
+        // INIT_FCALL fails before argument evaluation can have effects.
+        if decl.is_none()
+            && !builtins::is_builtin(lname)
+            && builtins::builtin_params(lname).is_none()
+            && builtin_byref(lname).is_none()
+        {
+            self.send_line = Some(callee);
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Call to undefined function {}()",
+                    miss_name.as_deref().unwrap_or(raw)
+                ),
+                0,
+            ));
+        }
+        // Zend's literal call-site cache retains the first successful
+        // resolution, including a global/builtin namespace fallback.
+        // An override declared by an argument affects other unresolved
+        // sites, but not this call or later calls from the same site.
+        let target = match decl {
+            Some(d) => match self.vm_compiled(&d) {
+                Some(c) if !c.needs_bind => CachedFn::Direct(d, c),
+                _ => CachedFn::Decl(d),
+            },
+            None => CachedFn::Builtin,
+        };
+        *cache.borrow_mut() = Some(target.clone());
+        Ok(target)
+    }
+
+    /// Execute the target chosen before argument evaluation.
+    fn vm_call(
+        &mut self,
+        lname: &str,
+        raw: &str,
+        argv: &mut Vec<Value>,
+        site: usize,
+        (slots, arg_slots): (&mut [Slot], &[u16]),
+        target: &CachedFn,
+    ) -> Result<Value, PhpError> {
+        self.send_line = Some(site);
+        let decl = match target {
+            CachedFn::Direct(d, _) | CachedFn::Decl(d) => Some(d.clone()),
+            CachedFn::Builtin => None,
+        };
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(cell));
         // By-ref callee params bind the caller's own zval — a plain-CV
@@ -1838,10 +1846,7 @@ impl<'a> Interp<'a> {
             }
             return self.fail(PhpError::uncaught(
                 "Error",
-                format!(
-                    "Call to undefined function {}()",
-                    miss_name.as_deref().unwrap_or(raw)
-                ),
+                format!("Call to undefined function {}()", raw),
                 0,
             ));
         }
