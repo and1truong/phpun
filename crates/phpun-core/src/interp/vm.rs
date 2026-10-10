@@ -742,7 +742,11 @@ impl Compiler {
                     .trim_start_matches('\u{1}')
                     .rsplit('\\')
                     .next()
-                    .is_some_and(|seg| seg.eq_ignore_ascii_case("compact"))
+                    .is_some_and(|seg| {
+                        ["compact", "extract", "get_defined_vars"]
+                            .iter()
+                            .any(|name| seg.eq_ignore_ascii_case(name))
+                    })
                 {
                     return None;
                 }
@@ -1159,8 +1163,11 @@ impl<'a> Interp<'a> {
                     Slot::V(v) => v.clone(),
                     Slot::C(c) => c.borrow().clone(),
                 }),
-                Op::Store(s) => match &slots[*s as usize] {
-                    Slot::V(_) => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
+                Op::Store(s) => match &mut slots[*s as usize] {
+                    Slot::V(v) => {
+                        let old = std::mem::replace(v, vs.last().unwrap().clone());
+                        self.destruct_dying_value(&old)?;
+                    }
                     Slot::C(c) => {
                         // CV write: new zval lands, displaced decrefs —
                         // same ordering as cell_store.
