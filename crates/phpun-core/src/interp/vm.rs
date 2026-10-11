@@ -2503,32 +2503,23 @@ impl<'a> Interp<'a> {
                     name,
                     fallback,
                 } => {
-                    match crate::interp::util::lkey_get(&self.classes, name) {
-                        Some(cls) => {
-                            let cls = cls.clone();
+                    let target = crate::interp::util::lkey_get(&self.classes, name)
+                        .cloned()
+                        .and_then(|cls| {
                             let ctor = self.find_method_in(&cls, "__construct");
                             if ctor
                                 .as_ref()
                                 .is_some_and(|(m, _)| m.decl.params.iter().any(|p| p.by_ref))
                             {
-                                // A by-ref ctor param needs the
-                                // caller's real cell — `Op::NewCall`
-                                // drains `vs` as values, so route the
-                                // whole `new` through the canonical
-                                // arm which rebuilds arg cells from
-                                // the AST exprs.
-                                self.vm_materialize(comp, slots);
-                                let r = self.eval(fallback);
-                                self.vm_refresh(comp, slots);
-                                vs.push(r?);
-                                pc = *at + 1;
-                                continue;
+                                return None;
                             }
-                            ntargets.push((cls, ctor));
-                        }
+                            Some((cls, ctor))
+                        });
+                    match target {
+                        Some(target) => ntargets.push(target),
                         None => {
-                            // Autoload / not-found path lives in the
-                            // canonical eval — verbatim errors.
+                            // Autoload, missing classes and by-ref ctor arguments
+                            // retain the canonical binder and caller Cells.
                             self.vm_materialize(comp, slots);
                             let r = self.eval(fallback);
                             self.vm_refresh(comp, slots);
@@ -2549,7 +2540,13 @@ impl<'a> Interp<'a> {
                     let (cls, ctor) = ntargets.pop().expect("InitNew resolved this new");
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
                     let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -2567,11 +2564,16 @@ impl<'a> Interp<'a> {
                     };
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
-                    // Direct dispatch never touches the caller's locals —
-                    // canonical fallbacks inside nested ops do their own
-                    // materialize/refresh, so the top-level slot→globals
-                    // sync that wraps Op::Call isn't needed here.
+                    // A direct callee can rebind globals or release their
+                    // last PHP owner. Drop stale caller slot handles before
+                    // dispatch and reload the canonical bindings afterward.
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
                     let result = self.vm_run_method_direct(&core, &mut argv, obj, name, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -4345,6 +4347,14 @@ unset($e); unset($h); var_dump($wh->get());
 
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
+        {
+            let mut limits = Interp::new("limit.php");
+            limits.ini.insert("memory_limit".into(), "128M".into());
+            assert!(limits.statement_boundary().is_none());
+            limits.ini.insert("memory_limit".into(), "1K".into());
+            assert!(limits.statement_boundary().is_some());
+            assert!(limits.mem_exceeded);
+        }
         let mut it = Interp::new("arena.php");
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let frame = it.frame_new("direct");

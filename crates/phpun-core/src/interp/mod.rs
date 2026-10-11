@@ -1988,7 +1988,7 @@ impl<'a> Interp<'a> {
             assert_src: String::new(),
             mem_used: MM_BASE_USED,
             mem_last: 0,
-            mem_limit_ck: (0, None),
+            mem_limit_ck: (-1, None),
             mem_exceeded: false,
             oom_at: None,
             // zend_mm_init commits the first 2MB chunk eagerly.
@@ -4027,6 +4027,15 @@ impl<'a> Interp<'a> {
         self.oom_at.is_some()
     }
 
+    fn memory_limit_bytes(&mut self) -> i64 {
+        let raw = self.ini.get("memory_limit").map(String::as_str);
+        if raw != self.mem_limit_ck.1.as_deref() {
+            let v = self.ini_bytes("memory_limit");
+            self.mem_limit_ck = (v, raw.map(str::to_string));
+        }
+        self.mem_limit_ck.0
+    }
+
     /// zend's memory_limit check runs inside the allocator where a
     /// request forces newly committed memory: a huge alloc needs its
     /// own segment (real_size + aligned request vs limit), anything
@@ -4041,12 +4050,7 @@ impl<'a> Interp<'a> {
     /// reusable runs, so fragmented heaps can trip a bit earlier.
     /// PR #88 owns the canonical page-level model.
     pub(crate) fn mem_check(&mut self, req: u64) -> Option<u64> {
-        let raw = self.ini.get("memory_limit").map(String::as_str);
-        if raw != self.mem_limit_ck.1.as_deref() {
-            let v = self.ini_bytes("memory_limit");
-            self.mem_limit_ck = (v, raw.map(str::to_string));
-        }
-        let limit = self.mem_limit_ck.0;
+        let limit = self.memory_limit_bytes();
         if limit <= 0 {
             return None;
         }
@@ -4763,7 +4767,7 @@ impl<'a> Interp<'a> {
                 let cap = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0)
                     + self.seg_above(key);
                 let reloc = fp > cap;
-                let limit = self.ini_bytes("memory_limit");
+                let limit = self.memory_limit_bytes();
                 let over = |s: &Self| -> bool {
                     if limit <= 0 {
                         return false;
