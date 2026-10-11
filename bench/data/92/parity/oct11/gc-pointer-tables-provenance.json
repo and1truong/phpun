@@ -1,0 +1,81 @@
+{
+  "source": "c44f9ea9e26b13bd2888cf57147c0eaa7fc6e69e",
+  "runtime": "b0a02f2105ef3591a33db1cfc00bb61bb5ae5eab",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1663202,
+        "bytes": 69796944
+      },
+      "after": {
+        "requests": 1663202,
+        "bytes": 69796940
+      }
+    },
+    {
+      "label": "gcgraph",
+      "before": {
+        "requests": 35122,
+        "bytes": 6196215
+      },
+      "after": {
+        "requests": 35122,
+        "bytes": 6191987
+      }
+    }
+  ],
+  "binary_sha256": "fccfcdcc4f09e6a0ea52d7a55975c0993ccb4e618368bdaf642d2cb06f3dcb03",
+  "scope": "Historical pre-#305 candidate: use existing FxMap/FxSet for GcScan and temporary pointer-only visited/reach/dead sets. Persistent purple/dying state, traversal, root counts, callbacks and destructor order unchanged; no new abstraction/dependency. Frozen sourceb0a02f2/binaryfccfcdc and timingdb6adbe. Main#305 was merged afterward; final integration is rebuilt/gated/measured separately, never attribute these old pairs to final current main.",
+  "fallbacks": "Canonical graph discovery, depth/refcount accounting, typed pins, duplicate Cell identities, generator/closure/internal storage and buffer-overflow paths all retained. ONE existing registered/plain-cell fixture extended for live typed root,40deadtyped pairs and callable cycle; existing scanner check adopts visited-set type."
+}
