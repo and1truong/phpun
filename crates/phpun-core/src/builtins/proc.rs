@@ -1160,7 +1160,7 @@ fn php_exec(it: &mut Interp, fname: &str, args: &[Cell], ty: u8) -> Result<Value
                     Value::Array(a) => {
                         if Rc::strong_count(a) > 1 {
                             let mut na = PhpArray {
-                                entries: a.borrow().entries.clone(),
+                                entries: a.borrow().entries.clone().into(),
                                 next: a.borrow().next,
                                 is_ref: a.borrow().is_ref,
                                 iter_pos: a.borrow().iter_pos,

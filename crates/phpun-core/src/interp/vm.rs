@@ -2121,6 +2121,11 @@ impl<'a> Interp<'a> {
                                     // Only the CV and this peek own the table. Shared tables
                                     // keep canonical CoW; existing buckets do not change
                                     // array layout, iterator positions or memory charges.
+                                    if Rc::strong_count(&a) == 2 && a.borrow_mut().entries.store_packed_scalar(k, value) {
+                                        vs.push(value.clone());
+                                        pc += 1;
+                                        continue;
+                                    }
                                     let c = if Rc::strong_count(&a) == 2 {
                                         a.borrow().get_cell(&ArrKey::Int(k))
                                     } else {

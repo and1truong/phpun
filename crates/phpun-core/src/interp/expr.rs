@@ -7178,7 +7178,7 @@ impl<'a> Interp<'a> {
                     let mut arr = rc.borrow_mut();
                     let grew = match ak {
                         Some(ak) => {
-                            let grew = arr.get_cell(&ak).is_none();
+                            let grew = arr.get(&ak).is_none();
                             arr.set(ak, v);
                             grew
                         }
@@ -7563,8 +7563,13 @@ impl<'a> Interp<'a> {
     /// The separated copy for CoW / array-copy contexts (`=`, exchange
     /// values): ref-marked cells are re-bound, the rest duplicated.
     pub fn dup_array(&self, a: &PhpArray) -> PhpArray {
+        if a.entries.is_scalar_packed() {
+            let mut copy = a.clone();
+            copy.is_ref = a.is_ref;
+            return copy;
+        }
         let mut copy = PhpArray {
-            entries: Vec::with_capacity(a.entries.len()),
+            entries: Vec::with_capacity(a.entries.len()).into(),
             next: a.next,
             is_ref: a.is_ref,
             iter_pos: a.iter_pos,

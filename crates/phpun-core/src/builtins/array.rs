@@ -413,6 +413,11 @@ pub(crate) fn dispatch(
                 it.mem_exceeded = true;
                 return Err(it.oom_fatal());
             }
+            if start == 0 && matches!(v, Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)) {
+                let rc = Rc::new(RefCell::new(PhpArray::scalar_fill(n as usize, v)));
+                it.mem_track(&rc, want);
+                return Ok(Some(Value::Array(rc)));
+            }
             let mut out = PhpArray::new();
             // Keys are sequential and unique — append O(1) each
             // instead of set()'s O(n) key search (a 2M fill was
@@ -503,7 +508,7 @@ pub(crate) fn dispatch(
                     Some(_) => 1,
                 };
                 arr.foreach_spliced(off as usize, len as usize, ins);
-                let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut arr.entries);
+                let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut *arr.entries);
                 arr.next = 0;
                 let (head, rest) = tail.split_at(off as usize);
                 let (cut, tail2) = rest.split_at((len as usize).min(rest.len()));
@@ -672,7 +677,7 @@ pub(crate) fn dispatch(
                     new_entries.push((ArrKey::Int(i as i64), c));
                 }
                 new_entries.append(&mut arr.entries);
-                arr.entries = new_entries;
+                arr.entries = new_entries.into();
                 // zend_hash_extend grows once for the prepend — one
                 // pow2 grow reported, not per-element grows.
                 arr.mem_note_extend(add as i64);
@@ -1859,7 +1864,7 @@ fn sort_array(
             // in-place arData sort means the partial permutation sticks
             // even when a conversion Error aborts it.
             if let Some(rc) = it.arr_mut(cell) {
-                rc.borrow_mut().entries = sorted;
+                rc.borrow_mut().entries = sorted.into();
             }
             if deep {
                 return depth_err();
@@ -1885,7 +1890,7 @@ fn sort_array(
                 // zend assigns the sorted dup into the arg zval —
                 // whatever the callback wrote mid-sort is discarded.
                 let mut out = PhpArray::new();
-                out.entries = sorted;
+                out.entries = sorted.into();
                 out.next = next;
                 *cell.borrow_mut() = Value::Array(Rc::new(RefCell::new(out)));
                 if let Some(e) = cb_err {

@@ -6777,8 +6777,11 @@ impl<'a> Interp<'a> {
         let mut inner = Vec::new();
         match v {
             Value::Array(a) => {
-                for (_, c) in &a.borrow().entries {
-                    Self::gc_scan_cell(c, scan, &mut inner, depth - 1, visited, false);
+                let a = a.borrow();
+                if !a.entries.is_scalar_packed() {
+                    for (_, c) in &a.entries {
+                        Self::gc_scan_cell(c, scan, &mut inner, depth - 1, visited, false);
+                    }
                 }
             }
             Value::Callable(c) => {
@@ -6978,7 +6981,7 @@ impl<'a> Interp<'a> {
                     // No graph target or PHP callback can appear during this
                     // last-owner walk. Mixed/nested/resource tables retain
                     // the full dying-cell snapshot before callbacks run.
-                    if a.borrow().entries.iter().all(|(_, c)| {
+                    if a.borrow().entries.is_scalar_packed() || a.borrow().entries.iter().all(|(_, c)| {
                         matches!(
                             &*c.borrow(),
                             Value::Null
