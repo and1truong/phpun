@@ -1,0 +1,26 @@
+{
+  "summary": {
+    "total": 8,
+    "passed": 1,
+    "failed": 5,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 1,
+    "unsupported": 0,
+    "borked": 0,
+    "crashed": 1,
+    "timed_out": 0,
+    "applicable": 7,
+    "compatibility_pct": 14.29
+  },
+  "results": [
+    {"file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/bug70345_old.phpt", "name": "Bug #70345 (Multiple vulnerabilities related to PCRE functions)", "status": "skip", "reason": "skip new pcre version", "duration_ms": 21},
+    {"file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/bug76909.phpt", "name": "Bug #76909 preg_match difference between 7.3 and < 7.3", "status": "pass", "reason": "", "duration_ms": 21},
+    {"file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/check_jit_enabled.phpt", "name": "Check for JIT enablement status", "status": "fail", "reason": "", "duration_ms": 21},
+    {"file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/ctype_back_to_c.phpt", "name": "Changing LC_CTYPE back to C", "status": "fail", "reason": "", "duration_ms": 21},
+    {"file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/locales.phpt", "name": "Localized match", "status": "fail", "reason": "", "duration_ms": 21},
+    {"file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt", "name": "Bug #71197 (range function produces another 2 segfaults with long integers)", "status": "crash", "reason": "", "duration_ms": 23884},
+    {"file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/sort/locale_sort.phpt", "name": "Sort with SORT_LOCALE_STRING", "status": "fail", "reason": "", "duration_ms": 32},
+    {"file": "/workspace/phpun/vendor/php-tests/tests/lang/bug30638.phpt", "name": "Bug #30638 (localeconv returns wrong LC_NUMERIC settings) (ok to fail on MacOS X)", "status": "fail", "reason": "", "duration_ms": 22}
+  ]
+}

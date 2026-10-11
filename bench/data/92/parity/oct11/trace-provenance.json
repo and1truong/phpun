@@ -1,0 +1,14 @@
+{
+  "decision": "Both prototypes rejected; final runtime tree identical to #238 parent. #237 remains open, no trace performance claim.",
+  "full_runtime": "fa968a7a25d772f05fe62db40b44d732b7b94d25",
+  "borrow_runtime": "06d6005ec6f4d8f45ac3f3d20137d321009be793",
+  "configuration": "Rust1.99 LTO/codegen-units1; PHP8.5.11 native -n. Timing profilers off, seven isolated alternating pairs, every captured exit/stdout/stderr byte gated.",
+  "binaries": {
+    "direct-arena": "9ccbb77607f1be415b014c10f18c4741dfb333c647405538235f0468f45a11c0",
+    "trace-shells": "d44ce1aee4bfac2ec6610edc9a605df6a987cbc2285a6930a2a54a7d1ba2d06f",
+    "borrow-call-state": "8735b2ce163881ad444a5a5b6143c3b2780852a6a30c4117a0ba7719911f0819"
+  },
+  "full_gates": "workspace fmt/clippy/tests;23 script +19 workload PHP gates;3406 PHPT with two recorded resource status transitions; GC63635 standalone30s passes all3 binaries.",
+  "borrow_gates": "workspace fmt/clippy/tests including one argument/receiver/exception ownership check;8 bench+2 app seven-pair PHP gates. No broad PHPT claim for rejected borrow-only.",
+  "borrow_partial_run": "Requested examples/app/run.php does not exist, PHP oracle failed before candidate execution. Eight preceding workload rows retained unchanged; separate two-app file uses real bench/app/cli.php10,2 (not full-prototype100,20)."
+}

@@ -780,3 +780,69 @@ startup+2.7% retained. No broad app claim. Hashes/config/argv/samples/status
 maps/CPU source rows/copy counts are in `data/92/parity/oct11/arena-*` and
 `*-main-*`; large raw perf.data remains in workspace. No perf.data from old
 main relabelled as current.
+
+## Rejected trace/call-state experiments (#237)
+
+Parent runtime9d1544f (#238). Full stable Box<TraceFrame> pool plus borrowed
+CallArgs prototype fa968a7 passed workspace checks,23 PHP script gates,19
+workloads. Observed out-of-line copies fell391370846→11102261B (−97.2%),
+physical allocations32254→32282. This does **not** establish a CPU win.
+Seven isolated, byte-gated alternating pairs gave fib135.467→134.103ms
+(0.990×),sieve203.342→225.155(1.107×),objects253.126→265.411(1.049×),
+regex39.918→43.941(1.101×). Arrays0.967×,JSON1.002×,DB1.053×,
+app100,20 1.024×,Composer0.957×; all raw medians retained. Rejected.
+
+3406PHPT full prototype2726pass603fail25skip38unsupported6crash8timeout.
+Two recorded transitions: gc63635 pass→10s timeout and range_bug71197
+timeout→crash. Standalone30s gc63635 passes main3939ms,parent3999ms,
+prototype3756ms. Original batch status maps retained; no all-status-identical
+claim. Known pathological range behavior unchanged, not fixed here.
+
+Borrow-only prototype06d6005 removes stable trace shells to isolate the
+CallArgs effect. Workspace tests/fmt/clippy and all captured PHP gates pass.
+Fib147.550→153.502ms(1.040×),sieve0.989×,strings1.023×,arrays1.023×,
+objects1.020×,regex1.000×,JSON0.983×,DB0.967×. Separate small app10,2
+0.941×/Composer0.964× retained; this app input differs from full prototype.
+The eight-bench run stopped on an invalid app filename before candidate
+execution; partial rows preserved, valid apps measured separately. Rejected.
+
+Both runtime changes were reverted in ordinary commits. Final runtime tree
+is identical to #238 parent; the prototype history/patch, exact hashes,
+raw timings, physical requests/copies, PHPT maps and standalone resource
+rechecks are in data/92/parity/oct11/trace-* and borrow-*. #237 remains open.
+This rules out copy-byte counts as sufficient evidence for the next tier;
+method teardown and removing repeated scalar call/dispatch work remain next.
+
+## Receiver teardown guard (#239)
+
+Runtime75e78c5, parent#238 runtime9d1544f (trace prototypes reverted). Skip
+frame object-cell vector/hashmap bookkeeping only when the receiver has an
+owner beyond this frame's raw handle+$this cell and no other frame object
+cell/arg/alias must be considered. Other frames use the shared destructor
+pass. ONE runnable WeakReference/object-arg/TypeError/named-call ownership
+check covers normal returns, fallback and owner release.
+
+Workspace7core/22runtime/19format checks,fm/clippy,23 VM/arena/receiver
+script+19workload PHP byte gates,measure/http-load/VM-profile checks pass.
+3406PHPT comparable2727pass603fail25skip38unsupported6crash7timeout.
+Only range_bug71132 timeout→crash relative parent, known pathological
+range near INT_MIN. Initial misconfigured SKIPIF-under-SUT map retained
+separately; all3406 rerun with --sut candidate/--php native reference.
+No gain claim from altered skip conditions.
+
+Seven isolated alternating profiler-off pairs, PHP exit/stdout/stderr gate:
+
+| Workload | Parent/candidate median ms | Candidate/parent |
+|---|---:|---:|
+| objects5×5000 | 253.969/231.728 | 0.912 |
+| objects20×5000 | 1008.835/960.085 | 0.952 |
+| profile objects norm10 | 6.335/6.319 | 0.997 |
+| profile objects ctor10 | 6.492/6.370 | 0.981 |
+| fib26 | 135.418/134.564 | 0.994 |
+| app100,20 | 41.583/35.356 | 0.850 |
+| Composer | 7.892/7.738 | 0.980 |
+
+Separate physical objects20×5000 requests14463259→13463260(−6.9%),
+bytes465086016→388949018(−16.4%). Object allocations still100000,
+remaining storage/GC work not solved. No broad parity claim or multiplying
+step ratios; raw timings/hashes/maps/correction source in oct11/receiver-*.
