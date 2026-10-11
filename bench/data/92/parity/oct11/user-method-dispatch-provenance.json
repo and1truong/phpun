@@ -1,0 +1,34 @@
+{
+  "runtime": "3a206b5",
+  "source": "bfa4f0a3add26520667dcae81c2afcbc6a8e384a",
+  "tracked_clean": "only vendor symlink",
+  "phpt_changes": [],
+  "profile": {
+    "binary": "static-builtin-signatures",
+    "samples": 1965,
+    "lost": 0,
+    "args": [
+      "bench/40-objects.php",
+      "200",
+      "5000"
+    ],
+    "command": "perf record -e cpu-clock -F199 --call-graph dwarf,8192",
+    "raw_local": "/workspace/parity92/oct11/static-builtin-signatures-objects.data",
+    "raw_sha256": "f226bc039ea1aa4e52c7234eb28d543b0738dd24c1f82d61df3436f202d06f1b",
+    "note": "DWARF data kept local; exact symbol report compressed/published; inclusive shares overlap, not summed"
+  },
+  "physical_requests": {
+    "objects20x5000": [
+      10863260,
+      8763260
+    ]
+  },
+  "physical_bytes": {
+    "objects20x5000": [
+      302289539,
+      285089519
+    ]
+  },
+  "guard": "concrete PHP method with line>0 on PHP root class kind Class, line>0,file present,no parent/no interfaces; only after visibility/private target resolution",
+  "fallback": "internal/inherited/interface/abstract/missing methods preserve old full dispatcher and canonical user binder"
+}
