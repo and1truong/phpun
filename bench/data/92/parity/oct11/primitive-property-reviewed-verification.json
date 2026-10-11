@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "003cfa327341c686aa258c9b5fd09e85e802269524eaddaf513a1e0913607437",
+  "source": "e6ab84b7e4c0c88b0a9219f67e2ebed12e59482e",
+  "parent": "nullable-length-review",
+  "summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "changes": []
+}
