@@ -1,0 +1,71 @@
+{
+  "source": "c3b77583def04ab6ed75a706b820691a67b29191",
+  "runtime": "b7281ad7345305d31060b8dea6e2d787e44d9cc8",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1633154,
+        "bytes": 68355761
+      },
+      "after": {
+        "requests": 1483154,
+        "bytes": 66855749
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636049,
+        "bytes": 26704253
+      },
+      "after": {
+        "requests": 636049,
+        "bytes": 26704241
+      }
+    }
+  ],
+  "binary_sha256": "3001e4c1e958d37b54db2897b6dd0e114af16c39a7dc5d1f9bb2a848c39c9255",
+  "scope": "Pre316 dataset only: reuse existing decl_prop_site in shared promoted_prop_write instead of cloning PropDecl solely to read effective visibility/readonly/class. Applies AST and compiled constructors; no new cache/layout/helper/unsafe/dependency. Frozen b7281ad/3001e4c parent2e4dba8/13fac09 excludes newly merged JSON #316. Current main999 integration adds JSON and requires fresh measurement/gates below.",
+  "fallbacks": "Same pinned scope/private/inheritance resolution and effective hook/readonly/private owner/slot fallback guards. ONE existing promoted-store runtime unit adds child effective set hook, native checked."
+}
