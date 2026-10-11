@@ -1,0 +1,49 @@
+{
+  "source": "c8b23dee0e41ce0535e64aa741d68fa0ca0f13f4",
+  "runtime": "a0894ae601329f0f1d93ce207abd65a2d8027543",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1663202,
+        "bytes": 69798420
+      },
+      "after": {
+        "requests": 1633154,
+        "bytes": 68356112
+      }
+    },
+    {
+      "label": "gcgraph",
+      "before": {
+        "requests": 32245,
+        "bytes": 5997998
+      },
+      "after": {
+        "requests": 32236,
+        "bytes": 5997583
+      }
+    }
+  ],
+  "binary_sha256": "bb9f0bf342375b146fc4a1d0a43ba65682b8eae01dde1301fd5517e881b96b7c",
+  "scope": "Use existing prop_order/prop_get iterators in shared GC object graph and dying walks. Avoid temporary owned Vec<(String,Cell)> and cloned keys. Each dying step re-reads current live order, preserving callback mutation/tombstones; selected Cell/payload clone and object borrow are released before callbacks.",
+  "fallbacks": "Graph/root/duplicate-Cell accounting,typed pins,purple buffering,generator/internal fields/destructor order unchanged. Keep owned live_props snapshots for other consumers requiring them. No layout/unsafe/dependencies. Extend ONE existing registered/plain-cell fixture for aliased duplicate props/live roots and unset tombstones; native outputs checked vs PHP/parent."
+}
