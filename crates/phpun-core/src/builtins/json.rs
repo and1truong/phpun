@@ -484,12 +484,21 @@ fn json_arr(
     // are dead buckets, not elements (009 keeps a list after unset).
     let (live, is_list) = {
         let a = a.borrow();
-        let live: Vec<(ArrKey, Cell)> = a
-            .entries
-            .iter()
-            .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
-            .cloned()
-            .collect();
+        // Packed storage has no cells to materialize — snapshot the
+        // scalar values straight out of the packed Vec.
+        let live: Vec<(ArrKey, Value)> = match a.entries.packed_clone() {
+            Some(vals) => vals
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (ArrKey::Int(i as i64), v))
+                .collect(),
+            None => a
+                .entries
+                .iter()
+                .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
+                .map(|(k, c)| (k.clone(), c.borrow().clone()))
+                .collect(),
+        };
         let is_list = cx.esc.flags & F_FORCE_OBJECT == 0
             && live
                 .iter()
@@ -499,7 +508,7 @@ fn json_arr(
     };
     out.push(if is_list { '[' } else { '{' });
     let mut first = true;
-    for (k, c) in live {
+    for (k, v) in live {
         if !first {
             out.push(',');
         }
@@ -515,7 +524,6 @@ fn json_arr(
                 out.push(' ');
             }
         }
-        let v = c.borrow().clone();
         json_child(it, &v, cx, out, lvl)?;
     }
     if cx.esc.pretty() && !first {
@@ -839,11 +847,11 @@ fn json_value(
             if stk > DEC_STACK {
                 return Err(J_SYNTAX);
             }
-            let mut a = PhpArray::new();
+            let mut vals: Vec<Value> = Vec::new();
             json_ws(b, pos)?;
             if b.get(*pos) == Some(&b']') {
                 *pos += 1;
-                return Ok(Value::Array(Rc::new(RefCell::new(a))));
+                return Ok(Value::Array(Rc::new(RefCell::new(PhpArray::new()))));
             }
             if b.get(*pos) == Some(&b'}') {
                 // A closer of the other kind where one is legal is a
@@ -852,7 +860,7 @@ fn json_value(
             }
             loop {
                 let v = json_value(it, b, pos, cx, rem, stk)?;
-                a.push(v);
+                vals.push(v);
                 json_ws(b, pos)?;
                 match b.get(*pos) {
                     Some(b',') => *pos += 1,
@@ -864,7 +872,9 @@ fn json_value(
                     _ => return Err(J_SYNTAX),
                 }
             }
-            Ok(Value::Array(Rc::new(RefCell::new(a))))
+            Ok(Value::Array(Rc::new(RefCell::new(PhpArray::packed_list(
+                vals,
+            )))))
         }
         Some(b'{') => {
             *pos += 1;
