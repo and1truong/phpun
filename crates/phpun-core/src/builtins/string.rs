@@ -159,16 +159,8 @@ pub(crate) fn dispatch(
             value => value.to_php_bytes().len(),
         } as i64),
         // PHP strtoupper/strtolower are ASCII-only byte maps.
-        "strtoupper" => Value::bytes({
-            let mut s = arg_bs(it, args, 0);
-            s.make_ascii_uppercase();
-            s
-        }),
-        "strtolower" => Value::bytes({
-            let mut s = arg_bs(it, args, 0);
-            s.make_ascii_lowercase();
-            s
-        }),
+        "strtoupper" => case_value(arg_bs(it, args, 0), true),
+        "strtolower" => case_value(arg_bs(it, args, 0), false),
         "ucfirst" => {
             let mut s = arg_bs(it, args, 0);
             if let Some(f) = s.first_mut() {
@@ -1290,8 +1282,8 @@ fn trim_set(s: &[u8], chars: &[u8], left: bool, right: bool) -> Vec<u8> {
 }
 
 fn str_replace_one<'s>(
-    finds: &[Vec<u8>],
-    repls: &[Vec<u8>],
+    finds: &[impl AsRef<[u8]>],
+    repls: &[impl AsRef<[u8]>],
     repl_scalar: bool,
     subj: &'s [u8],
     ci: bool,
@@ -1299,13 +1291,14 @@ fn str_replace_one<'s>(
 ) -> Cow<'s, [u8]> {
     let mut out = Cow::Borrowed(subj);
     for (i, f) in finds.iter().enumerate() {
+        let f = f.as_ref();
         if f.is_empty() {
             continue;
         }
         let r = if repl_scalar {
-            repls[0].as_slice()
+            repls[0].as_ref()
         } else {
-            repls.get(i).map(|r| r.as_slice()).unwrap_or(&[])
+            repls.get(i).map(|r| r.as_ref()).unwrap_or(&[])
         };
         let mut start = 0;
         let mut changed: Option<Vec<u8>> = None;
@@ -1394,6 +1387,35 @@ fn str_replace(
         apply(subj)?
     };
     Ok((result, count))
+}
+
+pub(in crate::builtins) fn case_value(mut bytes: Vec<u8>, upper: bool) -> Value {
+    if upper {
+        bytes.make_ascii_uppercase();
+    } else {
+        bytes.make_ascii_lowercase();
+    }
+    Value::bytes(bytes)
+}
+
+pub(in crate::builtins) fn replace_value(
+    find: &crate::value::PhpStr,
+    repl: &crate::value::PhpStr,
+    subj: &crate::value::PhpStr,
+    ci: bool,
+) -> Value {
+    let mut count = 0;
+    match str_replace_one(
+        &[find.as_ref()],
+        &[repl.as_ref()],
+        true,
+        subj,
+        ci,
+        &mut count,
+    ) {
+        Cow::Owned(bytes) => Value::bytes(bytes),
+        Cow::Borrowed(_) => Value::Str(subj.clone()),
+    }
 }
 
 pub(in crate::builtins) fn substr_value(s: &[u8], start: i64, len: Option<i64>) -> Value {

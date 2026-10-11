@@ -1,0 +1,5 @@
+{
+  "source": "ef5bf3a plus format and inherited nullable fixes",
+  "decision": "VM-only entry does not reduce original string benchmark allocations; shared builtin entry needs same kernel",
+  "initial_negative_results_retained": "scalar-string-vm-only-timings.json"
+}
