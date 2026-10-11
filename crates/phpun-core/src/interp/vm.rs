@@ -2837,6 +2837,10 @@ impl<'a> Interp<'a> {
             }
             return self.call_value(callable, args);
         };
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Some(value) = native::callback(self, decl, &values) {
+            return Ok(value);
+        }
         let mut argv = self.vm_val_pool.pop().unwrap_or_default();
         argv.extend(values);
         let result = self.vm_run_direct(decl, &comp, &mut argv, Some(closure.clone()));
@@ -3444,6 +3448,23 @@ DivisionByZeroError:Division by zero
             it.vm_frame_pool.iter().any(|f| f.value_args.capacity() > 0),
             "primitive callback did not reach the value ABI"
         );
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            for _ in 0..70 {
+                assert!(matches!(it.call_value_pair(&callable,
+                    [super::Value::Int(2),super::Value::Int(1)],false).unwrap(),super::Value::Int(3)));
+            }
+            let super::CallableKind::Closure(decl) = &c.kind else {panic!("closure");};
+            match &it.compiled_fns[&(Rc::as_ptr(decl) as usize)].3 {
+                super::native::State::Ready(p)=>assert!(p.executions.get()>0,"callback did not enter native before VM frame"),
+                _=>panic!("callback graph was not native"),
+            }
+            let error=it.call_value_pair(&callable,[super::Value::Int(i64::MAX),super::Value::Int(1)],false).unwrap_err();
+            assert!(error.message.contains("Return value must be of type int"),"{}",error.message);
+            assert!(it.call_trace.is_empty());
+            assert_eq!(it.vm_stack.len(),1);
+            assert_eq!(it.vm_stack[0].used,32+super::super::VM_FRAME_SLOTS*16);
+        }
         drop(callable);
         assert!(
             weak.upgrade().is_none(),
