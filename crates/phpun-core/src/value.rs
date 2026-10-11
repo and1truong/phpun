@@ -121,6 +121,9 @@ impl ArrayEntries {
         self.scalar.borrow().clone()
     }
     fn packed_get(&self, key: &ArrKey) -> Option<Option<Value>> {
+        if self.cells.get().is_some() {
+            return None;
+        }
         let values = self.scalar.borrow();
         values.as_ref().map(|values| match key {
             ArrKey::Int(i) if *i >= 0 => values.get(*i as usize).cloned(),
