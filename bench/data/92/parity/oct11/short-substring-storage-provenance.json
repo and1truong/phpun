@@ -1,0 +1,72 @@
+{
+  "source": "30264628769d42599d506b9c410c5098fde6fa9c",
+  "runtime": "198b029331522e038f8a71b5deddf7dc2556ed49",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "strings100",
+      "before": {
+        "requests": 1298282,
+        "bytes": 94540668
+      },
+      "after": {
+        "requests": 898168,
+        "bytes": 101045066
+      }
+    },
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 858127,
+        "bytes": 49975175
+      },
+      "after": {
+        "requests": 858113,
+        "bytes": 49976333
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26546326
+      },
+      "after": {
+        "requests": 616027,
+        "bytes": 26707468
+      }
+    }
+  ],
+  "binary_sha256": "15b1a15ab543f1a38e650d228b1fc459f9c8cfd02b1ec81d042ecb489b989ee0",
+  "scope": "REJECTED prototype: Rc-backed safe inline <=23 byte strings removed the separate byte-buffer allocation for short substrings. PhpStr/Value stayed 8/16 bytes, but EVERY shared string payload grew from Vec24 to enum32. The runtime will be ordinarily reverted; this PR retains the evidence only.",
+  "fallbacks": "Prototype preserved full-range source reuse, partial-result memory charges, alias/weak detach/offset identity and long-string Vec growth. ONE existing arena check covered NUL/empty/23\u219224 concat, weak handles, real payload sizes and mb_strcut boundary. Initial compile failure in mb_strcut after borrowed-range change was corrected by the inherited shared P1 fix; original source commit 198b029 remains in history."
+}

@@ -3285,4 +3285,39 @@ this is not full compatibility. Explicit release core clean/rebuild/hash recorde
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/scalar-value-stack-review-*.
 
+## #362: docs(perf): reject inline substring storage after repeated string and JSON regressions (2026-10-11)
+
+REJECTED prototype: Rc-backed safe inline <=23 byte strings removed the separate byte-buffer allocation for short substrings. PhpStr/Value stayed 8/16 bytes, but EVERY shared string payload grew from Vec24 to enum32. The runtime will be ordinarily reverted; this PR retains the evidence only.
+
+Prototype preserved full-range source reuse, partial-result memory charges, alias/weak detach/offset identity and long-string Vec growth. ONE existing arena check covered NUL/empty/23→24 concat, weak handles, real payload sizes and mb_strcut boundary. Initial compile failure in mb_strcut after borrowed-range change was corrected by the inherited shared P1 fix; original source commit 198b029 remains in history.
+
+Runtime 198b029331522e038f8a71b5deddf7dc2556ed49; timing source 30264628769d42599d506b9c410c5098fde6fa9c; report/integration source 30264628769d42599d506b9c410c5098fde6fa9c.
+
+Two separate 31 alternating profiler-off PHP8.5.11 -n byte-gated target cohorts; fresh seven rotating PHP/main/parent/candidate pairs. Physical diagnostics run separately.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 47.326 | 48.365 | 1.0220 |
+| bench/20-strings.php 100 | 200.955 | 206.240 | 1.0263 |
+| bench/40-objects.php | 96.149 | 95.299 | 0.9912 |
+| bench/60-json.php | 412.955 | 433.499 | 1.0497 |
+| bench/app/cli.php 100 20 | 35.252 | 34.498 | 0.9786 |
+
+First 31 pairs: strings +2.2%, strings100 +2.6%, JSON +5.0%; objects −0.9% flat, app −2.1% unattributed. Independent 31 confirmation: strings +1.5%, strings100 +3.5%, JSON +3.3%. Fresh whole seven geomean 2.77198×PHP, parent −0.88% driven by unrelated benches; strings +0.5%/long +1.3%, JSON +2.0%, Composer +3.9%. These whole unrelated gains do not override repeated target regressions. Separate strings100 physical requests 1298282→898168 (−400114) but bytes 94540668→101045066 (+6504398); objects requests −14/bytes +1158; arrays requests −14/bytes +161142. REJECTED: ordinary revert restores preceding runtime. No allocation-count-to-speed conversion or parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings100: requests 1298282→898168; bytes 94540668→101045066.
+- objects5: requests 858127→858113; bytes 49975175→49976333.
+- arrays: requests 616041→616027; bytes 26546326→26707468.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Full-range and partial-result 4MB native/canonical gates PASS. Binary/UTF-offset probe PASS; PHP oracle has no mbstring, so mb_strcut boundary is the explicit Rust check.
+Prototype all 3406 statuses: only known GC timeout→pass; serialized parent/candidate same10s both PASS. Full 2732 pass/599 fail/25 skip/38 unsupported/6 crash/6 timeout retained; no new difference after GC recheck. Partial compatibility.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/short-substring-storage-*.
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
