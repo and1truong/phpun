@@ -4273,7 +4273,7 @@ try { rem_zero(9,0); } catch (DivisionByZeroError $e) { echo $e->getMessage(), "
 
         let mut scan = super::super::GcScan::default();
         let mut out = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = crate::value::FxSet::default();
         for value in [
             super::Value::Null,
             super::Value::Bool(true),
