@@ -1,0 +1,75 @@
+{
+  "host": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "metric": "cold CLI ms; 7 alternating reps; profilers off",
+  "source": "154ac34268e9669625e63a37d2356579ac846b7a",
+  "dirty": true,
+  "build": "rustc 1.99.0; cargo build --offline --release; LTO=true/codegen-units=1",
+  "binaries": {
+    "/workspace/parity92/oct11/primitive-property-reviewed": "003cfa327341c686aa258c9b5fd09e85e802269524eaddaf513a1e0913607437",
+    "/workspace/parity92/oct11/scalar-string-calls": "9957cb5bd8c448173dc930d9cfc8640086a7f4a7b973f17922ff1a5b92473844",
+    "/workspace/php85": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f"
+  },
+  "php_args": [
+    "-n"
+  ],
+  "cases": [
+    {
+      "argv": [
+        "bench/profile/strings.php",
+        "replace",
+        "20000"
+      ],
+      "before_ms": [
+        689.726971,
+        678.592656,
+        679.677958,
+        689.553188,
+        643.755756,
+        718.638964,
+        643.051629
+      ],
+      "after_ms": [
+        652.769274,
+        645.402343,
+        664.921414,
+        638.909527,
+        656.629707,
+        629.943702,
+        652.194028
+      ],
+      "before_median": 679.677958,
+      "after_median": 652.194028,
+      "ratio": 0.9595633054205945,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "bench/profile/strings.php",
+        "slice",
+        "20000"
+      ],
+      "before_ms": [
+        81.079065,
+        76.597585,
+        75.697291,
+        75.81588,
+        79.316655,
+        86.599141,
+        94.176367
+      ],
+      "after_ms": [
+        69.979196,
+        72.160962,
+        70.014444,
+        76.678777,
+        71.107438,
+        76.871286,
+        87.507913
+      ],
+      "before_median": 79.316655,
+      "after_median": 72.160962,
+      "ratio": 0.9097832227039832,
+      "gate": "exit/stdout/stderr == PHP"
+    }
+  ]
+}
