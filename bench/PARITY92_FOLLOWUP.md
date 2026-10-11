@@ -1698,3 +1698,5 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/primitive-property-checks-*.
+
+Fresh primitive-property Sieve profile:1753samples/zero lost, exclusive vm_exec_ops45.75% (semantic work included),gc_note_dying7.42%,gc_dying_release5.93%,ini_bytes6.96%. Source lines unresolved. Binary hash/config/byte gate and gzip symbol-line report published; raw DWARF stays local. Supports #285 scalar-array dying maps and #286 reuse of the existing memory-limit cache, not a pure-dispatch attribution.
