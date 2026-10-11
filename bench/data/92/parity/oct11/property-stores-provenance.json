@@ -1,0 +1,27 @@
+{
+  "runtime": "e62b948",
+  "build_source": "e62b948 (95f8f80 merges parent report only)",
+  "sha256": {
+    "scalar-dim-writes-fixed": "a6ddbb52b42016d475ec43c8fe2c64c2cd048653d255ab283358d663d9b1dc4c",
+    "property-stores": "bfa9c4971800c5251d2cd9879e59c42bfecdf03159e8d465708e7f67f6d2aae9"
+  },
+  "build": "Rust1.99 release LTO/codegen-units1; forced core clean before worktree switch",
+  "gates": "workspace8core/22runtime/19format,fmt/clippy;existing promoted/property binding;25script+19workload+warm comparator+dimension byte gates;VM-profile;3406PHPT",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes": {},
+  "timing": "7 alternating isolated profiler-off pairs;31 defaultobjects/Composer follow-up; PHP8.5.11 -n; exit/stdout/stderr identical",
+  "dirty": "Only untracked vendor symlink; production source clean"
+}

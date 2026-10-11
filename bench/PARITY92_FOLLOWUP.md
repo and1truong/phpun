@@ -1076,3 +1076,41 @@ extended dimension PHP probe andVM-profile pass.3406PHPT2727pass603fail25skip
 38unsupported6crash7timeout; only two known range crash/timeout swaps, no
 new fail/pass/skip. External CI not yet green. Packed/mixed storage #187 is
 still unfinished. Next #249 borrows property declarations during shared stores.
+
+## #249: borrow pinned property declarations during stores (2026-10-11)
+
+Move the existing private/public/inherited declaration resolver into
+decl_prop_site, returning immutable Rc<Class>+declaration index. Existing
+decl_prop keeps its owned wrapper for other callers. Shared store_prop borrows
+the declaration while inspecting set visibility, readonly and type gates;
+declaration-existence checks no longer clone metadata. All hooks, owner/ref
+checks, conversion, clone/init diagnostics and actual property writes remain
+shared. No object slot cache, offset pin or new dependency. Runtime e62b948,
+23add/9delete. Existing promoted-slot binding check covers the shared path.
+
+Seven isolated alternating profiler-off PHP byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/40-objects.php | 237.885/228.219 | 0.959 |
+| bench/40-objects.php 20 5000 | 990.289/926.580 | 0.936 |
+| bench/profile/objects.php ctor 5000 | 48.244/45.097 | 0.935 |
+| bench/30-arrays.php | 93.880/91.334 | 0.973 |
+| bench/11-sieve.php | 75.530/73.760 | 0.977 |
+| bench/10-fib.php | 8.535/7.920 | 0.928 |
+| bench/app/cli.php 100 20 | 39.274/35.183 | 0.896 |
+| examples/composer/run.php | 8.625/8.937 | 1.036 |
+
+Objects31 follow-up238.160→222.645ms (−6.5%); Composer8.415→7.992
+(−5.0%), initial+3.6% negative row retained. No causal speed claim for other
+nontarget movements. Full object/suite gap remains far from PHP parity.
+Separate100000-object PHP-byte-gated allocation probe: requests12,763,259
+→10,963,259 (−1,800,000/~14.1%), bytes320,687,560→302,687,528 (−5.6%);
+obj_new100000 and cell994898 events unchanged. Allocation bytes are not CPU
+time; event counters do not count all physical allocations.
+
+Workspace8core/22runtime/19format,fm/clippy pass;25script+19workload and warm
+comparator/extended dimension byte/exit/error gates,VM-profile pass. All3406
+individual PHPT statuses identical to scalar-write parent:2727pass603fail25skip
+38unsupported6crash7timeout. External CI not asserted green. Next #251 extends
+pure integer native control-flow validation to backward/nested loops.
