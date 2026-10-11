@@ -78,7 +78,6 @@ fn key_str(k: &ArrKey) -> String {
     }
 }
 
-#[inline(always)]
 fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return None;
