@@ -4799,6 +4799,27 @@ $a = new ReceiverDtor; $b = $a; unset($a); echo "S\n"; unset($b);
         fresh.vm_call_reserve(&mut args, 2);
         let before: Vec<_> = fresh.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let object = fresh.new_instance("FreshFloat", args).unwrap();
+        let class = fresh.classes["freshfloat"].clone();
+        let cached = class.float_ctor_slots.get().unwrap().as_ref().unwrap();
+        assert_eq!(&**cached, &[0, 1]);
+        let proof_ptr = cached.as_ptr();
+        let mut again = super::super::CallArgs::positional(vec![
+            fresh.vm_scalar_arg(super::Value::Float(5.0)),
+            fresh.vm_scalar_arg(super::Value::Int(6)),
+        ]);
+        fresh.vm_call_reserve(&mut again, 2);
+        let second = fresh.new_instance("FreshFloat", again).unwrap();
+        assert_eq!(
+            class
+                .float_ctor_slots
+                .get()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            proof_ptr
+        );
+        assert!(matches!(second, super::Value::Object(_)));
         assert_eq!(fresh.vm_scalar_cell_pool.len(), 2);
         assert!(fresh
             .vm_scalar_cell_pool

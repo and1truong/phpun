@@ -2254,6 +2254,9 @@ pub struct PhpClass {
     /// machinery is class-fixed so it needn't rerun per object.
     pub flat_props: std::cell::OnceCell<Rc<Vec<FlatProp>>>,
     pub prop_order_template: std::cell::OnceCell<Rc<Vec<String>>>,
+    /// Immutable empty float-promotion ctor proof; indices only, no owners.
+    /// ponytail: existing float-only eligibility; widen only with binder gates and measured benefit.
+    pub float_ctor_slots: std::cell::OnceCell<Option<Box<[usize]>>>,
     /// Storage key → `flat_props` index, filled alongside `flat_props`:
     /// routes `prop_get`/`prop_insert` to `PhpObject.slots`.
     pub prop_slot: std::cell::OnceCell<Rc<HashMap<String, usize>>>,
