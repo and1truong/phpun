@@ -6709,8 +6709,11 @@ impl<'a> Interp<'a> {
         visited: &mut HashSet<usize>,
         internal: bool,
     ) {
+        if depth == 0 {
+            return;
+        }
         let value = c.borrow();
-        if depth == 0 || Self::gc_val_ptr(&value) == 0 {
+        if Self::gc_val_ptr(&value) == 0 {
             return;
         }
         let cp = Rc::as_ptr(c) as usize;
