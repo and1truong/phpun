@@ -3704,6 +3704,20 @@ set:3:false
                 )));
             }
         }
+        let mut packed = Interp::new("packed.php");
+        let result = packed.run_source(r#"<?php
+$a = array_fill(0, 4, true); $a[0] = $a[1] = false;
+$b = $a; $b[2] = false;
+$c = array_fill(0, 4, true); $ref =& $c[0]; $ref = false;
+$count = 0; for ($i = 0; $i < 4; $i++) { if ($a[$i]) $count++; }
+var_dump($count, $b[2], $c[0]);
+"#);
+        assert_eq!(result.exit_code, 0, "{}", packed.err_buf);
+        assert_eq!(packed.out, b"int(2)\nbool(false)\nbool(false)\n");
+        for (name, inline) in [("a", true), ("b", true), ("c", false)] {
+            let super::Value::Array(a) = packed.globals.vars[name].borrow().clone() else { panic!("array") };
+            assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
+        }
     }
 
     #[test]
