@@ -3789,6 +3789,35 @@ try { rem_zero(9,0); } catch (DivisionByZeroError $e) { echo $e->getMessage(), "
         it.frame_recycle(frame);
         let frame = it.frame_new("second");
         assert_eq!(&*frame as *const super::super::Frame, ptr);
+
+        let mut scan = super::super::GcScan::default();
+        let mut out = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        for value in [
+            super::Value::Null,
+            super::Value::Bool(true),
+            super::Value::Int(7),
+            super::Value::Float(1.5),
+            super::Value::str("leaf"),
+        ] {
+            Interp::gc_scan_cell(
+                &super::cell(value),
+                &mut scan,
+                &mut out,
+                16,
+                &mut visited,
+                false,
+            );
+        }
+        assert!(scan.cells.is_empty() && scan.cell_slots.is_empty() && out.is_empty());
+        let array = std::rc::Rc::new(std::cell::RefCell::new(super::PhpArray::new()));
+        let c = super::cell(super::Value::Array(array));
+        Interp::gc_scan_cell(&c, &mut scan, &mut out, 16, &mut visited, false);
+        Interp::gc_scan_cell(&c, &mut scan, &mut out, 16, &mut visited, false);
+        let cp = std::rc::Rc::as_ptr(&c) as usize;
+        assert_eq!(scan.cell_slots[&cp], 2);
+        assert_eq!(out.len(), 2);
+        assert!(std::rc::Rc::ptr_eq(&scan.cells[&cp], &c));
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
