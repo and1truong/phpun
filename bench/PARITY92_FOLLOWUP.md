@@ -2786,3 +2786,41 @@ Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/ini-bool-borrow-*.
+
+## #335: perf(objects): share class property order with copy on write (2026-10-11)
+
+PhpObject shares the class-fixed property-order template through Rc<Vec<String>>. Existing order mutations use Rc::make_mut; slots, defaults and dynamic property values retain their existing independent storage. Standard-library sharing, no unsafe/new dependency.
+
+ONE existing receiver/constructor check proves template sharing and mutation isolation. Native probes cover inherited private keys, unset/reinsert, references, clone, serialize/unserialize and readonly behavior. Existing inherited AllowDynamicProperties gap is retained separately; corrected probe explicitly marks both classes.
+
+Runtime 61f9d69da205ade2d9672debea31510606786c92; timing source 466240dd8d1521c42d8afb1b3280b4b87fcfa1e7; report/integration source 61f9d69da205ade2d9672debea31510606786c92.
+
+Seven alternating profiler-off pairs plus31-pair focused cohort and fresh whole-suite7 rotating PHP/main/parent/candidate,all exit/stdout/stderr byte gated.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 108.308 | 111.683 | 1.0312 |
+| bench/40-objects.php 20 5000 | 463.457 | 401.077 | 0.8654 |
+| bench/30-arrays.php | 85.470 | 84.887 | 0.9932 |
+| bench/60-json.php | 539.044 | 499.101 | 0.9259 |
+| examples/composer/run.php | 8.158 | 8.028 | 0.9840 |
+
+31 alternating profiler-off pairs: objects107.220→98.461ms (−8.2%), long objects456.454→399.117ms (−12.6%), JSON522.647→526.188ms (+0.7%,flat). Initial7 default objects+3.1%,long−13.5%,JSON−7.4% retained; no JSON gain attributed. Fresh rotating whole7 main4e6/parentINI/candidate geomeans3.855→3.520×PHP; candidate/parent0.9881 (−1.2%). Objects−9.6%,long−9.6%; fib+4.8%,arrays+1.9%,DB+2.0%,JSON+0.5%;Composer−22.3% not attributed. Full raw cohorts retained; no parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1058129→983133; bytes 57271042→55272038.
+- arrays: requests 636052→636052; bytes 26702518→26703402.
+- json: requests 4360115→4360115; bytes 296859462→296860346.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing receiver test extended; original inherited-attribute gap and corrected native probe retained.
+All3406individualPHPT statuses identical to frozenINI parent (2731pass599fail25skip38unsupported6crash7timeout). Existing compatibility failures retained.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/object-order-cow-*.
+
+Build provenance for #335: the release command ran at466240d with the exact formatting-only Rust patch archived asobject-order-cow-format-only.patch. That source was committed unchanged as61f9d69 after freezing the executable. Report merges changed metadata only. No claim that466240d was clean at build time. Whole-suite raw measurements are object-order-cow-whole.json. Objects allocation requests1058129→983133 (−74996);arrays/JSON unchanged requests,each+884bytes.

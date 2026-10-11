@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "728111616dfe46fded60f712235536a9ff917c2150c5ad852cf7fb30d85cbddd",
+  "source": "466240dd8d1521c42d8afb1b3280b4b87fcfa1e7",
+  "parent": "ini-bool-borrow",
+  "summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "changes": []
+}
