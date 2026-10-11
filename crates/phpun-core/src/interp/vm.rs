@@ -3644,9 +3644,21 @@ DivisionByZeroError:Division by zero
             "scalar builtin created a transient trace frame"
         );
         assert_eq!(it.vm_stack.last().unwrap().used, used);
-        let mut values = vec![super::Value::str("not numeric")];
+        let mut values = vec![
+            super::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+                super::PhpArray::new(),
+            ))),
+            super::Value::Int(0),
+            super::Value::Int(1),
+        ];
         assert!(it
-            .vm_call("sqrt", "sqrt", &mut values, 1, &super::CachedFn::Builtin)
+            .vm_call(
+                "substr",
+                "substr",
+                &mut values,
+                1,
+                &super::CachedFn::Builtin
+            )
             .is_err());
         assert!(
             !it.trace_pool.is_empty(),

@@ -1320,13 +1320,14 @@ pub fn cmp_depth_err() -> bool {
     CMP_DEPTH_ERR.with(|f| f.get())
 }
 
-/// Take the notices a comparison just queued (object→number casts).
-/// Called right after `compare`/`identical` at interp + builtin
-/// boundaries; the messages go out as E_NOTICE in order.
+/// A pure-call guard: queued diagnostics require the canonical builtin frame.
 pub(crate) fn cmp_notices_pending() -> bool {
     CMP_NOTICES.with(|v| !v.borrow().is_empty())
 }
 
+/// Take the notices a comparison just queued (object→number casts).
+/// Called right after `compare`/`identical` at interp + builtin
+/// boundaries; the messages go out as E_NOTICE in order.
 pub fn take_cmp_notices() -> Vec<String> {
     CMP_NOTICES.with(|v| std::mem::take(&mut *v.borrow_mut()))
 }
