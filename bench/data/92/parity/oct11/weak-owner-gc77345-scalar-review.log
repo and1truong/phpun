@@ -1,0 +1,16 @@
+phpun PHPT report — binary under test: /workspace/parity92/oct11/weak-owner
+========================================================================
+========================================================================
+Total:           1
+Passed:          1
+Failed:          0
+Expected-fail:   0
+Warned (xpass):  0
+Skipped:         0
+Unsupported:     0
+Borked:          0
+Crashed:         0
+Timed out:       0
+Applicable:      1
+Compatibility:   100.0%  (1/1)
+wrote /workspace/parity92/oct11/weak-owner-gc77345-scalar-review.json

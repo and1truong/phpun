@@ -2943,3 +2943,38 @@ External CI not asserted green. No suite parity claim or multiplication of step 
 Raw/source/hashes in bench/data/92/parity/oct11/weak-owner-*.
 
 Weak-owner source3911b6c/frozen1042bda whole7: main4e6geo3.8165→candidate2.7538×PHP,candidate/parent0.9663(−3.4%). Full raw GCpass→timeout isretained;serializedsame10s parent8951ms/candidate9348ms bothPASS,after-isolationmap identical. String/array/object/JSON request savings above are physicalallocator observations,not speed or CPU attribution. Whole/31negative and mismatched cohorts remain separate.
+
+## #344: docs(perf): reject scalar-object GC scan after paired object regressions (2026-10-11)
+
+Rejected experiment: skip dying-cell snapshots for last-owner scalar-only objects; internal/nested/resource values kept original path. Existing runnable check covered scalar leaf, surviving alias purple-root marking and nested fallback. Ordinary revert47f5ac5 restores all runtime/source exactly to PR345 (git diff8a77753HEAD--crates/Cargo empty).
+
+Report-only PR; no rejected runtime is retained. Candidate ELF90bf414 and experiment sourcee69221d are preserved for reproducibility, not the final runtime.
+
+Runtime e69221d6e333b911d1d8fa9f7d1c783705fc23de; timing source 0b41cf4d04cb917e0d00898c94ae9394040fc365; report/integration source 47f5ac5e7ad13dc1a8fd952fac94798a14fb112c.
+
+31alternating profiler-off byte-gated pairs against nativePHP8.5.11-n; no seven-run whole follow-up after rejection.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 90.630 | 92.517 | 1.0208 |
+| bench/40-objects.php 20 5000 | 360.756 | 383.130 | 1.0620 |
+| bench/60-json.php | 424.403 | 426.443 | 1.0048 |
+| bench/20-strings.php 100 | 244.853 | 227.662 | 0.9298 |
+| bench/30-arrays.php | 79.567 | 79.719 | 1.0019 |
+
+31 alternating profiler-off pairs: objects90.630→92.517ms(+2.1%),long360.756→383.130(+6.2%),JSON+.5%,arrays+.2%,strings100−7.0% not attributed to an object-only change. Physicalobjects only4 fewer requests/104 bytes; arrayssame requests/+24bytes. Rejected because primary workload regressed and meaningful physical saving absent. No fresh whole-corpus follow-up: rejection decided from31pairs, finalruntime parent unchanged. Serializedsame10s GC77345 parent8937/candidate8386ms bothpass; rawfull timeout→pass kept.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 933121→933117; bytes 54871934→54871830.
+- arrays: requests 616040→616040; bytes 26543322→26543346.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Experiment workspace/fmt/clippy and existingreceiver/GC check PASS;final ordinaryrevert source identicalalready-gated parent.
+All3406individualPHPT onlyGC77345timeout→pass;599knownfails unchanged. Serializedsame10s parent8937/candidate8386ms bothPASS. Finalreverted source exactly parent;fullcandidate statuses not a new compatibility gain.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/scalar-object-gc-*.

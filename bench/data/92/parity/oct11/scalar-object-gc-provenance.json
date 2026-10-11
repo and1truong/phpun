@@ -1,0 +1,110 @@
+{
+  "source": "47f5ac5e7ad13dc1a8fd952fac94798a14fb112c",
+  "runtime": "e69221d6e333b911d1d8fa9f7d1c783705fc23de",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 933121,
+        "bytes": 54871934
+      },
+      "after": {
+        "requests": 933117,
+        "bytes": 54871830
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616040,
+        "bytes": 26543322
+      },
+      "after": {
+        "requests": 616040,
+        "bytes": 26543346
+      }
+    }
+  ],
+  "binary_sha256": "90bf41455d292ce972fc8cb7b668dd65f89ec98c3bf6c0c06f9fbbb322882fe8",
+  "scope": "Rejected experiment: skip dying-cell snapshots for last-owner scalar-only objects; internal/nested/resource values kept original path. Existing runnable check covered scalar leaf, surviving alias purple-root marking and nested fallback. Ordinary revert47f5ac5 restores all runtime/source exactly to PR345 (git diff8a77753HEAD--crates/Cargo empty).",
+  "fallbacks": "Report-only PR; no rejected runtime is retained. Candidate ELF90bf414 and experiment sourcee69221d are preserved for reproducibility, not the final runtime.",
+  "final_runtime": "3911b6c6160fd6f195461fb25ee606a6c43be54f",
+  "revert": "47f5ac5",
+  "decision": "rejected",
+  "serialized_gc77345_rechecks": [
+    {
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+          "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 8937
+        }
+      ]
+    },
+    {
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+          "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 8386
+        }
+      ]
+    }
+  ]
+}
