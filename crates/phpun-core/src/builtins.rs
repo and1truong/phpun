@@ -79,26 +79,54 @@ fn key_str(k: &ArrKey) -> String {
 }
 
 fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    let first = *needle.first()?;
-    let last = hay.len().checked_sub(needle.len())?;
-    let mut at = from;
-    // ponytail: first-byte filter avoids a full comparison at every byte;
-    // repetitive long needles still have O(n*m) cost (future two-way search).
-    while at <= last {
-        let bytes = &hay[at..=last];
-        // SAFETY: memchr reads this nonempty slice and returns null or a
-        // pointer within it; subtraction uses that same live allocation.
-        let found = unsafe { libc::memchr(bytes.as_ptr().cast(), first.into(), bytes.len()) };
-        if found.is_null() {
-            return None;
-        }
-        let p = at + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize };
-        if hay[p..].starts_with(needle) {
-            return Some(p);
-        }
-        at = p + 1;
+    if needle.is_empty() {
+        return None;
     }
-    None
+    let last = hay.len().checked_sub(needle.len())?;
+    if from > last {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = &hay[from..];
+        // SAFETY: memmem reads only these live bounded slices and returns
+        // null or the start of a complete match within `bytes`.
+        let found = unsafe {
+            libc::memmem(
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                needle.as_ptr().cast(),
+                needle.len(),
+            )
+        };
+        if found.is_null() {
+            None
+        } else {
+            // SAFETY: both pointers are in the same live slice allocation.
+            Some(from + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize })
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let first = needle[0];
+        let mut at = from;
+        // ponytail: portable first-byte filter can remain O(n*m); use a
+        // platform search or two-way implementation if target evidence warrants it.
+        while at <= last {
+            let bytes = &hay[at..=last];
+            // SAFETY: memchr reads this live slice and returns null or a pointer within it.
+            let found = unsafe { libc::memchr(bytes.as_ptr().cast(), first.into(), bytes.len()) };
+            if found.is_null() {
+                return None;
+            }
+            let p = at + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize };
+            if hay[p..].starts_with(needle) {
+                return Some(p);
+            }
+            at = p + 1;
+        }
+        None
+    }
 }
 
 /// Replace every non-overlapping `from` with `to` (byte version of
@@ -1812,6 +1840,19 @@ pub(crate) fn strict_sig_view(name: &str) -> Option<&'static [(&'static str, &'s
 mod byte_search_tests {
     #[test]
     fn filtered_search_matches_naive_binary_search_at_every_offset() {
+        let mut hay = vec![b'a'; 8192];
+        hay.extend_from_slice(b"b\0\xfftail");
+        let mut needle = vec![b'a'; 257];
+        needle.push(b'b');
+        for find in [needle, b"b\0\xff".to_vec(), vec![b'c'; 513]] {
+            for from in [0, 1, 4096, hay.len(), hay.len() + 1, usize::MAX] {
+                let expected = hay
+                    .get(from..)
+                    .and_then(|h| h.windows(find.len()).position(|w| w == find))
+                    .map(|i| i + from);
+                assert_eq!(super::bfind(&hay, &find, from), expected);
+            }
+        }
         // Exhaustive small binary alphabets include NUL and non-UTF8 bytes.
         for len in 0..=7 {
             for bits in 0..(1 << len) {
