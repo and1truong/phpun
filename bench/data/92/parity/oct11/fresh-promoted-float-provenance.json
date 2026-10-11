@@ -1,0 +1,61 @@
+{
+  "source": "d5a65fba4d5e54e7f759cfa79d7f24c3117cad17",
+  "runtime": "d5a65fba4d5e54e7f759cfa79d7f24c3117cad17",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1358161,
+        "bytes": 64355869
+      },
+      "after": {
+        "requests": 1058127,
+        "bytes": 57272483
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636049,
+        "bytes": 26704237
+      },
+      "after": {
+        "requests": 636049,
+        "bytes": 26704241
+      }
+    }
+  ],
+  "binary_sha256": "9b85d202330a83835ee6ca8d6dcece28c1e1f741c74ddfdbb53a407e261546ca",
+  "scope": "Actual AST new_instance path skips frames only for fresh same-class/root-scope public empty userland constructors with fully supplied fixed by-value promoted float parameters. Preflight metadata, argument types and uninitialized unhooked/non-readonly storage before any write; Int-to-Float widening matches PHP. Existing prop_insert and vm_frame_free handle storage/paid arena spans. No benchmark recognizer, new cache/layout/helper/dependency.",
+  "fallbacks": "Named/default/missing/extra/ref/inherited/nonempty/internal/visibility/readonly/hooks/pending-context/error/profiler/coverage/deadline/OOM or unreserved spans retain full canonical dispatch. ONE existing receiver unit proves actual frame bypass, values and arena repayment; extended native probe covers fallback matrix."
+}

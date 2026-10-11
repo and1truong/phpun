@@ -1,0 +1,22 @@
+[
+  {
+    "binary": "float-method-leaves",
+    "result": {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+      "status": "pass",
+      "reason": "",
+      "duration_ms": 8297
+    }
+  },
+  {
+    "binary": "fresh-promoted-float",
+    "result": {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+      "status": "pass",
+      "reason": "",
+      "duration_ms": 8620
+    }
+  }
+]
