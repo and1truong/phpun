@@ -1,0 +1,21 @@
+{
+  "runtime": "91618f6ce934141c2e75d571daf31df312d1b635",
+  "binary_sha256": "21be565b896c164c8ae2398381da684632d3fb8a2ab4acea75dd35d02d1169c2",
+  "samples": 1753,
+  "lost": 0,
+  "event": "cpu-clock:u199Hz;DWARF8192",
+  "argv": [
+    "bench/11-sieve.php",
+    "100",
+    "100000"
+  ],
+  "stdout_gate": "nativePHP8.5.11 -n identical",
+  "self_samples_percent": {
+    "vm_exec_ops_semantics_included": 45.75,
+    "gc_note_dying": 7.42,
+    "ini_bytes": 6.96,
+    "gc_dying_release": 5.93
+  },
+  "raw_dwarf": "local only;14.128MB; symbol/source-line report gzip published; source-lines unresolved cgu0:0",
+  "scope": "CPU profile separate from profiler-off speed runs; inclusive/self estimates are not elapsed speedups"
+}
