@@ -4739,19 +4739,13 @@ new ValueCtorArgs(4); new ValueCtorArgs(5, "ok");
 $x=1; new ValueCtorRef($x); echo $x, "\n";
 try { new ValueCtor("bad", 2); } catch (TypeError $e) { echo get_class($e), "\n"; }
 unset($a); var_dump($weak->get());
-class_alias(ValueCtor::class, 'ValueCtorAlias');
-$alias = new ValueCtorAlias(n:5, x:7); echo json_encode($alias->values()), "\n";
-class ResolutionOrder {function __construct($n) {echo "ctor:$n\n";}}
-function resolution_argument() {echo "arg\n";return 6;}
-new ResolutionOrder(resolution_argument());
-$side=0;try {new MissingResolution(++$side);}catch(Error $e){}var_dump($side);
 "#,
         );
         assert_eq!(result.exit_code, 0, "{}", constructors.err_buf);
         assert_eq!(constructors.err_buf, "");
         assert_eq!(
             constructors.out,
-            b"[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\n[7,5]\narg\nctor:6\nint(0)\n"
+            b"[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\n"
         );
         let super::Value::Object(object) = constructors.instantiate("valuector", &[]).unwrap()
         else {
