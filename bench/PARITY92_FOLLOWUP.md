@@ -711,3 +711,72 @@ release22VM/callback byte gates plus19workload gates pass. This integration
 binary is recorded separately in `callback-main-integration.json`; the timings
 and583PHPT maps above remain frozen92d0be0 evidence, not timing/status claims
 for a different binary.
+
+## Current-main direct arena rollback (#236, main #235)
+
+Frozen main e202891 → runtime9d1544f, dedicated release target with unchanged
+Rust/PHP configuration. User-reported main geomean2.71× and objects7.88× live
+in #92 as a separate host/config source. Do not substitute the ratios below
+for that dataset or multiply step gains.
+
+Direct binders already have a live frame: current-segment span rollback now
+sits on that frame, without Rc<VmSite>/MemCharge lookup/token-vector transfer.
+Cold page growth retains the shared canonical token/accounting path; canonical
+argument evaluation tokens unchanged. Frame pop repays the span on all returns,
+unwind and canonical rebinds, and pooled frames retain no span. Accounting is
+kept, not disabled.
+
+ONE existing arena runnable check extended with actual inline-reservation
+witness (no token/charge added) and clean rollback/pool invariants. Workspace
+6core/22runtime/19format checks,fmt/clippy pass.23VM/callback/160-arg page-growth
+probes and19workloads exit/stdout/stderr byte-identical to PHP8.5.11 -n.
+3406PHPT: both2727pass/603existingfail/25skip/38unsupported; main6crash7timeout,
+candidate5crash8timeout. Only individual status change is known
+range_bug71132 crash→timeout at10s. Standalone30s both crash, unchanged
+f64 range unable to progress near PHP_INT_MIN. Original maps retained.
+
+Main CPU fib34:1379samples,zero lost; vm_exec_ops27.56%,vm_run15.23%,
+vm_run_direct8.05%,call_site_frame5.08%,vm_site3.63%,vm_frame_free1.74%
+exclusive symbols. Ops symbols include semantics, not pure opcode decode.
+Objects150×5000 has zero lost; malloc/free~10.5%,destruct_cells2.9%,
+GC collector3.0%. Diagnostic phase times are not speed timings.
+
+Separate PHP-gated physical allocation requests: fib26 425169→32254(−92.4%),
+requested bytes18562026→5979410(−67.8%). vm_site392835→1 is an EVENT counter,
+not the physical total. Objects20×5000 requests14563261→14463259,
+bytes468286008→465086016: small effect on that path. Observed out-of-line
+fib26 copies394512846→391370846B; call_site_frame/trace_pop still each~32%
+of observed bytes. Lower bounds omit inline/hidden/realloc movement and are
+not CPU percentages. This selects stable trace-shell/call-state movement #237
+next; does not prove native/JIT would resolve object allocation.
+
+Seven rotating PHP/main/candidate profiler-off pairs, every byte gate passes:
+
+| Workload | PHP/main/candidate median ms | Candidate/main |
+|---|---:|---:|
+| bench/00-startup.php | 3.297/5.605/5.317 | 0.949 |
+| bench/10-fib.php | 10.765/160.221/140.032 | 0.874 |
+| bench/11-sieve.php | 7.309/240.324/216.303 | 0.900 |
+| bench/20-strings.php | 12.833/174.494/160.350 | 0.919 |
+| bench/30-arrays.php | 15.886/187.400/166.196 | 0.887 |
+| bench/40-objects.php | 7.324/255.108/258.814 | 1.015 |
+| bench/50-regex.php | 6.272/38.407/39.250 | 1.022 |
+| bench/60-json.php | 145.695/519.124/510.340 | 0.983 |
+| bench/70-db.php | 27.996/116.149/111.178 | 0.957 |
+| bench/app/cli.php 100 20 | 4.655/39.894/41.961 | 1.052 |
+| examples/composer/run.php | 4.257/7.919/8.230 | 1.039 |
+
+Native nine-bench geomean9.083→8.571×PHP,
+candidate/main0.944. Fib−12.6%,sieve−10.0%,arrays−11.3%;
+objects+1.5%,regex+2.2%,app+5.2% retained; no object/parity/broad-app claim.
+
+31fresh isolated follow-up (PHP gated):
+- bench/app/cli.php 100 20: 41.967→40.052ms (0.954×), ranges38.296–52.686/38.022–46.801.
+- examples/composer/run.php: 7.627→7.626ms (1.000×), ranges7.037–8.290/7.145–9.940.
+- bench/00-startup.php: 5.484→5.631ms (1.027×), ranges5.117–6.667/5.060–6.359.
+
+Initial app regression does not reproduce in31samples; ranges overlap and
+startup+2.7% retained. No broad app claim. Hashes/config/argv/samples/status
+maps/CPU source rows/copy counts are in `data/92/parity/oct11/arena-*` and
+`*-main-*`; large raw perf.data remains in workspace. No perf.data from old
+main relabelled as current.

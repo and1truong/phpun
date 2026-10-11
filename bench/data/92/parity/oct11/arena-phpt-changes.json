@@ -1,0 +1,6 @@
+{
+  "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": [
+    "crash",
+    "timeout"
+  ]
+}

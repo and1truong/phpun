@@ -1,0 +1,471 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 8452260250
+#
+# Overhead  Command       Shared Object     Symbol                                                                                                                                                                                                                                                                                                                                                        
+# ........  ............  ................  ..............................................................................................................................................................................................................................................................................................................................................................
+#
+     5.77%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::vm_exec_ops
+            |
+            ---<phpun_core::interp::Interp>::vm_exec_ops
+               <phpun_core::interp::Interp>::vm_exec
+               |          
+               |--3.03%--<phpun_core::interp::Interp>::vm_run
+               |          |          
+               |           --2.97%--<phpun_core::interp::Interp>::vm_exec_ops
+               |          
+                --2.73%--<phpun_core::interp::Interp>::vm_scope_exec
+                          |          
+                          |--1.49%--<phpun_core::interp::Interp>::run
+                          |          <phpun_core::interp::Interp>::run_source
+                          |          phpun::run_script
+                          |          
+                           --1.25%--<phpun_core::interp::Interp>::vm_exec_ops::{closure#0}
+                                     <phpun_core::interp::Interp>::exec_foreach_with
+                                     <phpun_core::interp::Interp>::vm_exec_ops
+
+     5.53%  main-e202891  libc.so.6         [.] cfree
+            |
+            ---__libc_free (inlined)
+
+     4.93%  main-e202891  libc.so.6         [.] malloc
+            |
+            ---malloc
+               |          
+               |--1.01%--<str>::to_lowercase
+               |          
+                --0.65%--<alloc::raw_vec::RawVecInner>::finish_grow
+
+     3.03%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::gc_cycle_collect_impl
+            |
+            ---<phpun_core::interp::Interp>::gc_cycle_collect_impl
+               <phpun_core::interp::Interp>::gc_maybe_collect
+               <phpun_core::interp::Interp>::destruct_dying_value
+               <phpun_core::interp::Interp>::var_set
+               <phpun_core::interp::Interp>::exec_foreach_with
+               <phpun_core::interp::Interp>::vm_exec_ops
+
+     2.97%  main-e202891  main-e202891      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>
+            |
+            ---<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>
+               |          
+                --1.31%--<phpun_core::interp::Interp>::destruct_cells
+                          |          
+                           --1.07%--<phpun_core::interp::Interp>::destruct_frame_objs
+                                     <phpun_core::interp::Interp>::vm_run
+                                     |          
+                                      --0.71%--<phpun_core::interp::Interp>::invoke_fn_run
+                                                <phpun_core::interp::Interp>::invoke_fn
+                                                <phpun_core::interp::Interp>::invoke_method
+                                                <phpun_core::interp::Interp>::method_invoke_pre
+                                                <phpun_core::interp::Interp>::method_invoke_vis
+                                                <phpun_core::interp::Interp>::new_instance
+                                                <phpun_core::interp::Interp>::eval::{closure#24}
+
+     2.91%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::destruct_cells
+            |
+            ---<phpun_core::interp::Interp>::destruct_cells
+               |          
+               |--2.08%--<phpun_core::interp::Interp>::destruct_frame_objs
+               |          <phpun_core::interp::Interp>::vm_run
+               |          |          
+               |          |--1.37%--<phpun_core::interp::Interp>::invoke_fn_run
+               |          |          <phpun_core::interp::Interp>::invoke_fn
+               |          |          <phpun_core::interp::Interp>::invoke_method
+               |          |          <phpun_core::interp::Interp>::method_invoke_pre
+               |          |          <phpun_core::interp::Interp>::method_invoke_vis
+               |          |          <phpun_core::interp::Interp>::new_instance
+               |          |          <phpun_core::interp::Interp>::eval::{closure#24}
+               |          |          
+               |           --0.71%--<phpun_core::interp::Interp>::vm_exec_ops
+               |                     <phpun_core::interp::Interp>::vm_exec
+               |                     <phpun_core::interp::Interp>::vm_scope_exec
+               |                     <phpun_core::interp::Interp>::vm_exec_ops::{closure#0}
+               |                     <phpun_core::interp::Interp>::exec_foreach_with
+               |          
+                --0.77%--<phpun_core::interp::Interp>::vm_exec_ops
+                          <phpun_core::interp::Interp>::vm_exec
+                          <phpun_core::interp::Interp>::vm_scope_exec
+                          <phpun_core::interp::Interp>::run
+                          <phpun_core::interp::Interp>::run_source
+                          phpun::run_script
+
+     2.56%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::push_handle
+            |
+            ---<phpun_core::interp::Interp>::push_handle
+               <phpun_core::interp::Interp>::alloc_obj
+               <phpun_core::interp::Interp>::instantiate
+               <phpun_core::interp::Interp>::new_instance
+               <phpun_core::interp::Interp>::eval::{closure#24}
+               <phpun_core::interp::Interp>::eval
+
+     2.26%  main-e202891  main-e202891      [.] phpun_core::interp::util::lkey_get::<alloc::rc::Rc<phpun_core::ast::FunctionDecl>, core::hash::BuildHasherDefault<phpun_core::value::FxHasher>, &str>
+            |
+            ---phpun_core::interp::util::lkey_get::<alloc::rc::Rc<phpun_core::ast::FunctionDecl>, core::hash::BuildHasherDefault<phpun_core::value::FxHasher>, &str>
+               |          
+                --2.08%--<phpun_core::interp::Interp>::is_a_str
+                          <phpun_core::interp::Interp>::method_invoke_pre
+                          <phpun_core::interp::Interp>::method_invoke_vis
+                          <phpun_core::interp::Interp>::new_instance
+                          <phpun_core::interp::Interp>::eval::{closure#24}
+                          <phpun_core::interp::Interp>::eval
+
+     2.14%  main-e202891  main-e202891      [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+            |
+            ---<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+               |          
+               |--1.25%--<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&str>
+               |          |          
+               |           --0.59%--<phpun_core::value::PhpObject>::decl_slot
+               |          
+                --0.89%--<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>
+                          |          
+                           --0.59%--<phpun_core::interp::Interp>::destruct_cells
+                                     <phpun_core::interp::Interp>::destruct_frame_objs
+                                     <phpun_core::interp::Interp>::vm_run
+
+     2.14%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::mem_realloc::<core::cell::RefCell<phpun_core::value::PhpArray>>::{closure#4}
+            |
+            ---<phpun_core::interp::Interp>::mem_realloc::<core::cell::RefCell<phpun_core::value::PhpArray>>::{closure#4}
+               |          
+                --1.72%--<phpun_core::interp::Interp>::mem_sweep
+                          <phpun_core::interp::Interp>::mem_commit
+                          |          
+                          |--1.19%--<phpun_core::interp::Interp>::mem_track::<core::cell::RefCell<phpun_core::value::PhpObject>>
+                          |          <phpun_core::interp::Interp>::store_prop
+                          |          <phpun_core::interp::Interp>::vm_run
+                          |          <phpun_core::interp::Interp>::invoke_fn_run
+                          |          <phpun_core::interp::Interp>::invoke_fn
+                          |          <phpun_core::interp::Interp>::invoke_method
+                          |          <phpun_core::interp::Interp>::method_invoke_pre
+                          |          <phpun_core::interp::Interp>::method_invoke_vis
+                          |          <phpun_core::interp::Interp>::new_instance
+                          |          
+                           --0.54%--<phpun_core::interp::Interp>::mem_track::<phpun_core::interp::VmSite>
+                                     <phpun_core::interp::Interp>::vm_site
+                                     <phpun_core::interp::Interp>::vm_exec_ops
+                                     <phpun_core::interp::Interp>::vm_exec
+                                     <phpun_core::interp::Interp>::vm_run
+                                     <phpun_core::interp::Interp>::vm_exec_ops
+
+     2.14%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::vm_run
+            |
+            ---<phpun_core::interp::Interp>::vm_run
+               |          
+               |--1.55%--<phpun_core::interp::Interp>::invoke_fn_run
+               |          <phpun_core::interp::Interp>::invoke_fn
+               |          <phpun_core::interp::Interp>::invoke_method
+               |          <phpun_core::interp::Interp>::method_invoke_pre
+               |          <phpun_core::interp::Interp>::method_invoke_vis
+               |          <phpun_core::interp::Interp>::new_instance
+               |          <phpun_core::interp::Interp>::eval::{closure#24}
+               |          <phpun_core::interp::Interp>::eval
+               |          
+                --0.59%--<phpun_core::interp::Interp>::vm_exec_ops
+                          <phpun_core::interp::Interp>::vm_exec
+                          <phpun_core::interp::Interp>::vm_scope_exec
+                          <phpun_core::interp::Interp>::vm_exec_ops::{closure#0}
+                          <phpun_core::interp::Interp>::exec_foreach_with
+
+     2.14%  main-e202891  main-e202891      [.] <str>::to_lowercase
+            |
+            ---<str>::to_lowercase
+               |          
+                --0.65%--<phpun_core::interp::Interp>::is_a
+
+     1.90%  main-e202891  main-e202891      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&str>
+            |
+            ---<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&str>
+               |          
+               |--0.95%--<phpun_core::value::PhpObject>::decl_slot
+               |          
+                --0.65%--<phpun_core::interp::Interp>::mem_check
+                          <phpun_core::interp::Interp>::mem_commit
+                          |          
+                           --0.59%--<phpun_core::interp::Interp>::mem_track::<core::cell::RefCell<phpun_core::value::PhpObject>>
+
+     1.72%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::gc_note_dying
+            |
+            ---<phpun_core::interp::Interp>::gc_note_dying
+               |          
+                --1.43%--<phpun_core::interp::Interp>::destruct_dying_value
+                          |          
+                          |--0.89%--<phpun_core::interp::Interp>::cell_store
+                          |          <phpun_core::interp::Interp>::vm_exec_ops
+                          |          <phpun_core::interp::Interp>::vm_exec
+                          |          <phpun_core::interp::Interp>::vm_scope_exec
+                          |          <phpun_core::interp::Interp>::run
+                          |          <phpun_core::interp::Interp>::run_source
+                          |          phpun::run_script
+                          |          
+                           --0.54%--<phpun_core::interp::Interp>::var_set
+                                     <phpun_core::interp::Interp>::exec_foreach_with
+                                     <phpun_core::interp::Interp>::vm_exec_ops
+                                     <phpun_core::interp::Interp>::vm_exec
+                                     <phpun_core::interp::Interp>::vm_scope_exec
+                                     <phpun_core::interp::Interp>::run
+
+     1.66%  main-e202891  main-e202891      [.] <phpun_core::value::PhpClass>::name
+            |
+            ---<phpun_core::value::PhpClass>::name
+               |          
+                --0.83%--<phpun_core::interp::Interp>::method_invoke_pre
+                          <phpun_core::interp::Interp>::method_invoke_vis
+                          <phpun_core::interp::Interp>::new_instance
+                          <phpun_core::interp::Interp>::eval::{closure#24}
+                          <phpun_core::interp::Interp>::eval
+
+     1.55%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::global_var_cell
+            |
+            ---<phpun_core::interp::Interp>::global_var_cell
+               |          
+               |--0.71%--<phpun_core::interp::Interp>::dim_detached
+               |          |          
+               |           --0.59%--<phpun_core::interp::Interp>::assign_inner
+               |                     <phpun_core::interp::Interp>::eval
+               |          
+                --0.54%--<phpun_core::interp::Interp>::vm_refresh
+                          <phpun_core::interp::Interp>::vm_exec_ops
+                          <phpun_core::interp::Interp>::vm_exec
+                          <phpun_core::interp::Interp>::vm_scope_exec
+
+     1.31%  main-e202891  libc.so.6         [.] 0x00000000001724da
+            |
+            ---0x7f053dd8e4da
+
+     1.19%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::vm_materialize
+            |
+            ---<phpun_core::interp::Interp>::vm_materialize
+               |          
+                --0.54%--<phpun_core::interp::Interp>::vm_exec_ops
+                          <phpun_core::interp::Interp>::vm_exec
+                          <phpun_core::interp::Interp>::vm_scope_exec
+
+     1.13%  main-e202891  libc.so.6         [.] 0x000000000009ede1
+            |
+            ---0x7f053dcbade1
+               |          
+                --1.01%--0x7f053dcbde39
+                          malloc
+
+     1.07%  main-e202891  main-e202891      [.] <phpun_core::ast::PropDecl as core::clone::Clone>::clone
+            |
+            ---<phpun_core::ast::PropDecl as core::clone::Clone>::clone
+               <phpun_core::interp::Interp>::decl_prop
+               <phpun_core::interp::Interp>::store_prop
+               <phpun_core::interp::Interp>::vm_run
+               <phpun_core::interp::Interp>::invoke_fn_run
+               <phpun_core::interp::Interp>::invoke_fn
+               <phpun_core::interp::Interp>::invoke_method
+               <phpun_core::interp::Interp>::method_invoke_pre
+               <phpun_core::interp::Interp>::method_invoke_vis
+
+     1.01%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::exec_foreach_with
+            |
+            ---<phpun_core::interp::Interp>::exec_foreach_with
+               <phpun_core::interp::Interp>::vm_exec_ops
+               <phpun_core::interp::Interp>::vm_exec
+               <phpun_core::interp::Interp>::vm_scope_exec
+               <phpun_core::interp::Interp>::run
+               <phpun_core::interp::Interp>::run_source
+               phpun::run_script
+
+     1.01%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::vm_refresh
+            |
+            ---<phpun_core::interp::Interp>::vm_refresh
+               |          
+                --0.65%--<phpun_core::interp::Interp>::vm_exec_ops
+                          <phpun_core::interp::Interp>::vm_exec
+                          <phpun_core::interp::Interp>::vm_scope_exec
+                          |          
+                           --0.54%--<phpun_core::interp::Interp>::run
+                                     <phpun_core::interp::Interp>::run_source
+                                     phpun::run_script
+
+     0.95%  main-e202891  libc.so.6         [.] 0x00000000001724e1
+            |
+            ---0x7f053dd8e4e1
+
+     0.89%  main-e202891  libc.so.6         [.] 0x00000000001724e7
+            |
+            ---0x7f053dd8e4e7
+
+     0.89%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::assign_inner
+            |
+            ---<phpun_core::interp::Interp>::assign_inner
+               <phpun_core::interp::Interp>::eval
+
+     0.83%  main-e202891  libc.so.6         [.] 0x000000000009edc3
+            |
+            ---0x7f053dcbadc3
+               |          
+                --0.77%--0x7f053dcbde39
+                          malloc
+
+     0.83%  main-e202891  libc.so.6         [.] 0x000000000009eee6
+            |
+            ---0x7f053dcbaee6
+               |          
+                --0.71%--0x7f053dcbc23f
+                          __libc_free (inlined)
+                          |          
+                           --0.54%--core::ptr::drop_glue::<phpun_core::value::PhpArray>
+                                     <alloc::rc::Rc<core::cell::RefCell<phpun_core::value::PhpArray>>>::drop_slow
+                                     <phpun_core::interp::Interp>::cell_store
+                                     <phpun_core::interp::Interp>::vm_exec_ops
+                                     <phpun_core::interp::Interp>::vm_exec
+                                     <phpun_core::interp::Interp>::vm_scope_exec
+                                     <phpun_core::interp::Interp>::run
+                                     <phpun_core::interp::Interp>::run_source
+                                     phpun::run_script
+
+     0.83%  main-e202891  libc.so.6         [.] 0x00000000000a1398
+            |
+            ---0x7f053dcbd398
+               malloc
+
+     0.83%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::binary_operands
+            |
+            ---<phpun_core::interp::Interp>::binary_operands
+               <phpun_core::interp::Interp>::binary
+               |          
+                --0.59%--<phpun_core::interp::Interp>::arg_cells
+                          <phpun_core::interp::Interp>::eval::{closure#24}
+                          <phpun_core::interp::Interp>::eval
+                          <phpun_core::interp::Interp>::assign_inner
+
+     0.83%  main-e202891  main-e202891      [.] <phpun_core::value::PhpObject>::live_props
+            |
+            ---<phpun_core::value::PhpObject>::live_props
+               <phpun_core::interp::Interp>::gc_scan_obj_fields
+               <phpun_core::interp::Interp>::gc_cycle_collect_impl
+               <phpun_core::interp::Interp>::gc_maybe_collect
+               <phpun_core::interp::Interp>::destruct_dying_value
+               <phpun_core::interp::Interp>::var_set
+               <phpun_core::interp::Interp>::exec_foreach_with
+               <phpun_core::interp::Interp>::vm_exec_ops
+
+     0.77%  main-e202891  main-e202891      [.] <hashbrown::map::HashMap<alloc::string::String, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>, core::hash::BuildHasherDefault<phpun_core::value::FxHasher>>>::insert
+            |
+            ---<hashbrown::map::HashMap<alloc::string::String, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>, core::hash::BuildHasherDefault<phpun_core::value::FxHasher>>>::insert
+
+     0.77%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::eval
+            |
+            ---<phpun_core::interp::Interp>::eval
+
+     0.77%  main-e202891  main-e202891      [.] core::ptr::drop_glue::<phpun_core::value::PhpObject>
+            |
+            ---core::ptr::drop_glue::<phpun_core::value::PhpObject>
+               <alloc::rc::Rc<core::cell::RefCell<phpun_core::value::PhpObject>>>::drop_slow
+               <alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>>::drop_slow
+               core::ptr::drop_glue::<phpun_core::value::PhpArray>
+               <alloc::rc::Rc<core::cell::RefCell<phpun_core::value::PhpArray>>>::drop_slow
+               <phpun_core::interp::Interp>::cell_store
+               <phpun_core::interp::Interp>::vm_exec_ops
+               <phpun_core::interp::Interp>::vm_exec
+               <phpun_core::interp::Interp>::vm_scope_exec
+               <phpun_core::interp::Interp>::run
+               <phpun_core::interp::Interp>::run_source
+               phpun::run_script
+
+     0.71%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::call_site_frame
+            |
+            ---<phpun_core::interp::Interp>::call_site_frame
+               <phpun_core::interp::Interp>::vm_run
+
+     0.65%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::store_prop
+            |
+            ---<phpun_core::interp::Interp>::store_prop
+               <phpun_core::interp::Interp>::vm_run
+               <phpun_core::interp::Interp>::invoke_fn_run
+               <phpun_core::interp::Interp>::invoke_fn
+               <phpun_core::interp::Interp>::invoke_method
+               <phpun_core::interp::Interp>::method_invoke_pre
+               <phpun_core::interp::Interp>::method_invoke_vis
+               <phpun_core::interp::Interp>::new_instance
+
+     0.65%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::vm_site
+            |
+            ---<phpun_core::interp::Interp>::vm_site
+
+     0.59%  main-e202891  libc.so.6         [.] 0x000000000017bac0
+            |
+            ---0x7f053dd97ac0
+
+     0.59%  main-e202891  libc.so.6         [.] 0x000000000017bacf
+            |
+            ---0x7f053dd97acf
+
+     0.59%  main-e202891  main-e202891      [.] <core::iter::adapters::map::Map<core::iter::adapters::filter::Filter<core::slice::iter::Iter<(phpun_core::value::ArrKey, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>)>, <phpun_core::value::PhpArray>::iter::{closure#0}>, <phpun_core::interp::Interp>::exec_foreach_with::{closure#3}> as core::iter::traits::iterator::Iterator>::next
+            |
+            ---<core::iter::adapters::map::Map<core::iter::adapters::filter::Filter<core::slice::iter::Iter<(phpun_core::value::ArrKey, alloc::rc::Rc<core::cell::RefCell<phpun_core::value::Value>>)>, <phpun_core::value::PhpArray>::iter::{closure#0}>, <phpun_core::interp::Interp>::exec_foreach_with::{closure#3}> as core::iter::traits::iterator::Iterator>::next
+               <phpun_core::interp::Interp>::exec_foreach_with
+               <phpun_core::interp::Interp>::vm_exec_ops
+               <phpun_core::interp::Interp>::vm_exec
+               <phpun_core::interp::Interp>::vm_scope_exec
+               <phpun_core::interp::Interp>::run
+               <phpun_core::interp::Interp>::run_source
+
+     0.59%  main-e202891  main-e202891      [.] <phpun_core::value::PhpObject>::prop_get
+            |
+            ---<phpun_core::value::PhpObject>::prop_get
+               |          
+                --0.54%--<phpun_core::value::PhpObject>::live_props
+                          <phpun_core::interp::Interp>::gc_scan_obj_fields
+                          <phpun_core::interp::Interp>::gc_cycle_collect_impl
+                          <phpun_core::interp::Interp>::gc_maybe_collect
+                          <phpun_core::interp::Interp>::destruct_dying_value
+                          <phpun_core::interp::Interp>::var_set
+                          <phpun_core::interp::Interp>::exec_foreach_with
+                          <phpun_core::interp::Interp>::vm_exec_ops
+
+     0.59%  main-e202891  main-e202891      [.] alloc::fmt::format::format_inner
+            |
+            ---alloc::fmt::format::format_inner
+
+     0.54%  main-e202891  libc.so.6         [.] 0x000000000009ef43
+            |
+            ---0x7f053dcbaf43
+
+     0.54%  main-e202891  libc.so.6         [.] 0x000000000017bbcd
+            |
+            ---0x7f053dd97bcd
+
+     0.54%  main-e202891  libc.so.6         [.] 0x000000000017bc2f
+            |
+            ---0x7f053dd97c2f
+               <phpun_core::interp::Interp>::decl_prop
+               <phpun_core::interp::Interp>::store_prop
+               <phpun_core::interp::Interp>::vm_run
+               <phpun_core::interp::Interp>::invoke_fn_run
+               <phpun_core::interp::Interp>::invoke_fn
+               <phpun_core::interp::Interp>::invoke_method
+               <phpun_core::interp::Interp>::method_invoke_pre
+               <phpun_core::interp::Interp>::method_invoke_vis
+               <phpun_core::interp::Interp>::new_instance
+
+     0.54%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::is_a
+            |
+            ---<phpun_core::interp::Interp>::is_a
+
+     0.54%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::method_invoke_pre
+            |
+            ---<phpun_core::interp::Interp>::method_invoke_pre
+               <phpun_core::interp::Interp>::method_invoke_vis
+               <phpun_core::interp::Interp>::new_instance
+               <phpun_core::interp::Interp>::eval::{closure#24}
+               <phpun_core::interp::Interp>::eval
+
+     0.54%  main-e202891  main-e202891      [.] <phpun_core::interp::Interp>::scope_private_prop
+            |
+            ---<phpun_core::interp::Interp>::scope_private_prop
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

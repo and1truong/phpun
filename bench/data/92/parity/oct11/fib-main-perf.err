@@ -1,0 +1,2 @@
+[ perf record: Woken up 45 times to write data ]
+[ perf record: Captured and wrote 11.110 MB /workspace/parity92/oct11/fib-main.data (1379 samples) ]
