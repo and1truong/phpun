@@ -3232,6 +3232,27 @@ impl<'a> Interp<'a> {
     /// to drop runs its __destruct now — Zend's behavior at function
     /// exit and exception unwind (bug52361).
     fn destruct_frame_objs(&mut self, f: &Frame) -> Result<(), PhpError> {
+        // A normal method keeps one receiver handle plus its $this cell. If
+        // another owner keeps it live and no other object is being dropped,
+        // this pass cannot run a destructor. Aliases/object args keep the full
+        // cell-counting path; do not assume every method receiver is borrowed.
+        if let Some(receiver) = &f.this_obj {
+            let this_owner = f.vars.get("this").is_some_and(
+                |c| matches!(&*c.borrow(), Value::Object(o) if Rc::ptr_eq(o, receiver)),
+            );
+            if Rc::strong_count(receiver) > 1 + usize::from(this_owner)
+                && f.vars.iter().all(|(name, c)| {
+                    (name == "this" && this_owner) || !matches!(&*c.borrow(), Value::Object(_))
+                })
+                && !f
+                    .args
+                    .iter()
+                    .any(|c| matches!(&*c.borrow(), Value::Object(_)))
+                && !f.value_args.iter().any(|v| matches!(v, Value::Object(_)))
+            {
+                return Ok(());
+            }
+        }
         // The pass only acts on cells holding objects — skip the
         // collect entirely for object-free frames (most calls).
         let has_obj = f

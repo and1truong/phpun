@@ -1,0 +1,9 @@
+{
+  "runtime": "75e78c55e4eee0da2113bebad435e4a9f81d7f8a",
+  "hash": "e7df45183c612b5171ab1944a33d38c5bdbcb14fa6ddf23810016f25d2ff4eb4",
+  "parent": "9d1544fe3ba65426c9ea7efc307c884380289a14",
+  "build": "Rust1.99 release LTO/codegen-units1, PHP8.5.11 native -n",
+  "gate": "workspace7core/22runtime/19format tests,fm/clippy;23 VM/arena/receiver script+19 workload PHP exit/stdout/stderr gates;measure/http-load/VM-profile checks pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout; parent5crash8timeout, only range_bug71132 resource transition; existing range pathology unchanged.",
+  "runner_correction": "Initial batch accidentally used SUT for SKIPIF rather than native PHP; full original map retained as receiver-phpt-skipif-sut.json.gz. Eight affected statuses rechecked at30s with PHP reference, then all3406 rerun with correct --sut/--php flags. Comparable map receiver-phpt.json.gz; no compatibility gain claim from skipped cases.",
+  "allocation": "physical objects20x5000 requested allocations14463259\u219213463260(-6.9%),requested bytes465086016\u2192388949018(-16.4%); profiler timing excluded.100000obj_new unchanged."
+}

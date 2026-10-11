@@ -3452,6 +3452,42 @@ DivisionByZeroError:Division by zero
     }
 
     #[test]
+    fn borrowed_receiver_teardown_keeps_argument_and_exception_owners() {
+        let mut it = Interp::new("receiver.php");
+        let result = it.run_source(
+            r#"<?php
+class TeardownItem { function __destruct() { echo "item\n"; } }
+class TeardownHost {
+ public int $x = 4;
+ function run(int $n): int { return $this->x + $n; }
+ function arg(TeardownItem $item): int { return $this->x; }
+ function __destruct() { echo "host\n"; }
+}
+function invoke(TeardownHost $o, int $n): int { return $o->run($n); }
+$h = new TeardownHost; $wh = WeakReference::create($h);
+echo invoke($h, 2), "\n";
+var_dump($wh->get() !== null);
+$i = new TeardownItem; $wi = WeakReference::create($i);
+echo $h->arg($i), "\n";
+unset($i); var_dump($wi->get());
+try { invoke($h, 'bad'); } catch (TypeError $e) { echo get_class($e), "\n"; }
+echo $h->run(n: 3), "\n";
+unset($e); unset($h); var_dump($wh->get());
+"#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.err_buf, "");
+        assert_eq!(
+            it.out,
+            b"6\nbool(true)\n4\nitem\nNULL\nTypeError\n7\nhost\nNULL\n"
+        );
+        assert!(it
+            .vm_frame_pool
+            .iter()
+            .all(|frame| frame.this_obj.is_none() && frame.vars.is_empty()));
+    }
+
+    #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
         let mut it = Interp::new("arena.php");
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
