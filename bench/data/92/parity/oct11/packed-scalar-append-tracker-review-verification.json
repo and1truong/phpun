@@ -1,0 +1,26 @@
+{
+  "binary_sha256": "8fa0879fbdb729960abc6894f005f8e63ce657b412639dcb7a9eb92025aaba79",
+  "source": "ef9d86349218323748f20faf36ff8d6e2c18fe32",
+  "parent": "borrowed-new-context",
+  "summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 8,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ]
+}

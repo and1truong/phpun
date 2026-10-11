@@ -3500,3 +3500,41 @@ Raw/source/hashes in bench/data/92/parity/oct11/packed-scalar-append-guard-first
 Review PRRT_kwDOU4oR3M6rRBw- identified missing table mem_realloc on the scalar root append path. ONE existing packed scalar check now asserts the tracked ht_req for both the original dense table and a CoW-separated table. The assertion fails before the fix (a tracked0 versus expected136), then passes with canonical realloc after dropping table/container borrows. Workspace/fmt/clippy pass; fresh release/native/memory/fullPHPT and speed reruns pending. Earlier timings/physical results are PRE-REVIEW historical data, not a corrected speed claim.
 
 A separate memory_get_usage delta probe prints PHP1336:2616 versus parent/pre-review1032:2056; that pre-existing calibration gap is explicit and is NOT claimed fixed by restoring this internal tracker. Full raw output remains in the tracker review artifacts.
+
+## #370: perf(storage): retain dense scalar append with canonical table accounting (2026-10-11)
+
+Reuse existing ArrayEntries packed scalar/lazy Cell storage for empty or still-unboxed dense scalar appends (next==length); PhpArray push/set share the same helper and original memory bookkeeping. Root-variable AST append enters only after existing container/detach/read-only/diagnostic checks and no reference binding. Closed scalar and append-key guards run first so graph values retain the original path promptly. No new layout, representation backend, allocator, cache, dependency or unsafe. Review correction restores canonical mem_realloc after dropping container/table borrows, including a fresh CoW table.
+
+Exported Cells, references, graph values, mixed/sparse keys, compound/deferred/detached writes, properties, superglobals and handlers keep the original path. CoW, next-key overflow, logical array footprint, foreach positions and Cell identities stay canonical. Sequential packed integer keys make mem_note_key a no-op; the shared mem_note_append charge remains. ONE existing packed storage check proves activation,CoW,reference export,mixed fallback and native output. The SAME existing packed check asserts actual tracked ht_req on dense and CoW arrays; before correction it failed tracked0 versus expected136.
+
+Runtime 1c7c77691097db04ad35ae82677368f484ccad39; timing source ef9d86349218323748f20faf36ff8d6e2c18fe32; report/integration source ef9d86349218323748f20faf36ff8d6e2c18fe32.
+
+Corrected first31, independent31 target/app repeats, separate negative31, and fresh whole7 PHP/main/parent/candidate rotating profiler-off byte-gated cold CLI samples. Earlier pre-review candidates omitted tracker work and cannot support corrected performance claims. Physical diagnostics separate.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/profile/arrays.php append 100000 | 101.073 | 95.635 | 0.9462 |
+| bench/profile/arrays.php map 50000 | 61.147 | 57.966 | 0.9480 |
+| bench/30-arrays.php | 79.121 | 79.976 | 1.0108 |
+| bench/40-objects.php | 96.727 | 89.294 | 0.9232 |
+| bench/40-objects.php 20 5000 | 370.700 | 369.817 | 0.9976 |
+| bench/60-json.php | 415.362 | 410.364 | 0.9880 |
+| examples/composer/run.php | 8.093 | 8.178 | 1.0105 |
+| bench/app/cli.php 100 20 | 32.943 | 32.574 | 0.9888 |
+
+Before-review first/refined cohorts remain explicitly historical. Corrected frozen build1c7c776/ELF8fa0879f, timing/report integrationef9d863 has an empty production diff. Corrected31append−5.4%,map−5.2%,arrays+1.1%,defaultobjects−7.7%unattributed,longobjects−0.2%flat,JSON−1.2%,Composer+1.0%,app−1.1%. Independent31append−7.0%,map−3.9%,arrays−1.5%,longobjects−0.4%flat,app+0.9%,Composer−7.3%unattributed. Wholegeo2.70985×PHP/main3.93246×PHP,parent−1.64%; strings+3.3%/long+0.5%,DB+1.3%,app+0.9% retained. WholeComposer−13.0% and other unrelated gains are not credited to scalar storage. Separate arraysphysical+4requests/−816996B;objectsrequestsunchanged/84Bdiagnostic delta. Retain small existing-storage change for repeated scalar append/map benefit with restored canonical memory tracking. No overall parity or CPU claim. Native memory_get_usage delta remains PHP1336:2616 versus parent/corrected1032:2056; this pre-existing calibration gap is NOT fixed. Internal tracked-table assertions now pass, and full4MB append OOM remains byte-identical. Isolated negative31: bench/20-strings.php -0.2%, bench/70-db.php +0.5%.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 808127→808127; bytes 49724078→49723994.
+- arrays: requests 616041→616045; bytes 26545106→25728110.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Corrected partial-result4MB native/canonical fatal and densearray4MB append fatal are byte-identical PHP/parent/candidate, including2097160-byte allocation. Memory usage calibration gap remains explicit.
+Corrected all3406 individually compared: only one known range crash→timeout;2731pass599fail25skip38unsupported5crash8timeout. No new fail/pass/skip; partial compatibility, not a suite pass. Previous GC rechecks belonged to the historical pre-review cohort.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 8, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/packed-scalar-append-tracker-review-*.

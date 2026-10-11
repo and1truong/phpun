@@ -1,0 +1,20 @@
+[
+  {
+    "name": "php",
+    "exit": 0,
+    "stdout": "RESULT 1336:2616:64:65\n",
+    "stderr": ""
+  },
+  {
+    "name": "parent",
+    "exit": 0,
+    "stdout": "RESULT 1032:2056:64:65\n",
+    "stderr": ""
+  },
+  {
+    "name": "candidate",
+    "exit": 0,
+    "stdout": "RESULT 1032:2056:64:65\n",
+    "stderr": ""
+  }
+]
