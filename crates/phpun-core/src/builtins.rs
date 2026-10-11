@@ -80,7 +80,14 @@ fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     // ponytail: first-byte filter avoids a full comparison at every byte;
     // repetitive long needles still have O(n*m) cost (future two-way search).
     while at <= last {
-        let p = at + hay[at..=last].iter().position(|b| *b == first)?;
+        let bytes = &hay[at..=last];
+        // SAFETY: memchr reads this nonempty slice and returns null or a
+        // pointer within it; subtraction uses that same live allocation.
+        let found = unsafe { libc::memchr(bytes.as_ptr().cast(), first.into(), bytes.len()) };
+        if found.is_null() {
+            return None;
+        }
+        let p = at + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize };
         if hay[p..].starts_with(needle) {
             return Some(p);
         }
