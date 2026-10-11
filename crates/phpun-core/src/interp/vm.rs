@@ -2507,6 +2507,23 @@ impl<'a> Interp<'a> {
                         Some(cls) => {
                             let cls = cls.clone();
                             let ctor = self.find_method_in(&cls, "__construct");
+                            if ctor
+                                .as_ref()
+                                .is_some_and(|(m, _)| m.decl.params.iter().any(|p| p.by_ref))
+                            {
+                                // A by-ref ctor param needs the
+                                // caller's real cell — `Op::NewCall`
+                                // drains `vs` as values, so route the
+                                // whole `new` through the canonical
+                                // arm which rebuilds arg cells from
+                                // the AST exprs.
+                                self.vm_materialize(comp, slots);
+                                let r = self.eval(fallback);
+                                self.vm_refresh(comp, slots);
+                                vs.push(r?);
+                                pc = *at + 1;
+                                continue;
+                            }
                             ntargets.push((cls, ctor));
                         }
                         None => {
