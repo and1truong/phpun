@@ -491,7 +491,16 @@ fn json_arr(
             a.entries
                 .iter()
                 .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
-                .cloned()
+                .map(|(k, c)| {
+                    // A dead reference must not gain an alias from our
+                    // snapshot: dup_array uses the original strong count.
+                    let c = if it.is_ref_cell(c) && Rc::strong_count(c) == 1 {
+                        cell(c.borrow().clone())
+                    } else {
+                        c.clone()
+                    };
+                    (k.clone(), c)
+                })
                 .collect()
         } else {
             Vec::new()
