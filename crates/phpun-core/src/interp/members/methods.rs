@@ -516,10 +516,10 @@ impl<'a> Interp<'a> {
                             {
                                 let mut so = src.borrow_mut();
                                 let pk = crate::value::int_prop_key(next);
-                                if !so.props.contains_key(&pk) {
+                                if !so.prop_has(&pk) {
                                     so.prop_order.push(pk.clone());
                                 }
-                                so.props.insert(pk, pc);
+                                so.prop_insert(pk, pc);
                             }
                             return Ok(Some(Value::Null));
                         }
@@ -589,7 +589,7 @@ impl<'a> Interp<'a> {
                                 src.borrow().internal,
                                 Some(ObjectInternal::ArrayIter { .. })
                             );
-                        if !spl_src && src.borrow_mut().props.remove(&pname).is_some() {
+                        if !spl_src && src.borrow_mut().prop_take(&pname).is_some() {
                             self.mem_credit(&src, 32);
                         }
                     }
@@ -637,6 +637,7 @@ impl<'a> Interp<'a> {
                         let store = self.ao_store(obj);
                         let it = self.alloc_obj(PhpObject {
                             class: icls,
+                            slots: Vec::new(),
                             props: Default::default(),
                             prop_order: Vec::new(),
                             id: 0,
@@ -1072,6 +1073,7 @@ impl<'a> Interp<'a> {
                         };
                         let it = self.alloc_obj(PhpObject {
                             class: icls,
+                            slots: Vec::new(),
                             props: Default::default(),
                             prop_order: Vec::new(),
                             id: 0,
@@ -1271,7 +1273,7 @@ impl<'a> Interp<'a> {
         let (is_new, exempt, cls_name) = {
             let ob = obj.borrow();
             (
-                !ob.props.contains_key(&kn),
+                !ob.prop_has(&kn),
                 ob.class.name().eq_ignore_ascii_case("stdclass")
                     || ob.class.decl.attrs.iter().any(|a| {
                         a.name
@@ -1293,7 +1295,7 @@ impl<'a> Interp<'a> {
         if !ob.prop_order.contains(&kn) {
             ob.prop_order.push(kn.clone());
         }
-        ob.props.insert(kn, c);
+        ob.prop_insert(kn, c);
         Ok(())
     }
 
@@ -1369,10 +1371,10 @@ impl<'a> Interp<'a> {
         let pc = cell(v);
         {
             let mut so = src.borrow_mut();
-            if !so.props.contains_key(&pname) {
+            if !so.prop_has(&pname) {
                 so.prop_order.push(pname.clone());
             }
-            so.props.insert(pname.clone(), pc.clone());
+            so.prop_insert(pname.clone(), pc.clone());
         }
         // The prop HT is the storage hash — `$ao[5]` writes a STRING
         // "5" slot (zend doesn't symtable-convert object prop names),
@@ -1408,11 +1410,11 @@ impl<'a> Interp<'a> {
             if pname.starts_with('\0') {
                 continue;
             }
-            if let Some(pc) = so.props.get(pname) {
+            if let Some(pc) = so.prop_get(pname) {
                 let k = ArrKey::Str(pname.clone().into());
                 let mut a = arr.borrow_mut();
                 match a.get_cell(&k) {
-                    Some(c) if Rc::ptr_eq(&c, pc) => {}
+                    Some(c) if Rc::ptr_eq(&c, &pc) => {}
                     _ => {
                         a.bind_cell(k, pc.clone());
                     }
@@ -1424,7 +1426,7 @@ impl<'a> Interp<'a> {
             .entries
             .iter()
             .filter_map(|(k, _)| match k {
-                ArrKey::Str(s) if !so.props.contains_key(s.as_ref()) => Some(k.clone()),
+                ArrKey::Str(s) if !so.prop_has(s.as_ref()) => Some(k.clone()),
                 _ => None,
             })
             .collect();
@@ -1607,7 +1609,7 @@ impl<'a> Interp<'a> {
                 // spl storage hash entirely; int-keyed buckets are
                 // real storage slots.
                 .filter(|n| !n.starts_with('\0') || crate::value::int_prop_index(n).is_some())
-                .filter_map(|n| ob.props.get(n).map(|c| (n.clone(), c.clone())))
+                .filter_map(|n| ob.prop_get(n).map(|c| (n.clone(), c.clone())))
                 .collect();
             for (k, c) in &ob.props {
                 if (!k.starts_with('\0') || crate::value::int_prop_index(k).is_some())
@@ -1678,7 +1680,7 @@ impl<'a> Interp<'a> {
         let ob = obj.borrow();
         let mut props = PhpArray::new();
         for name in &ob.prop_order {
-            if let Some(c) = ob.props.get(name) {
+            if let Some(c) = ob.prop_get(name) {
                 props.set(ArrKey::Str(Rc::from(name.as_str())), c.borrow().clone());
             }
         }
@@ -2444,7 +2446,7 @@ impl<'a> Interp<'a> {
             "spldoublylinkedlist" | "splstack" | "splqueue"
         ) {
             let dll_method = |o: &Rc<RefCell<PhpObject>>| -> Vec<Value> {
-                match o.borrow().props.get("\0dll\0items") {
+                match o.borrow().prop_get("\0dll\0items") {
                     Some(c) => match &*c.borrow() {
                         Value::Array(a) => {
                             a.borrow().iter().map(|(_, c)| c.borrow().clone()).collect()
@@ -2470,10 +2472,8 @@ impl<'a> Interp<'a> {
                     for (i, iv) in items.into_iter().enumerate() {
                         a.set(ArrKey::Int(i as i64), iv);
                     }
-                    obj.borrow_mut().props.insert(
-                        "\0dll\0items".into(),
-                        cell(Value::Array(Rc::new(RefCell::new(a)))),
-                    );
+                    obj.borrow_mut()
+                        .prop_insert("\0dll\0items", cell(Value::Array(Rc::new(RefCell::new(a)))));
                     return Ok(Value::Null);
                 }
                 "pop" | "shift" => {
@@ -2491,10 +2491,8 @@ impl<'a> Interp<'a> {
                     for (i, iv) in items.into_iter().enumerate() {
                         a.set(ArrKey::Int(i as i64), iv);
                     }
-                    obj.borrow_mut().props.insert(
-                        "\0dll\0items".into(),
-                        cell(Value::Array(Rc::new(RefCell::new(a)))),
-                    );
+                    obj.borrow_mut()
+                        .prop_insert("\0dll\0items", cell(Value::Array(Rc::new(RefCell::new(a)))));
                     return Ok(r.unwrap_or(Value::Null));
                 }
                 _ => {}
@@ -2537,16 +2535,15 @@ impl<'a> Interp<'a> {
                             3
                         };
                         let mut o = obj.borrow_mut();
-                        o.props.insert("\0tz\0name".into(), cell(Value::str(tz)));
-                        o.props.insert("\0tz\0ty".into(), cell(Value::Int(ty)));
+                        o.prop_insert("\0tz\0name", cell(Value::str(tz)));
+                        o.prop_insert("\0tz\0ty", cell(Value::Int(ty)));
                     }
                     return Ok(Value::Null);
                 }
                 "getlocation" => {
                     let n = obj
                         .borrow()
-                        .props
-                        .get("\0tz\0name")
+                        .prop_get("\0tz\0name")
                         .map(|c| c.borrow().clone())
                         .map(|v| match v {
                             Value::Str(s) => crate::value::lossy(&s).to_string(),
@@ -2558,16 +2555,14 @@ impl<'a> Interp<'a> {
                 "getname" => {
                     return Ok(obj
                         .borrow()
-                        .props
-                        .get("\0tz\0name")
+                        .prop_get("\0tz\0name")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null));
                 }
                 "getoffset" => {
                     let name = obj
                         .borrow()
-                        .props
-                        .get("\0tz\0name")
+                        .prop_get("\0tz\0name")
                         .map(|c| c.borrow().clone())
                         .map(|v| match v {
                             Value::Str(s) => crate::value::lossy(&s).to_string(),
@@ -2580,8 +2575,7 @@ impl<'a> Interp<'a> {
                         .and_then(|v| match v {
                             Value::Object(o) => match o
                                 .borrow()
-                                .props
-                                .get("\0dt\0ts")
+                                .prop_get("\0dt\0ts")
                                 .map(|c| c.borrow().clone())
                                 .unwrap_or(Value::Int(0))
                             {
@@ -2607,8 +2601,7 @@ impl<'a> Interp<'a> {
             let dt_ts = |o: &Rc<RefCell<PhpObject>>| -> i64 {
                 match o
                     .borrow()
-                    .props
-                    .get("\0dt\0ts")
+                    .prop_get("\0dt\0ts")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Int(0))
                 {
@@ -2619,8 +2612,7 @@ impl<'a> Interp<'a> {
             let dt_off = |o: &Rc<RefCell<PhpObject>>| -> i64 {
                 match o
                     .borrow()
-                    .props
-                    .get("\0dt\0off")
+                    .prop_get("\0dt\0off")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Int(0))
                 {
@@ -2691,8 +2683,7 @@ impl<'a> Interp<'a> {
                             Value::Object(o) => {
                                 let b = o.borrow();
                                 Some(
-                                    b.props
-                                        .get("\0tz\0name")
+                                    b.prop_get("\0tz\0name")
                                         .map(|c| c.borrow().clone())
                                         .and_then(|v| match v {
                                             Value::Str(s) => {
@@ -2782,7 +2773,7 @@ impl<'a> Interp<'a> {
                             ("\0dt\0us", Value::Int(us)),
                             ("\0dt\0tz", Value::str(tz)),
                         ] {
-                            ob.props.insert(k.into(), cell(v));
+                            ob.prop_insert(k, cell(v));
                         }
                     }
                     return Ok(Value::Null);
@@ -2804,8 +2795,7 @@ impl<'a> Interp<'a> {
                     let (e_name, t_name) = {
                         let ob = obj.borrow();
                         let name = ob
-                            .props
-                            .get("\0dt\0tz")
+                            .prop_get("\0dt\0tz")
                             .map(|c| c.borrow().clone())
                             .and_then(|v| match v {
                                 Value::Str(b) => Some(crate::value::lossy(&b).to_string()),
@@ -2813,8 +2803,7 @@ impl<'a> Interp<'a> {
                             })
                             .unwrap_or_else(|| "UTC".to_string());
                         let ty = match ob
-                            .props
-                            .get("\0dt\0tzty")
+                            .prop_get("\0dt\0tzty")
                             .map(|c| c.borrow().clone())
                             .unwrap_or(Value::Int(3))
                         {
@@ -2837,8 +2826,7 @@ impl<'a> Interp<'a> {
                     };
                     let us = match obj
                         .borrow()
-                        .props
-                        .get("\0dt\0us")
+                        .prop_get("\0dt\0us")
                         .map(|c| c.borrow().clone())
                     {
                         Some(Value::Int(n)) => n,
@@ -2932,8 +2920,7 @@ impl<'a> Interp<'a> {
                             Value::Object(io) => {
                                 let get = |k: &str| match io
                                     .borrow()
-                                    .props
-                                    .get(&format!("\0di\0{}", k))
+                                    .prop_get(&format!("\0di\0{}", k))
                                     .map(|c| c.borrow().clone())
                                     .unwrap_or(Value::Int(0))
                                 {
@@ -3005,8 +2992,7 @@ impl<'a> Interp<'a> {
                     let v = self.dt_store(&obj, day * 86400 + secs.rem_euclid(86400), immutable)?;
                     if let Value::Object(no) = &v {
                         no.borrow_mut()
-                            .props
-                            .insert("\0dt\0us".into(), cell(Value::Int(arg(3))));
+                            .prop_insert("\0dt\0us", cell(Value::Int(arg(3))));
                     }
                     return Ok(v);
                 }
@@ -3046,8 +3032,7 @@ impl<'a> Interp<'a> {
                     if let Some(zo) = tzv {
                         let name = zo
                             .borrow()
-                            .props
-                            .get("\0tz\0name")
+                            .prop_get("\0tz\0name")
                             .map(|c| c.borrow().clone())
                             .and_then(|v| match v {
                                 Value::Str(s) => Some(crate::value::lossy(&s).to_string()),
@@ -3060,10 +3045,10 @@ impl<'a> Interp<'a> {
                         let v = self.dt_store(&obj, dt_ts(&obj), immutable)?;
                         if let Value::Object(no) = &v {
                             let mut nb = no.borrow_mut();
-                            nb.props.insert("\0dt\0off".into(), cell(Value::Int(off)));
-                            nb.props.insert("\0dt\0tz".into(), cell(Value::str(&name)));
-                            nb.props.insert(
-                                "\0dt\0tzty".into(),
+                            nb.prop_insert("\0dt\0off", cell(Value::Int(off)));
+                            nb.prop_insert("\0dt\0tz", cell(Value::str(&name)));
+                            nb.prop_insert(
+                                "\0dt\0tzty",
                                 cell(Value::Int(
                                     if name.starts_with('+') || name.starts_with('-') {
                                         1
@@ -3115,7 +3100,7 @@ impl<'a> Interp<'a> {
                         ("i", mi),
                         ("s", se),
                     ] {
-                        ob.props.insert(k.into(), cell(Value::Int(v)));
+                        ob.prop_insert(k, cell(Value::Int(v)));
                         ob.prop_order.push(k.into());
                     }
                     for (k, v) in [
@@ -3124,16 +3109,12 @@ impl<'a> Interp<'a> {
                         ("days", Value::Bool(false)),
                         ("from_string", Value::Bool(false)),
                     ] {
-                        ob.props.insert(k.into(), cell(v));
+                        ob.prop_insert(k, cell(v));
                         ob.prop_order.push(k.into());
                     }
-                    ob.props
-                        .insert("\0di\0months".into(), cell(Value::Int(y * 12 + mo)));
-                    ob.props.insert("\0di\0days".into(), cell(Value::Int(d)));
-                    ob.props.insert(
-                        "\0di\0secs".into(),
-                        cell(Value::Int(h * 3600 + mi * 60 + se)),
-                    );
+                    ob.prop_insert("\0di\0months", cell(Value::Int(y * 12 + mo)));
+                    ob.prop_insert("\0di\0days", cell(Value::Int(d)));
+                    ob.prop_insert("\0di\0secs", cell(Value::Int(h * 3600 + mi * 60 + se)));
                     return Ok(Value::Null);
                 }
                 None => {
@@ -3476,6 +3457,7 @@ impl<'a> Interp<'a> {
         props.insert("\0di\0secs".into(), cell(Value::Int(sc)));
         Value::Object(self.alloc_obj(PhpObject {
             class: dc,
+            slots: Vec::new(),
             props,
             prop_order: order,
             id: 0,
@@ -3497,14 +3479,12 @@ impl<'a> Interp<'a> {
             let nv = self.clone_object(obj)?;
             if let Value::Object(no) = &nv {
                 no.borrow_mut()
-                    .props
-                    .insert("\0dt\0ts".into(), cell(Value::Int(ts)));
+                    .prop_insert("\0dt\0ts", cell(Value::Int(ts)));
             }
             Ok(nv)
         } else {
             obj.borrow_mut()
-                .props
-                .insert("\0dt\0ts".into(), cell(Value::Int(ts)));
+                .prop_insert("\0dt\0ts", cell(Value::Int(ts)));
             Ok(Value::Object(obj.clone()))
         }
     }
@@ -3627,14 +3607,12 @@ impl<'a> Interp<'a> {
         let lname = name.to_lowercase();
         Ok(match lname.as_str() {
             "getmessage" => Some(
-                ob.props
-                    .get("message")
+                ob.prop_get("message")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null),
             ),
             "getcode" => Some(
-                ob.props
-                    .get("code")
+                ob.prop_get("code")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Int(0)),
             ),
@@ -3703,8 +3681,7 @@ impl<'a> Interp<'a> {
                     Some(previous.clone().unwrap_or(Value::Null))
                 }
                 _ => Some(
-                    ob.props
-                        .get("previous")
+                    ob.prop_get("previous")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null),
                 ),
@@ -3731,8 +3708,7 @@ impl<'a> Interp<'a> {
                 for (i, m) in chain.iter().rev().enumerate() {
                     let mo = m.borrow();
                     let msg = mo
-                        .props
-                        .get("message")
+                        .prop_get("message")
                         .map(|c| c.borrow().to_php_string())
                         .unwrap_or_default();
                     let (file, line, trace, full) = match &mo.internal {
@@ -3778,8 +3754,7 @@ impl<'a> Interp<'a> {
                 Some(Value::str(out))
             }
             "getseverity" => Some(
-                ob.props
-                    .get("severity")
+                ob.prop_get("severity")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Int(1)),
             ),
@@ -3969,15 +3944,14 @@ impl<'a> Interp<'a> {
                 } else {
                     (1, None, None, bound[2].clone())
                 };
-                ob.props.insert("message".into(), cell(Value::str(msg)));
-                ob.props.insert("code".into(), cell(Value::Int(code)));
+                ob.prop_insert("message", cell(Value::str(msg)));
+                ob.prop_insert("code", cell(Value::Int(code)));
                 if !ob.prop_order.contains(&"message".into()) {
                     ob.prop_order.push("message".into());
                     ob.prop_order.push("code".into());
                 }
                 if ee {
-                    ob.props
-                        .insert("severity".into(), cell(Value::Int(severity)));
+                    ob.prop_insert("severity", cell(Value::Int(severity)));
                     if !ob.prop_order.contains(&"severity".into()) {
                         ob.prop_order.push("severity".into());
                     }
@@ -3988,13 +3962,13 @@ impl<'a> Interp<'a> {
                     // (filename)` branch in zend_exceptions.c), while
                     // no filename leaves the throw-site line alone.
                     if let Some(f) = &filename {
-                        ob.props.insert("file".into(), cell(Value::str(f)));
+                        ob.prop_insert("file", cell(Value::str(f)));
                         if let Some(ObjectInternal::Exception { file, .. }) = &mut ob.internal {
                             *file = f.clone();
                         }
                     }
                     if let Some(l) = line.or(filename.is_some().then_some(0)) {
-                        ob.props.insert("line".into(), cell(Value::Int(l)));
+                        ob.prop_insert("line", cell(Value::Int(l)));
                         if let Some(ObjectInternal::Exception { line: il, .. }) = &mut ob.internal {
                             *il = l as u32;
                         }
@@ -4029,7 +4003,7 @@ impl<'a> Interp<'a> {
                         if !ob.prop_order.contains(&pk) {
                             ob.prop_order.push(pk.clone());
                         }
-                        ob.props.insert(pk, cell(pv));
+                        ob.prop_insert(pk, cell(pv));
                     }
                 }
                 Some(Value::Null)
@@ -4067,7 +4041,7 @@ impl<'a> Interp<'a> {
             if !ob.prop_order.contains(&k) {
                 ob.prop_order.push(k.clone());
             }
-            ob.props.insert(k, cell(v));
+            ob.prop_insert(k, cell(v));
         };
         put(&mut ob, "file".to_string(), Value::str(file));
         put(&mut ob, "line".to_string(), Value::Int(line as i64));
@@ -4096,6 +4070,7 @@ impl<'a> Interp<'a> {
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
+                        prop_slot: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     })
@@ -4325,13 +4300,13 @@ fn parse_date_interval(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
 fn dt_interval_format(obj: &Rc<RefCell<PhpObject>>, fmt: &str) -> String {
     let f = |k: &str| -> Value {
         let o = obj.borrow();
-        if let Some(c) = o.props.get(k) {
+        if let Some(c) = o.prop_get(k) {
             return c.borrow().clone();
         }
         // from_string intervals carry no public fields — derive them
         // from the \0di\0 slots the way zend resolves lazily.
         let slot = |n: &str| -> i64 {
-            match o.props.get(n).map(|c| c.borrow().clone()) {
+            match o.prop_get(n).map(|c| c.borrow().clone()) {
                 Some(Value::Int(v)) => v,
                 _ => 0,
             }

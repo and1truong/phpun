@@ -1588,6 +1588,7 @@ impl<'a> Interp<'a> {
                     parent_rc: RefCell::new(None),
                     throwable: std::cell::Cell::new(None),
                     flat_props: std::cell::OnceCell::new(),
+                    prop_slot: std::cell::OnceCell::new(),
                     statics: std::cell::RefCell::new(std::collections::HashMap::new()),
                     statics_init: std::cell::RefCell::new(false),
                 }));
@@ -2532,8 +2533,7 @@ impl<'a> Interp<'a> {
                     let (cls, msg, file, line, tr) = {
                         let ob = o.borrow();
                         let msg = ob
-                            .props
-                            .get("message")
+                            .prop_get("message")
                             .map(|v| v.borrow().to_php_string())
                             .unwrap_or_default();
                         let (file, line, tr) = match &ob.internal {

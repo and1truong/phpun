@@ -671,6 +671,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(Value::Object(self.alloc_obj(PhpObject {
                         class: oc,
+                        slots: Vec::new(),
                         props,
                         prop_order: order,
                         id: 0,
@@ -724,8 +725,7 @@ impl<'a> Interp<'a> {
                             "\0dt\0tz",
                         ] {
                             let v = sb
-                                .props
-                                .get(k)
+                                .prop_get(k)
                                 .map(|c| c.borrow().clone())
                                 .unwrap_or(Value::Int(0));
                             props.insert(k.to_string(), cell(v));
@@ -734,6 +734,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(Value::Object(self.alloc_obj(PhpObject {
                         class: oc,
+                        slots: Vec::new(),
                         props,
                         prop_order: order,
                         id: 0,
@@ -767,10 +768,8 @@ impl<'a> Interp<'a> {
                         let mut ob = o.borrow_mut();
                         ob.props.retain(|k, _| k.starts_with("\0di\0"));
                         ob.prop_order = vec!["from_string".into(), "date_string".into()];
-                        ob.props
-                            .insert("from_string".into(), cell(Value::Bool(true)));
-                        ob.props
-                            .insert("date_string".into(), cell(Value::str(&spec)));
+                        ob.prop_insert("from_string", cell(Value::Bool(true)));
+                        ob.prop_insert("date_string", cell(Value::str(&spec)));
                     }
                     Ok(v)
                 }

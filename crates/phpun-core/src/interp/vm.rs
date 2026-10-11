@@ -148,12 +148,14 @@ fn coverage_hit(reason: &str) {
 }
 
 /// Cache metadata only; never pin a receiver or a mutable property cell.
-/// ponytail: monomorphic resolved-key cache retains HashMap lookup; slot offsets
-/// need a measured layout change with storage-generation guards.
+/// `slot` is the declared-prop index from `prop_slot` — stable for the
+/// cached class, so the hit skips both key resolution and map probing;
+/// a `None` slot means the resolved key is a dynamic prop (map path).
 struct CachedProp {
     class: Rc<PhpClass>,
     scope: Option<Rc<PhpClass>>,
     key: String,
+    slot: Option<usize>,
     private_candidate: Option<String>,
 }
 
@@ -1894,13 +1896,17 @@ impl<'a> Interp<'a> {
                                 // scope slot that exists in a different instance.
                                 let same_resolution =
                                     hit.private_candidate.as_ref().is_none_or(|private| {
-                                        private == &hit.key || !ob.props.contains_key(private)
+                                        private == &hit.key || !ob.prop_has(private)
                                     });
                                 if Rc::ptr_eq(&hit.class, &ob.class)
                                     && same_scope
                                     && same_resolution
                                 {
-                                    if let Some(c) = ob.props.get(&hit.key) {
+                                    let c = match hit.slot {
+                                        Some(i) => ob.slots.get(i).and_then(|s| s.clone()),
+                                        None => ob.prop_get(&hit.key),
+                                    };
+                                    if let Some(c) = c {
                                         return Some(c.borrow().clone());
                                     }
                                 }
@@ -1910,10 +1916,12 @@ impl<'a> Interp<'a> {
                         if can_cache {
                             let private_candidate =
                                 scope.as_ref().map(|c| format!("\0{}\0{}", c.name(), name));
+                            let slot = o.borrow().decl_slot(&key);
                             *cache.borrow_mut() = Some(CachedProp {
                                 class: o.borrow().class.clone(),
                                 scope,
                                 key,
+                                slot,
                                 private_candidate,
                             });
                         }

@@ -872,7 +872,7 @@ impl<'a> Interp<'a> {
         self.call_value(&Value::str(name), CallArgs::positional(args))
     }
     pub fn prop_set(&mut self, obj: &Rc<RefCell<PhpObject>>, name: &str, v: Value) {
-        obj.borrow_mut().props.insert(name.to_string(), cell(v));
+        obj.borrow_mut().prop_insert(name, cell(v));
     }
     pub fn obj_class_name(&self, o: &Rc<RefCell<PhpObject>>) -> String {
         o.borrow().class.name().to_string()

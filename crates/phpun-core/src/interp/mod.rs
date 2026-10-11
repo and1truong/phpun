@@ -6285,10 +6285,11 @@ impl<'a> Interp<'a> {
         {
             let b = o.borrow();
             for name in &b.prop_order {
-                let Some(c) = b.props.get(name) else {
+                let Some(c) = b.prop_get(name) else {
                     continue;
                 };
-                if let Value::Object(go) = &*c.borrow() {
+                let cb = c.borrow();
+                if let Value::Object(go) = &*cb {
                     if !matches!(
                         &go.borrow().internal,
                         Some(crate::value::ObjectInternal::Generator(_))
@@ -6588,7 +6589,7 @@ impl<'a> Interp<'a> {
             a.borrow_mut().entries.clear();
         }
         for o in &dead {
-            o.borrow_mut().props.clear();
+            o.borrow_mut().prop_clear();
             if let Some(crate::value::ObjectInternal::Generator(st)) = &o.borrow().internal {
                 let mut st = st.borrow_mut();
                 st.items.clear();
@@ -6789,18 +6790,18 @@ impl<'a> Interp<'a> {
             return;
         }
         let ob = o.borrow();
-        for (pname, c) in ob.props.iter() {
+        for (pname, c) in ob.live_props().into_iter() {
             // Private props on classes whose Zend counterpart keeps its
             // storage in pure-C structures (no zval slots): the container
             // in that cell is engine modeling, counted out of the dead
             // set — its contents still scan as real member zvals.
             Self::gc_scan_cell(
-                c,
+                &c,
                 scan,
                 out,
                 depth - 1,
                 visited,
-                Self::gc_internal_prop(pname),
+                Self::gc_internal_prop(&pname),
             );
         }
         // ArrayIter's AoStore is zend's `intern->array` slot — a real
@@ -6939,15 +6940,14 @@ impl<'a> Interp<'a> {
                 } else {
                     let dying = {
                         let b = o.borrow();
-                        self.gc_dying_acquire(b.props.values().map(Rc::as_ptr))
+                        self.gc_dying_acquire(b.live_props().iter().map(|(_, c)| Rc::as_ptr(c)))
                     };
                     for i in 0.. {
                         let slot = {
                             let b = o.borrow();
-                            b.props
-                                .values()
-                                .nth(i)
-                                .map(|c| (Rc::strong_count(c), c.borrow().clone()))
+                            b.live_props()
+                                .get(i)
+                                .map(|(_, c)| (Rc::strong_count(c), c.borrow().clone()))
                         };
                         let Some((cstrong, pv)) = slot else { break };
                         self.gc_note_dying_slot(cstrong, &pv, depth - 1);
@@ -7465,8 +7465,8 @@ impl<'a> Interp<'a> {
         let obj = self.instantiate(&resolved, &[]).unwrap_or(Value::Null);
         if let Value::Object(o) = &obj {
             let mut o = o.borrow_mut();
-            o.props.insert("message".into(), cell(Value::str(msg)));
-            o.props.insert("code".into(), cell(Value::Int(0)));
+            o.prop_insert("message", cell(Value::str(msg)));
+            o.prop_insert("code", cell(Value::Int(0)));
             o.internal = Some(ObjectInternal::Exception {
                 file: self.diag_file(),
                 line: self.send_line.unwrap_or(self.cur_line) as u32,
@@ -7496,9 +7496,7 @@ impl<'a> Interp<'a> {
     pub fn exception_code(&mut self, class: &str, msg: &str, code: i64) -> Value {
         let v = self.exception(class, msg);
         if let Value::Object(o) = &v {
-            o.borrow_mut()
-                .props
-                .insert("code".into(), cell(Value::Int(code)));
+            o.borrow_mut().prop_insert("code", cell(Value::Int(code)));
         }
         v
     }

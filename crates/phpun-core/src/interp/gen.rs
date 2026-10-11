@@ -311,6 +311,7 @@ impl<'a> Interp<'a> {
             .expect("Generator class registered");
         self.alloc_obj(PhpObject {
             class: cls,
+            slots: Vec::new(),
             props: HashMap::new(),
             prop_order: Vec::new(),
             id: 0,
@@ -548,8 +549,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                     let mut ob = obj.borrow_mut();
-                    ob.props
-                        .insert("\0fi\0path".into(), cell(Value::str(&path)));
+                    ob.prop_insert("\0fi\0path", cell(Value::str(&path)));
                     ob.internal = Some(ObjectInternal::DirIter {
                         entries,
                         pos: 0,
@@ -558,8 +558,7 @@ impl<'a> Interp<'a> {
                     });
                 } else {
                     obj.borrow_mut()
-                        .props
-                        .insert("\0fi\0path".into(), cell(Value::str(&path)));
+                        .prop_insert("\0fi\0path", cell(Value::str(&path)));
                 }
                 Ok(Some(Value::Null))
             }
@@ -595,8 +594,7 @@ impl<'a> Interp<'a> {
                         let v = self.instantiate("splfileinfo", &[])?;
                         if let Value::Object(o) = &v {
                             o.borrow_mut()
-                                .props
-                                .insert("\0fi\0path".into(), cell(Value::str(&p)));
+                                .prop_insert("\0fi\0path", cell(Value::str(&p)));
                         }
                         Ok(Some(v))
                     }
@@ -727,8 +725,7 @@ impl<'a> Interp<'a> {
             _ => {
                 let path_v = obj
                     .borrow()
-                    .props
-                    .get("\0fi\0path")
+                    .prop_get("\0fi\0path")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mut path = self.conv_str(&path_v)?.to_string();

@@ -611,7 +611,7 @@ fn json_obj(
                         None => v,
                     }
                 }
-                None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                None => o.borrow().prop_get(&slot).map(|c| c.borrow().clone()),
             };
             if let Some(v) = v {
                 if !first {
@@ -968,6 +968,7 @@ fn stdclass(it: &mut Interp, props: HashMap<String, Cell>, order: Vec<String>) -
     };
     Value::Object(it.alloc_obj(PhpObject {
         class: cls,
+        slots: Vec::new(),
         props,
         prop_order: order,
         id: 0,

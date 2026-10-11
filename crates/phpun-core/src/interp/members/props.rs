@@ -87,12 +87,12 @@ impl<'a> Interp<'a> {
                     pname.to_string()
                 };
                 let mut o = obj.borrow_mut();
-                match o.props.get(&key) {
+                match o.prop_get(&key) {
                     Some(c) => *c.borrow_mut() = v,
                     None => {
                         // Typed-uninit slot: order was reserved at
                         // instantiate, the cell lands now.
-                        o.props.insert(key.clone(), cell(v));
+                        o.prop_insert(key.clone(), cell(v));
                         if !o.prop_order.contains(&key) {
                             o.prop_order.push(key.clone());
                         }
@@ -243,7 +243,7 @@ impl<'a> Interp<'a> {
         pn: &str,
         key: &str,
     ) -> bool {
-        !o.borrow().props.contains_key(key)
+        !o.borrow().prop_has(key)
             && self.decl_prop(o, pn).is_none()
             && !self.obj_is_a(o, "stdclass")
             && !o.borrow().class.decl.attrs.iter().any(|a| {
@@ -661,7 +661,7 @@ impl<'a> Interp<'a> {
             return self.hook_get_typecheck(p, dcls, v);
         }
         if self.backed_for(o, &p.name, hs) {
-            let value = o.borrow().props.get(&p.name).map(|c| c.borrow().clone());
+            let value = o.borrow().prop_get(&p.name).map(|c| c.borrow().clone());
             return match value {
                 Some(v) => Ok(v),
                 None if p.ty.is_some() => self.fail(PhpError::uncaught(
@@ -1164,7 +1164,7 @@ impl<'a> Interp<'a> {
             if !ob.prop_order.contains(&p.name) {
                 ob.prop_order.push(p.name.clone());
             }
-            ob.props.insert(p.name.clone(), cell(v));
+            ob.prop_insert(p.name.clone(), cell(v));
             return Ok(());
         }
         self.fail(PhpError::uncaught(
@@ -1427,7 +1427,7 @@ impl<'a> Interp<'a> {
         // Plain parent prop: get reads the slot, set writes it (and —
         // like a plain assignment — the implicit set returns the value).
         if is_get {
-            if !o.borrow().props.contains_key(pn) {
+            if !o.borrow().prop_has(pn) {
                 // Implicit get reads the shared backing slot; an
                 // uninitialized typed prop is a catchable Error naming
                 // the decl visible from the object (parent_get_plain_…).
@@ -1446,8 +1446,7 @@ impl<'a> Interp<'a> {
                 }
             }
             Ok(o.borrow()
-                .props
-                .get(pn)
+                .prop_get(pn)
                 .map(|c| c.borrow().clone())
                 .unwrap_or(Value::Null))
         } else {
@@ -1456,7 +1455,7 @@ impl<'a> Interp<'a> {
             if !ob.prop_order.iter().any(|k| k == pn) {
                 ob.prop_order.push(pn.to_string());
             }
-            ob.props.insert(pn.to_string(), cell(v.clone()));
+            ob.prop_insert(pn, cell(v.clone()));
             Ok(v)
         }
     }
@@ -1603,7 +1602,7 @@ impl<'a> Interp<'a> {
         if !self.prop_visible(&cls, pn) {
             return None;
         }
-        let value = o.borrow().props.get(&k)?.borrow().clone();
+        let value = o.borrow().prop_get(&k)?.borrow().clone();
         Some((value, k))
     }
 
@@ -1885,7 +1884,7 @@ impl<'a> Interp<'a> {
                             } else {
                                 pd.name.clone()
                             };
-                            let held = o.borrow().props.get(&dk).cloned();
+                            let held = o.borrow().prop_get(&dk);
                             return match held {
                                 Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
                                     Ok(cell(c.borrow().clone()))
@@ -1917,7 +1916,7 @@ impl<'a> Interp<'a> {
                                 } else {
                                     pd.name.clone()
                                 };
-                                let held = o.borrow().props.get(&dk).cloned();
+                                let held = o.borrow().prop_get(&dk);
                                 return match held {
                                     Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
                                         Ok(cell(c.borrow().clone()))
@@ -1993,7 +1992,7 @@ impl<'a> Interp<'a> {
                             // Nullable uninit slots byref-init to null.
                             let nc = cell(Value::Null);
                             self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
-                            o.borrow_mut().props.insert(pn.clone(), nc);
+                            o.borrow_mut().prop_insert(pn.clone(), nc);
                         }
                     }
                 }
@@ -2063,7 +2062,7 @@ impl<'a> Interp<'a> {
                 }
                 let undeclared = self.decl_prop(&o, &pn).is_none();
                 let mut ob = o.borrow_mut();
-                if !ob.props.contains_key(&key) {
+                if !ob.prop_has(&key) {
                     if !ob.prop_order.contains(&key) {
                         ob.prop_order.push(key.clone());
                     }
@@ -2080,9 +2079,9 @@ impl<'a> Interp<'a> {
                             pn.clone(),
                         ));
                     }
-                    ob.props.insert(key.clone(), nc);
+                    ob.prop_insert(key.clone(), nc);
                 }
-                let slot = ob.props.get(&key).unwrap().clone();
+                let slot = ob.prop_get(&key).unwrap().clone();
                 drop(ob);
                 if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     if let Some(tys) = &pd.ty {
@@ -2133,11 +2132,11 @@ impl<'a> Interp<'a> {
         });
         if let Some(dc) = dc {
             let k = format!("\0{}\0{}", dc, pn);
-            if o.borrow().props.contains_key(&k) {
+            if o.borrow().prop_has(&k) {
                 return Some(k);
             }
         }
-        if o.borrow().props.contains_key(pn) {
+        if o.borrow().prop_has(pn) {
             return Some(pn.to_string());
         }
         None
@@ -2184,7 +2183,7 @@ impl<'a> Interp<'a> {
                         } else {
                             pd.name.clone()
                         };
-                        if pd.readonly && o.borrow().props.contains_key(&dk) {
+                        if pd.readonly && o.borrow().prop_has(&dk) {
                             return self.fail(PhpError::uncaught(
                                 "Error",
                                 format!(
@@ -2245,7 +2244,7 @@ impl<'a> Interp<'a> {
                 }
                 if let Some(k) = self.obj_prop_key(&o, &pn).filter(|_| hidden.is_none()) {
                     let mut ob = o.borrow_mut();
-                    let prune = if let Some(c) = ob.props.remove(&k) {
+                    let prune = if let Some(c) = ob.prop_take(&k) {
                         // unset() severs the typed slot: refs bound to it
                         // become plain variables again (typed_properties_090).
                         let ptr = Rc::as_ptr(&c) as usize;

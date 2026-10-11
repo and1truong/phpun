@@ -410,6 +410,7 @@ impl<'a> Interp<'a> {
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
+                        prop_slot: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     }),
@@ -3115,7 +3116,7 @@ impl<'a> Interp<'a> {
         let o = self.instantiate(cls, &[])?;
         if let Value::Object(h) = &o {
             for (k, v) in props {
-                h.borrow_mut().props.insert(k, cell(v));
+                h.borrow_mut().prop_insert(k, cell(v));
             }
         }
         self.enum_cases.insert(key, o.clone());
@@ -3618,7 +3619,7 @@ impl<'a> Interp<'a> {
         // default_properties_table (~56B struct + 16B/prop slot) — the
         // bulk of `while(true) { $a[] = new X }` growth. Tracked: the
         // charge releases when the object dies (efree).
-        let bytes = 72 + 16 * o.props.len() as u64;
+        let bytes = 72 + 16 * o.prop_len() as u64;
         // The arena counter counts every shell too — a flat cost per
         // allocation (new_oom), decremented at Drop like zend's arena.
         crate::value::obj_charge();
@@ -3665,6 +3666,7 @@ impl<'a> Interp<'a> {
         };
         let rc = self.alloc_obj(PhpObject {
             class: cls,
+            slots: Vec::new(),
             props: HashMap::new(),
             prop_order: vec![],
             id: 0,
@@ -3803,9 +3805,11 @@ impl<'a> Interp<'a> {
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
+                        prop_slot: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
                     }),
+                    slots: Vec::new(),
                     props: HashMap::new(),
                     prop_order: vec![],
                     id: 0,
@@ -3818,9 +3822,9 @@ impl<'a> Interp<'a> {
         // the chain walk, redecl-position and hooked-backing rules
         // are class-fixed, computed once in flat_props_of.
         let flat = self.flat_props_of(&cls);
-        let mut props = HashMap::with_capacity(flat.len());
+        let mut slots: Vec<Option<Cell>> = vec![None; flat.len()];
         let mut prop_order = Vec::with_capacity(flat.len());
-        for fp in flat.iter() {
+        for (fi, fp) in flat.iter().enumerate() {
             prop_order.push(fp.key.clone());
             if fp.uninit {
                 continue;
@@ -3848,7 +3852,7 @@ impl<'a> Interp<'a> {
             if p.ty.is_some() {
                 default = self.prop_typed_write_check(p, c, default)?;
             }
-            props.insert(fp.key.clone(), cell(default));
+            slots[fi] = Some(cell(default));
         }
         let internal = if self.is_throwable_cls(&cls) {
             // A throwable's file/line attribute to the executing code
@@ -3877,7 +3881,8 @@ impl<'a> Interp<'a> {
         };
         let v = Value::Object(self.alloc_obj(PhpObject {
             class: cls,
-            props,
+            slots,
+            props: HashMap::new(),
             prop_order,
             id: 0,
             internal,
@@ -3958,6 +3963,13 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        let slot: Rc<HashMap<String, usize>> = Rc::new(
+            flat.iter()
+                .enumerate()
+                .map(|(i, fp)| (fp.key.clone(), i))
+                .collect(),
+        );
+        let _ = cls.prop_slot.set(slot);
         let flat = Rc::new(flat);
         let _ = cls.flat_props.set(flat.clone());
         flat

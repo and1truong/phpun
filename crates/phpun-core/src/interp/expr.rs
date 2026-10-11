@@ -4253,7 +4253,7 @@ impl<'a> Interp<'a> {
                                 let key = self.obj_prop_key(o, &pn);
                                 let object = key
                                     .as_ref()
-                                    .and_then(|k| o.borrow().props.get(k).cloned())
+                                    .and_then(|k| o.borrow().prop_get(k))
                                     .is_some_and(|c| matches!(&*c.borrow(), Value::Object(_)));
                                 let message = if object {
                                     "Cannot assign by reference to overloaded object".to_string()
@@ -4312,7 +4312,7 @@ impl<'a> Interp<'a> {
                             ob.prop_order.push(key.clone());
                         }
 
-                        let old = ob.props.insert(key.clone(), src.clone());
+                        let old = ob.prop_insert(key.clone(), src.clone());
                         drop(ob);
                         if old.is_none() {
                             // zend: a new dynamic-prop bucket allocs.
@@ -5161,7 +5161,7 @@ impl<'a> Interp<'a> {
                 match anc {
                     SlotAnchor::Obj(w, key) => {
                         if let Some(o) = w.upgrade() {
-                            o.borrow_mut().props.remove(&key);
+                            o.borrow_mut().prop_take(&key);
                         }
                     }
                     SlotAnchor::Statics(ccn, ppn) => {
@@ -5193,14 +5193,25 @@ impl<'a> Interp<'a> {
         // shares the same zval and keeps the typed gate
         // (typed_properties_081).
         let mut shared: Vec<(String, Cell)> = Vec::new();
-        for (k, c) in ob.props.iter() {
+        let copy_cell = |k: &String, c: &Cell, shared: &mut Vec<(String, Cell)>| {
             if self.is_ref_cell(c) && Rc::strong_count(c) > 1 {
                 shared.push((k.clone(), c.clone()));
             }
-            props.insert(k.clone(), cell(c.borrow().clone()));
+            cell(c.borrow().clone())
+        };
+        let mut slots: Vec<Option<Cell>> = Vec::with_capacity(ob.slots.len());
+        for (si, s) in ob.slots.iter().enumerate() {
+            slots.push(s.as_ref().map(|c| {
+                let key = ob.prop_order.get(si).cloned().unwrap_or_default();
+                copy_cell(&key, c, &mut shared)
+            }));
+        }
+        for (k, c) in ob.live_props().into_iter() {
+            props.insert(k.clone(), copy_cell(&k, &c, &mut shared));
         }
         let new_obj = PhpObject {
             class: ob.class.clone(),
+            slots,
             props,
             prop_order: ob.prop_order.clone(),
             id: 0,
@@ -5236,7 +5247,7 @@ impl<'a> Interp<'a> {
         if let Value::Object(no) = &nv {
             for (k, c) in shared {
                 let ptr = Rc::as_ptr(&c) as usize;
-                no.borrow_mut().props.insert(k.clone(), c);
+                no.borrow_mut().prop_insert(&k, c);
                 if let Some(a) = self.slot_anchor.get_mut(&ptr) {
                     if let SlotAnchor::Obj(w, sk) = a {
                         if sk == &k && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, o)) {
@@ -5371,7 +5382,7 @@ impl<'a> Interp<'a> {
                         // gate is lifted — only the scope check below
                         // still applies (R3 finding 13).
                         let key = self.obj_prop_key(&o, pn).unwrap_or_else(|| pn.to_string());
-                        if !self.clone_write && o.borrow().props.contains_key(&key) {
+                        if !self.clone_write && o.borrow().prop_has(&key) {
                             return self.fail(PhpError::uncaught(
                                 "Error",
                                 format!(
@@ -5428,7 +5439,7 @@ impl<'a> Interp<'a> {
                 if k.is_none()
                     && self.aap_active(&o)
                     && self.decl_prop(&o, pn).is_none()
-                    && !o.borrow().props.contains_key(pn)
+                    && !o.borrow().prop_has(pn)
                 {
                     // AAP prop writes route through spl_array_write_
                     // dimension in zend — the mid-sort guard applies.
@@ -5450,7 +5461,7 @@ impl<'a> Interp<'a> {
                     let mut ob = o.borrow_mut();
                     // Write into the existing slot — a `&`-bound
                     // reference must see the update (typed_properties_010).
-                    if let Some(existing) = ob.props.get(&k) {
+                    if let Some(existing) = ob.prop_get(&k) {
                         let existing = existing.clone();
                         drop(ob);
                         // The slot may be shared with a DIFFERENT typed
@@ -5486,7 +5497,7 @@ impl<'a> Interp<'a> {
                         if !ob.prop_order.contains(&k) {
                             ob.prop_order.push(k.clone());
                         }
-                        ob.props.insert(k, cell(v.clone()));
+                        ob.prop_insert(k, cell(v.clone()));
                         drop(ob);
                         // zend: a new declared-slot materialization allocs.
                         self.mem_track(&o, OBJ_SLOT_REQ);
@@ -5525,7 +5536,7 @@ impl<'a> Interp<'a> {
                     // (PHP 8.2+; stdClass is exempt).
                     let is_new = {
                         let ob = o.borrow();
-                        !ob.props.contains_key(pn)
+                        !ob.prop_has(pn)
                     };
                     // stdClass (and its subclasses) plus
                     // #[AllowDynamicProperties] opt out of the
@@ -5550,7 +5561,7 @@ impl<'a> Interp<'a> {
                     if !ob.prop_order.contains(&pn) {
                         ob.prop_order.push(pn.clone());
                     }
-                    ob.props.insert(pn, cell(v.clone()));
+                    ob.prop_insert(pn, cell(v.clone()));
                     drop(ob);
                     if is_new {
                         // zend: a new dynamic-prop bucket allocs.
@@ -8796,9 +8807,8 @@ impl<'a> Interp<'a> {
                 .map(|o| {
                     !self.destructed.contains_key(&(Rc::as_ptr(&o) as usize))
                         && o.borrow()
-                            .props
-                            .get(key)
-                            .map(|c| Rc::as_ptr(c) as usize == ptr)
+                            .prop_get(key)
+                            .map(|c| Rc::as_ptr(&c) as usize == ptr)
                             .unwrap_or(false)
                 })
                 .unwrap_or(false),
@@ -9268,7 +9278,7 @@ impl<'a> Interp<'a> {
                     ro_target = Some((o.clone(), pn.clone()));
                     let cls = o.borrow().class.clone();
                     if self.decl_prop(o, &pn).is_none()
-                        && !o.borrow().props.contains_key(&pn)
+                        && !o.borrow().prop_has(&pn)
                         && self.find_method_in(&cls, "__get").is_none()
                     {
                         // ARRAY_AS_PROPS: an undeclared prop reads the
@@ -9383,7 +9393,7 @@ impl<'a> Interp<'a> {
                     } else {
                         pd.name.clone()
                     };
-                    if o.borrow().props.contains_key(&dk) {
+                    if o.borrow().prop_has(&dk) {
                         let prev = if matches!(
                             old,
                             Value::Array(_)
@@ -10557,7 +10567,7 @@ impl<'a> Interp<'a> {
                     let ob = o.borrow();
                     let cls = ob.class.clone();
                     for n in &ob.prop_order {
-                        if let Some(c) = ob.props.get(n) {
+                        if let Some(c) = ob.prop_get(n) {
                             // Int-keyed buckets decode to int keys like
                             // zend's property-HT int slots.
                             let k = match crate::value::int_prop_index(n) {
@@ -10616,6 +10626,7 @@ impl<'a> Interp<'a> {
                         .expect("stdClass registered");
                     Value::Object(self.alloc_obj(PhpObject {
                         class: cls,
+                        slots: Vec::new(),
                         props,
                         prop_order: order,
                         id: 0,

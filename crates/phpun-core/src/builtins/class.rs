@@ -63,9 +63,7 @@ pub(crate) fn dispatch(
         "property_exists" => match arg(args, 0) {
             Value::Object(o) => {
                 let n = arg_str(it, args, 1);
-                Value::Bool(
-                    o.borrow().props.contains_key(&n) || it.class_has_prop(&o.borrow().class, &n),
-                )
+                Value::Bool(o.borrow().prop_has(&n) || it.class_has_prop(&o.borrow().class, &n))
             }
             Value::Str(cn) => {
                 let n = arg_str(it, args, 1);
@@ -129,7 +127,7 @@ pub(crate) fn dispatch(
                     // to int keys.
                     let ob = o.borrow();
                     for n in &ob.prop_order {
-                        if let Some(c) = ob.props.get(n) {
+                        if let Some(c) = ob.prop_get(n) {
                             let k = match crate::value::int_prop_index(n) {
                                 Some(i) => ArrKey::Int(i),
                                 None => ArrKey::Str(n.clone().into()),
@@ -163,7 +161,7 @@ pub(crate) fn dispatch(
                         }
                         let v = match &decl {
                             Some((p, dcls)) => it.serial_entry_value(&o, p, dcls, &slot),
-                            None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                            None => o.borrow().prop_get(&slot).map(|c| c.borrow().clone()),
                         };
                         if let Some(v) = v {
                             let k = match crate::value::int_prop_index(&out) {
