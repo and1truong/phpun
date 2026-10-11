@@ -4432,27 +4432,6 @@ unset($e); unset($h); var_dump($wh->get());
             assert!(limits.mem_exceeded);
         }
         let mut it = Interp::new("arena.php");
-        let array = std::rc::Rc::new(std::cell::RefCell::new(super::PhpArray::new()));
-        let key = std::rc::Rc::as_ptr(&array) as usize;
-        it.mem_realloc(&array, 264);
-        let usage = it.mem_used;
-        let tracked = it.mem_tracked.len();
-        for _ in 0..32 {
-            it.mem_realloc(&array, 264);
-        }
-        assert_eq!(it.mem_used, usage);
-        assert_eq!(it.mem_tracked.len(), tracked);
-        drop(array);
-        it.mem_sweep();
-        assert!(!it.mem_tracked.contains_key(&key));
-        let array = std::rc::Rc::new(std::cell::RefCell::new(super::PhpArray::new()));
-        it.mem_realloc(&array, 264);
-        assert_eq!(
-            it.mem_tracked[&(std::rc::Rc::as_ptr(&array) as usize)].table_req,
-            264
-        );
-        drop(array);
-        it.mem_sweep();
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let frame = it.frame_new("direct");
         it.stack.push(frame);

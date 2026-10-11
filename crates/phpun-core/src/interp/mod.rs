@@ -4728,9 +4728,7 @@ impl<'a> Interp<'a> {
         let key = Rc::as_ptr(rc) as *const u8 as usize;
         let mut old_live = None;
         if let Some(c) = self.mem_tracked.get(&key) {
-            // The live caller Rc owns this key; the stored Weak pins its
-            // allocation address, so equal-capacity charges are already live.
-            if c.table_req == req {
+            if (c.probe)() && c.table_req == req {
                 return;
             }
             if (c.probe)() {
