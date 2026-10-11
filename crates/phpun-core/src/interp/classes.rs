@@ -3865,6 +3865,10 @@ impl<'a> Interp<'a> {
                     }
                     self.vm_frame_free(&args.vm_sites);
                     self.vm_recycle_scalar_cells(args.cells.drain(..));
+                    // Same bounded empty-vector pool as VM retirement; no PHP owners retained.
+                    if self.vm_cell_pool.len() < 64 {
+                        self.vm_cell_pool.push(args.cells);
+                    }
                     self.last_call_by_ref = false;
                 } else if let Err(e) =
                     self.method_invoke_vis(o.clone(), "__construct", args, Some((m, dc)))

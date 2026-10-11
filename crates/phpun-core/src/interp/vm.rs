@@ -4796,6 +4796,7 @@ unset($a); var_dump($weak->get());
             super::cell(super::Value::Float(4.0)),
         ]);
         let argument_ids: Vec<_> = args.cells.iter().map(super::Rc::as_ptr).collect();
+        let argument_storage = args.cells.as_ptr();
         fresh.vm_call_reserve(&mut args, 2);
         let before: Vec<_> = fresh.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let object = fresh.new_instance("FreshFloat", args).unwrap();
@@ -4804,6 +4805,27 @@ unset($a); var_dump($weak->get());
             .vm_scalar_cell_pool
             .iter()
             .all(|c| argument_ids.contains(&super::Rc::as_ptr(c))));
+        assert!(fresh.vm_cell_pool.last().unwrap().is_empty());
+        let mut next = fresh
+            .arg_cells(
+                &[crate::ast::Expr::Int(8), crate::ast::Expr::Int(9)],
+                &[],
+                "FreshFloat",
+                false,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            next.cells.as_ptr(),
+            argument_storage,
+            "AST sends reuse cleared capacity"
+        );
+        assert!(matches!(*next.cells[0].borrow(), super::Value::Int(8)));
+        assert!(matches!(*next.cells[1].borrow(), super::Value::Int(9)));
+        fresh.vm_frame_free(&next.vm_sites);
+        fresh.vm_recycle_scalar_cells(next.cells.drain(..));
         let reused = fresh.vm_scalar_arg(super::Value::Int(11));
         assert!(argument_ids.contains(&super::Rc::as_ptr(&reused)));
         assert!(matches!(*reused.borrow(), super::Value::Int(11)));
