@@ -1413,7 +1413,14 @@ pub(in crate::builtins) fn replace_value(
     ci: bool,
 ) -> Value {
     let mut count = 0;
-    match str_replace_one(&[find.as_ref()], &[repl.as_ref()], true, subj, ci, &mut count) {
+    match str_replace_one(
+        &[find.as_ref()],
+        &[repl.as_ref()],
+        true,
+        subj,
+        ci,
+        &mut count,
+    ) {
         Cow::Owned(bytes) => Value::bytes(bytes),
         Cow::Borrowed(_) => Value::Str(subj.clone()),
     }
