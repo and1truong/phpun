@@ -1,0 +1,7 @@
+{
+  "source": "e8b771ab2f08455068e1b1e2d865c395a6316de5",
+  "ordinary_revert": "c4d90c2",
+  "production_diff_vs_parent": "empty across crates",
+  "fresh_workspace_fmt_clippy": "PASS",
+  "timings": "historical rejected prototype only"
+}

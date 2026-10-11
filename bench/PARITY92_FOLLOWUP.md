@@ -3358,6 +3358,8 @@ this is not full compatibility. Explicit release core clean/rebuild/hash recorde
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/float-ctor-proof-*.
 PR365 P2 artifact review: removed duplicate uncompressed PHPT JSON only after verifying lossless gzip byte identity; inherited PHPT representations also consolidated in #363 and ordinarily merged here. No measurement or runtime change.
+
+Retirement: ordinary revert c4d90c2 restores all crates byte-identical #365/#363. Fresh retirement workspace/fmt/clippy PASS; original prototype source/build/hashes retained. PHPT artifacts have one lossless compressed representation; parent P2 artifact fix ordinarily merged. No retirement timing claim.
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
 
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
