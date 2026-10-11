@@ -2305,3 +2305,45 @@ Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/promoted-decl-borrow-main-*.
+
+## #318: docs(perf): reject canonical frame buffer retention after negative timings (2026-10-11)
+
+Report-only: reject #318 frame_new buffer preservation after actual-target speed measurement. Ordinary revert restores existing canonical frame reset; no production capacity-retention change retained. Keep pre316 unvalidated ELF provenance separate from fully verified current integration ade0f37/8ce5b19.
+
+Full Frame::new context reset, owner/destructor/call/namespace semantics restored exactly to parent315. Candidate ONE existing canonical unit extended capacity/no-owner/context assertions and passed; reverts with prototype. Known inherited main JSON live-reference regression unchanged, fixed next#319.
+
+Runtime ade0f37ba5fe3682a9d6ad914e23575319b590c8; timing source ade0f37ba5fe3682a9d6ad914e23575319b590c8; report/integration source cd81522a80b000a653d52999b4979764cd7a5784.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 146.265 | 153.807 | 1.0516 |
+| bench/40-objects.php 20 5000 | 589.460 | 608.933 | 1.0330 |
+| bench/20-strings.php | 55.359 | 55.723 | 1.0066 |
+| bench/20-strings.php 100 | 238.843 | 248.126 | 1.0389 |
+| bench/11-sieve.php | 65.413 | 67.890 | 1.0379 |
+| bench/30-arrays.php | 77.949 | 78.259 | 1.0040 |
+| bench/60-json.php | 504.180 | 518.898 | 1.0292 |
+| bench/10-fib.php | 9.254 | 8.793 | 0.9501 |
+| bench/50-regex.php | 39.267 | 39.667 | 1.0102 |
+| bench/70-db.php | 112.757 | 106.967 | 0.9486 |
+| bench/app/cli.php 100 20 | 33.128 | 34.421 | 1.0390 |
+| examples/composer/run.php | 9.642 | 9.865 | 1.0231 |
+
+Physicalobjects1483154→1433156(−49998/~3.4%),bytes−4.5MB.7objects+5.2%,long+3.3%,longstrings+3.9%,sieve+3.8%,JSON+2.9%,app+3.9% retained.31objects145.867→146.430(+.4%flat),long592.073→599.324(+1.2%),longstrings244.852→254.577(+4.0%),sieve64.292→68.366(+6.3%),JSON+.8%,app+.4%. No target win; reject. FullGC77345timeout→pass is wall threshold,not semantic repair: parent serialized8728msPASS already published;candidatefullPASS.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1483154→1433156; bytes 66855410→62355566.
+- arrays: requests 636049→636049; bytes 26703845→26703821.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing canonical receiver unit extended capacity/empty PHP owners/context defaults;removed with rejected prototype.
+All3406raw maps:onlyGC77345timeout→pass;candidate2730pass601fail. Parent frozen serialized8728ms alreadyPASS,so not semantic repair;raw maps retained. Other statuses identical. Known main JSON reference bug unchanged,tracked#319.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/frame-reset-buffers-*.
