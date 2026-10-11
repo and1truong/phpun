@@ -411,7 +411,6 @@ impl<'a> Interp<'a> {
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
                         prop_order_template: std::cell::OnceCell::new(),
-                        float_ctor_slots: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
                         method_ic: std::cell::RefCell::new(None),
                         short_name: std::cell::OnceCell::new(),
@@ -3793,48 +3792,18 @@ impl<'a> Interp<'a> {
                     ty.as_ref()
                         .is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("float"))
                 };
-                let slots = cls.float_ctor_slots.get_or_init(|| {
-                    if !(Rc::ptr_eq(&cls, &dc)
-                        && cls.decl.parent.is_none()
-                        && !cls.decl.readonly
-                        && !m.is_static
-                        && !m.is_abstract
-                        && m.visibility == crate::ast::Visibility::Public
-                        && m.decl.line > 0
-                        && m.decl.body.is_empty()
-                        && m.decl.attrs.is_empty()
-                        && !m.decl.by_ref
-                        && m.decl.ret.is_none()
-                        && !m.decl.params.is_empty())
-                    {
-                        return None;
-                    }
-                    let flat = flat?;
-                    m.decl
-                        .params
-                        .iter()
-                        .map(|p| {
-                            if !p.promoted
-                                || p.by_ref
-                                || p.variadic
-                                || p.readonly
-                                || p.hooks.is_some()
-                                || !float_type(&p.ty)
-                            {
-                                return None;
-                            }
-                            flat.iter().position(|fp| {
-                                let prop = &fp.declaring.decl.props[fp.prop_idx];
-                                Rc::ptr_eq(&fp.declaring, &dc)
-                                    && prop.name == p.name
-                                    && !prop.readonly
-                                    && prop.hooks.is_none()
-                                    && float_type(&prop.ty)
-                            })
-                        })
-                        .collect::<Option<Box<[usize]>>>()
-                });
-                let direct = slots.is_some()
+                let direct = Rc::ptr_eq(&cls, &dc)
+                    && cls.decl.parent.is_none()
+                    && !cls.decl.readonly
+                    && !m.is_static
+                    && !m.is_abstract
+                    && m.visibility == crate::ast::Visibility::Public
+                    && m.decl.line > 0
+                    && m.decl.body.is_empty()
+                    && m.decl.attrs.is_empty()
+                    && !m.decl.by_ref
+                    && m.decl.ret.is_none()
+                    && !m.decl.params.is_empty()
                     && args.named.is_empty()
                     && args.cells.len() == m.decl.params.len()
                     && args.vm_slots >= VM_FRAME_SLOTS + args.cells.len() as u64
@@ -3859,19 +3828,33 @@ impl<'a> Interp<'a> {
                     && !crate::value::cmp_notices_pending()
                     && !self.mem_exceeded
                     && self.oom_at.is_none()
-                    && slots
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .zip(&args.cells)
-                        .all(|(i, c)| {
-                            matches!(*c.borrow(), Value::Int(_) | Value::Float(_))
-                                && o.borrow().slots.get(*i).is_some_and(|c| c.is_none())
-                        });
+                    && m.decl.params.iter().zip(&args.cells).all(|(p, c)| {
+                        p.promoted
+                            && !p.by_ref
+                            && !p.variadic
+                            && !p.readonly
+                            && p.hooks.is_none()
+                            && float_type(&p.ty)
+                            && matches!(*c.borrow(), Value::Int(_) | Value::Float(_))
+                            && flat.is_some_and(|flat| {
+                                flat.iter().enumerate().any(|(i, fp)| {
+                                    let prop = &fp.declaring.decl.props[fp.prop_idx];
+                                    Rc::ptr_eq(&fp.declaring, &dc)
+                                        && prop.name == p.name
+                                        && !prop.readonly
+                                        && prop.hooks.is_none()
+                                        && float_type(&prop.ty)
+                                        && o.borrow().slots.get(i).is_some_and(|c| c.is_none())
+                                })
+                            })
+                    });
                 if direct {
                     let flat = flat.unwrap();
-                    for (i, c) in slots.as_ref().unwrap().iter().zip(&args.cells) {
-                        let fp = &flat[*i];
+                    for (p, c) in m.decl.params.iter().zip(&args.cells) {
+                        let fp = flat
+                            .iter()
+                            .find(|fp| dc.decl.props[fp.prop_idx].name == p.name)
+                            .unwrap();
                         let value = match *c.borrow() {
                             Value::Int(v) => v as f64,
                             Value::Float(v) => v,
@@ -3928,7 +3911,6 @@ impl<'a> Interp<'a> {
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
                         prop_order_template: std::cell::OnceCell::new(),
-                        float_ctor_slots: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
                         method_ic: std::cell::RefCell::new(None),
                         short_name: std::cell::OnceCell::new(),
