@@ -2824,3 +2824,42 @@ External CI not asserted green. No suite parity claim or multiplication of step 
 Raw/source/hashes in bench/data/92/parity/oct11/object-order-cow-*.
 
 Build provenance for #335: the release command ran at466240d with the exact formatting-only Rust patch archived asobject-order-cow-format-only.patch. That source was committed unchanged as61f9d69 after freezing the executable. Report merges changed metadata only. No claim that466240d was clean at build time. Whole-suite raw measurements are object-order-cow-whole.json. Objects allocation requests1058129→983133 (−74996);arrays/JSON unchanged requests,each+884bytes.
+
+## #338: perf(vm): execute guarded packed-boolean loops with typed private buffers (2026-10-11)
+
+Eligible bounded for-loop regions execute existing integer/boolean VM operations in private primitive buffers. Successful guarded results use canonical scalar-cell stores/global publication and unchanged packed-array order/accounting. Unsupported types, aliases/ref/typed/readonly/global views, bounds, overflow, profiling/deadline contexts and step budgets discard buffers and retry original VM operations. Portable typed stack,not a general register VM/JIT; no dependency/unsafeValue layout. Existing native integer graphs accept markers as no-ops.
+
+Bound512ops/256CVs/10millionsteps/1MiBbooleanbuffer;deliberate ceiling and upgrade triggers documented. ONE existing scalar-dimension check proves activation,nested loops,CoW,overflow and >1MiB fallback. Native probes vary lengths/strides and cover refs/shared arrays/readonly/continue/handlers. No benchmark/function-name recognition.
+
+Runtime 7aa40eb7b8582a4a198070469efbe3476611dd05; timing source 7aa40eb7b8582a4a198070469efbe3476611dd05; report/integration source 7aa40eb7b8582a4a198070469efbe3476611dd05.
+
+31 alternating profiler-off nativePHP8.5.11-n byte-gated pairs in the table;separate freshwhole7 rotating PHP/main/parent/candidate and earlier prototype/negative cohorts retained.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/11-sieve.php | 70.860 | 21.366 | 0.3015 |
+| bench/11-sieve.php 10 100000 | 583.057 | 142.061 | 0.2436 |
+| bench/40-objects.php | 96.737 | 98.947 | 1.0228 |
+| bench/30-arrays.php | 81.130 | 82.048 | 1.0113 |
+| bench/60-json.php | 509.897 | 512.477 | 1.0051 |
+| examples/composer/run.php | 9.497 | 9.006 | 0.9483 |
+
+Final31pairs sieve70.860→21.366ms (−69.8%),long583.057→142.061 (−75.6%);objects+2.3%,arrays+1.1%,JSON+.5%,Composer−5.2%. Initial31sieve−67.0%/long−75.8%;initialwhole main3.826→candidate3.069×PHP,parent−10.5%,objects+6.5/regex+5.9/JSON+4.2/app+3.7/Composer+5.4% retained. Initialnegative31objects+1.3/regex+.2/JSON+.4/app+1.7/Composer+3.3% retained;do not average cohorts or attribute unrelated gains. Finalwhole raw retained below. Finalwhole7 geomeans {"main_php_ratio": 3.76027919535537, "candidate_php_ratio": 3.0526635018619923, "candidate_main_ratio": 0.8118183100958535, "candidate_parent_ratio": 0.8822022877817571};fullcase ratios/raw in bool-loop-bounded-whole.json. Each cohort is independently byte gated;do not multiply step gains.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- sieve10: requests 32490→32870; bytes 22031715→27282079.
+- objects5: requests 983132→983132; bytes 55269349→55269353.
+- arrays: requests 636052→636052; bytes 26700610→26700614.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+SameONEexisting scalar-dimension test extended;measure/mock andHTTPresponse checksPASS. Native25+19/probes/VM-profile PASS.
+Finalall3406individualPHPT statuses identical to frozenproperty-order parent:2731pass599fail25skip38unsupported6crash7timeout. InitialGCtimeout→pass recheckedserializedparent8915ms/candidate8762ms bothPASS;fullmaps retained,not a compatibility gain.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/bool-loop-bounded-*.
+
+Final frozen7aa40eb/53a0e08 whole7: main4e6 geomean3.7603→candidate3.0527×PHP;candidate/parent0.8822 (−11.8%). Sieve3.0913×PHP;objects11.5395×/long20.6112×;strings3.8064×/long4.6556×,arrays4.5986×,JSON2.9178×,DB3.6580×,regex2.5799×,fib0.7697×,startup1.7395×,app6.5929×,Composer1.8567×. Whole negatives:startup+3.4%,fib+4.6%,longobjects+.9%,app+4.7%;focused31objects+2.3%,arrays+1.1%,JSON+.5%. All exact rawsamples/cohort hashes are published,not multiplied or averaged into artificial savings. Physicalsieve10 adds380requests/+5250364bytes for privatebuffers (tradeoff,not allocation reduction). Objects/arrays unchangedrequests/+4bytes.

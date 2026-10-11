@@ -1,0 +1,109 @@
+{
+  "source": "7aa40eb7b8582a4a198070469efbe3476611dd05",
+  "runtime": "7aa40eb7b8582a4a198070469efbe3476611dd05",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "object-order-cow",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8915
+      }
+    },
+    {
+      "binary": "bool-loop",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8762
+      }
+    }
+  ],
+  "physical_allocations": [
+    {
+      "label": "sieve10",
+      "before": {
+        "requests": 32490,
+        "bytes": 22031715
+      },
+      "after": {
+        "requests": 32870,
+        "bytes": 27282079
+      }
+    },
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 983132,
+        "bytes": 55269349
+      },
+      "after": {
+        "requests": 983132,
+        "bytes": 55269353
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636052,
+        "bytes": 26700610
+      },
+      "after": {
+        "requests": 636052,
+        "bytes": 26700614
+      }
+    }
+  ],
+  "binary_sha256": "53a0e08b77c9074f88eac5511ab20c7d35e227da2b71650b55db8567caa95a9a",
+  "scope": "Eligible bounded for-loop regions execute existing integer/boolean VM operations in private primitive buffers. Successful guarded results use canonical scalar-cell stores/global publication and unchanged packed-array order/accounting. Unsupported types, aliases/ref/typed/readonly/global views, bounds, overflow, profiling/deadline contexts and step budgets discard buffers and retry original VM operations. Portable typed stack,not a general register VM/JIT; no dependency/unsafeValue layout. Existing native integer graphs accept markers as no-ops.",
+  "fallbacks": "Bound512ops/256CVs/10millionsteps/1MiBbooleanbuffer;deliberate ceiling and upgrade triggers documented. ONE existing scalar-dimension check proves activation,nested loops,CoW,overflow and >1MiB fallback. Native probes vary lengths/strides and cover refs/shared arrays/readonly/continue/handlers. No benchmark/function-name recognition.",
+  "whole_suite": "bool-loop-bounded-whole.json",
+  "initial_runtime": "5d02921b9f442f56f6956d4465f8062bd13baddd",
+  "initial_binary_sha256": "e24b8f85af35998268c95e83c1b8e1b1ffe6ba3e67aede7dcaa0e010f42180ab",
+  "initial_status_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "php": {
+    "version": "8.5.11",
+    "args": [
+      "-n"
+    ],
+    "pcre.jit": "1",
+    "opcache.enable_cli": "0"
+  }
+}

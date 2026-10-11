@@ -1,0 +1,4 @@
+object-order-cow objects5 allocs: 983132 bytes: 55269349
+bool-loop-bounded objects5 allocs: 983132 bytes: 55269353
+object-order-cow arrays allocs: 636052 bytes: 26700610
+bool-loop-bounded arrays allocs: 636052 bytes: 26700614
