@@ -8,11 +8,12 @@ use std::rc::Rc;
 
 use super::calls::builtin_byref;
 use super::util::cell;
-use crate::ast::{Expr, FunctionDecl, Param, Stmt};
+use crate::ast::{Expr, FunctionDecl, MethodDecl, Param, Stmt};
 use crate::builtins;
 use crate::error::PhpError;
 use crate::value::{
-    compare, identical, ArrKey, CallableKind, Cell, FxMap, PhpArray, PhpCallable, PhpClass, Value,
+    compare, identical, ArrKey, CallableKind, Cell, FxMap, PhpArray, PhpCallable, PhpClass,
+    PhpObject, Value,
 };
 
 use super::{Flow, Interp};
@@ -231,6 +232,21 @@ enum Op {
         callee: usize,
         cache: std::cell::RefCell<Option<CachedFn>>,
     },
+    /// `$cv->m()` — receiver binds at INIT (zend evaluates the object
+    /// before argument ops): reads the slot, resolves and caches the
+    /// monomorphic target. Canonical receivers/methods jump straight
+    /// to the fallback expr.
+    InitMethod {
+        call: usize,
+        obj: u16,
+    },
+    MethodCall {
+        name: Rc<str>,
+        argc: u16,
+        site: usize,
+        cache: std::cell::RefCell<Option<CachedMethod>>,
+        fallback: Box<Expr>,
+    },
     /// Statement boundary: decref the temps this statement left in
     /// expr_temps — the AST's Stmt::Expr-end sweep, which object
     /// dtors time against.
@@ -244,6 +260,27 @@ enum Op {
     Echo,
     Line(usize),
     Return,
+}
+
+/// Monomorphic method-dispatch cache at a `MethodCall` site: guards on
+/// the receiver's class and reuses the class-stable resolution —
+/// `core` None means "resolved but not direct-eligible" (stub,
+/// abstract, by-ref, generator, needs-bind, uncompiled), which is
+/// class-stable too. Context checks (scope-private, visibility,
+/// pending hook) still run per call.
+struct CachedMethod {
+    class: Rc<PhpClass>,
+    core: Option<MSiteCore>,
+}
+
+/// Class-stable pieces of a direct method target — everything except
+/// the receiver itself and per-call context guards.
+#[derive(Clone)]
+struct MSiteCore {
+    m: Rc<MethodDecl>,
+    fdecl: Rc<FunctionDecl>,
+    comp: Rc<Compiled>,
+    dc: Rc<PhpClass>,
 }
 
 /// Per-call-site resolution (zend's INIT_FCALL cache slot). `Direct`
@@ -1134,6 +1171,42 @@ impl Compiler {
                     *at = call;
                 }
             }
+            Expr::MethodCall {
+                obj,
+                name: crate::ast::PropName::Name(mname),
+                args,
+                nullsafe: false,
+                site,
+            } if matches!(Interp::unmark_rhs(obj), Expr::Var(n) if !Interp::is_superglobal(n))
+                && args.iter().all(|a| {
+                    !matches!(
+                        Interp::unmark_arg(a),
+                        Expr::Unpack(_) | Expr::Binary { op: "named", .. }
+                    )
+                }) =>
+            {
+                let Expr::Var(vname) = Interp::unmark_rhs(obj) else {
+                    unreachable!()
+                };
+                let obj = self.slot(vname);
+                let init = self.emit(Op::InitMethod {
+                    call: usize::MAX,
+                    obj,
+                });
+                for a in args {
+                    self.expr(Interp::unmark_arg(a))?;
+                }
+                let call = self.emit(Op::MethodCall {
+                    name: Rc::from(mname.as_str()),
+                    argc: args.len() as u16,
+                    site: *site,
+                    cache: std::cell::RefCell::new(None),
+                    fallback: Box::new(e.clone()),
+                });
+                if let Op::InitMethod { call: at, .. } = &mut self.ops[init] {
+                    *at = call;
+                }
+            }
             Expr::Prop {
                 obj,
                 name: crate::ast::PropName::Name(name),
@@ -1178,7 +1251,6 @@ impl Compiler {
             | Expr::Index { .. }
             | Expr::Prop { .. }
             | Expr::StaticProp { .. }
-            | Expr::MethodCall { .. }
             | Expr::StaticCall { .. }
             | Expr::StaticCallDyn { .. }
             | Expr::ClassConst { .. }
@@ -1836,6 +1908,7 @@ impl<'a> Interp<'a> {
         vs: &mut Vec<Value>,
         targets: &mut Vec<CachedFn>,
     ) -> Result<Flow, PhpError> {
+        let mut mtargets: Vec<Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)>> = Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
@@ -2204,6 +2277,67 @@ impl<'a> Interp<'a> {
                         continue;
                     }
                     targets.push(target);
+                }
+                Op::InitMethod { call: at, obj } => {
+                    let Op::MethodCall {
+                        name,
+                        site,
+                        cache,
+                        fallback,
+                        ..
+                    } = &comp.ops[*at]
+                    else {
+                        unreachable!("InitMethod always points to its MethodCall");
+                    };
+                    let mval = match &slots[*obj as usize] {
+                        Slot::V(v) => Some(v.clone()),
+                        Slot::C(c) => Some(c.borrow().clone()),
+                        Slot::Arg(i) => self
+                            .stack
+                            .last()
+                            .and_then(|f| f.value_args.get(*i as usize).cloned()),
+                        Slot::Uninit => None,
+                    };
+                    let hit = match mval {
+                        Some(Value::Object(o)) => self.vm_method_target(o, name, cache, *site),
+                        _ => None,
+                    };
+                    mtargets.push(hit.clone());
+                    if hit.is_none() {
+                        // Receiver or target outside the direct subset —
+                        // canonical eval keeps the full semantics (undef
+                        // CV warning, member-on-scalar error, __call).
+                        self.vm_materialize(comp, slots);
+                        let r = self.eval(fallback);
+                        self.vm_refresh(comp, slots);
+                        vs.push(r?);
+                        pc = *at + 1;
+                        continue;
+                    }
+                }
+                Op::MethodCall {
+                    name, argc, site, ..
+                } => {
+                    let n = *argc as usize;
+                    let hit = mtargets.pop().expect("InitMethod resolved this call");
+                    let Some((obj, core)) = hit else {
+                        unreachable!("canonical targets jump over MethodCall");
+                    };
+                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+                    argv.extend(vs.drain(vs.len() - n..));
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
+                    let result = self.vm_run_method_direct(&core, &mut argv, obj, name, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
+                    let v = result?;
+                    argv.clear();
+                    if self.vm_val_pool.len() < 64 {
+                        self.vm_val_pool.push(argv);
+                    }
+                    vs.push(v);
                 }
                 Op::Call {
                     lname,
@@ -2907,6 +3041,182 @@ impl<'a> Interp<'a> {
     }
 
     /// Execute the target chosen before argument evaluation.
+    /// Resolve a `$cv->m` site to its direct target: receiver must be
+    /// an object whose resolved method is a userland, compiled,
+    /// value-callable decl. Per-call context guards (scope-private
+    /// precedence, visibility, pending hook) run on every hit; the
+    /// class-keyed pieces live in the site cache.
+    fn vm_method_target(
+        &mut self,
+        o: Rc<std::cell::RefCell<PhpObject>>,
+        name: &Rc<str>,
+        cache: &std::cell::RefCell<Option<CachedMethod>>,
+        _site: usize,
+    ) -> Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)> {
+        if self.pending_hook_prop.is_some() {
+            return None;
+        }
+        let cls = o.borrow().class.clone();
+        let cached = {
+            let b = cache.borrow();
+            b.as_ref()
+                .filter(|h| Rc::ptr_eq(&h.class, &cls))
+                .map(|h| h.core.clone())
+        };
+        let core = match cached {
+            Some(core) => core,
+            None => {
+                let core = self.find_method_in(&cls, name).and_then(|(m, dc)| {
+                    if m.is_static
+                        || m.is_abstract
+                        || m.decl.line == 0
+                        || m.decl.body.is_empty()
+                        || m.decl.by_ref
+                        || m.decl.params.iter().any(|p| p.by_ref)
+                        || Self::decl_contains_yield(&m.decl.body)
+                    {
+                        return None;
+                    }
+                    let fdecl = self.method_function(&m);
+                    let comp = self.vm_compiled(&fdecl)?;
+                    (!comp.needs_bind).then(|| MSiteCore { m, fdecl, comp, dc })
+                });
+                *cache.borrow_mut() = Some(CachedMethod {
+                    class: cls.clone(),
+                    core: core.clone(),
+                });
+                core
+            }
+        }?;
+        // Scope-private methods shadow the object's table only inside
+        // their own scope; visibility gates __call/vis_error — both
+        // keep canonical semantics.
+        if self.scope_private_method(name).is_some() || !self.method_access_ok(&core.m, &core.dc) {
+            return None;
+        }
+        Some((o, core))
+    }
+
+    /// Direct method run — `vm_run_direct` with the frame's method
+    /// context (`this` var, this_obj/scope/decl/called class) instead
+    /// of the function-call shape. Arg-count misses still route the
+    /// evaluated args through method_invoke_vis so zend's
+    /// ArgumentCountError trace keeps its exact shape.
+    fn vm_run_method_direct(
+        &mut self,
+        core: &MSiteCore,
+        argv: &mut Vec<Value>,
+        this_obj: Rc<std::cell::RefCell<PhpObject>>,
+        name: &Rc<str>,
+        site: usize,
+    ) -> Result<Value, PhpError> {
+        let __p = pnow!();
+        let m = &core.m;
+        let decl = &core.fdecl;
+        let comp = &core.comp;
+        let scope = core.dc.clone();
+        let required = decl
+            .params
+            .iter()
+            .rposition(|p| p.default.is_none() && !p.variadic)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if argv.len() < required {
+            let mut args = super::CallArgs::empty();
+            args.cells = argv.drain(..).map(cell).collect();
+            return self.method_invoke_vis(this_obj, name, args, Some((m.clone(), scope.clone())));
+        }
+        let called = this_obj.borrow().class.clone();
+        let mut frame = self
+            .vm_frame_pool
+            .pop()
+            .unwrap_or_else(|| Box::new(super::Frame::new(String::new())));
+        frame.fn_name = decl.name.clone();
+        frame.decl_site = Rc::as_ptr(m) as usize;
+        frame.fn_line = decl.line;
+        frame.file = if decl.file.is_empty() {
+            self.cur_file.clone()
+        } else {
+            decl.file.clone()
+        };
+        frame.ns = decl.ns.clone();
+        frame.trait_origin = decl.decl_in.clone();
+        frame.hook_prop = self.pending_hook_prop.take();
+        frame.gen_body = self.pending_gen_body;
+        self.pending_gen_body = false;
+        frame.this_obj = Some(this_obj.clone());
+        frame.scope_class = Some(scope.clone());
+        frame.called_class = Some(called);
+        frame.decl_class = Some(scope);
+        frame.ret_by_ref = false;
+        frame.closure_rc = None;
+        frame.call_alias = None;
+        frame.statics_unit = None;
+        frame.vars.clear();
+        frame
+            .vars
+            .insert("this".to_string(), cell(Value::Object(this_obj)));
+        frame.args.clear();
+        frame.value_args.clear();
+        frame.vm_sites.clear();
+        let pending_caps = std::mem::take(&mut self.pending_gen_captures);
+        for (n, c, by_ref) in pending_caps {
+            let c2 = if by_ref { c } else { cell(c.borrow().clone()) };
+            frame.vars.insert(n, c2);
+        }
+        self.send_line = Some(site);
+        self.stack.push(frame);
+        padd!(0, __p);
+        let __p = pnow!();
+        let mut args = super::CallArgs::empty();
+        let mut abi = comp.value_abi
+            && !argv.is_empty()
+            && argv.len() <= u16::MAX as usize
+            && decl
+                .params
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.variadic || i < argv.len() || comp.defaults[i].is_some());
+        if abi {
+            'abi: for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic {
+                    abi = p.ty.is_none();
+                    break;
+                }
+                let (Some(ty), Some(v)) = (&p.ty, argv.get(i)) else {
+                    continue;
+                };
+                if comp.param_fast[i].is_some_and(|g| g(v)) {
+                    continue;
+                }
+                let v = v.clone();
+                match self.vm_abi_gate_slow(decl, p, ty, &v, argv, i) {
+                    Ok(()) => {}
+                    Err(Some(e)) => {
+                        self.stack_pop();
+                        return self.fail(e);
+                    }
+                    Err(None) => {
+                        abi = false;
+                        break 'abi;
+                    }
+                }
+            }
+        }
+        if abi {
+            let n = argv.len() as u64;
+            std::mem::swap(&mut self.cur().value_args, argv);
+            self.vm_call_reserve(&mut args, n);
+            padd!(1, __p);
+            return self.vm_run(decl, comp, args);
+        }
+        args.cells = self.vm_arg_cells(argv);
+        let n = args.cells.len() as u64;
+        self.vm_call_reserve(&mut args, n);
+        padd!(1, __p);
+        self.vm_run(decl, comp, args)
+    }
+
     fn vm_call(
         &mut self,
         lname: &str,
