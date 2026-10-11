@@ -1,0 +1,31 @@
+{
+  "binary_sha256": "9957cb5bd8c448173dc930d9cfc8640086a7f4a7b973f17922ff1a5b92473844",
+  "source": "e8fea20ada7f7df4c5469942329a829602525335",
+  "parent": "primitive-property-reviewed",
+  "summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ]
+}
