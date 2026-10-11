@@ -86,10 +86,8 @@ fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if from > last {
         return None;
     }
-    // Short needles retain the existing SIMD first-byte filter: native
-    // memmem's short-byte scan regressed both normal and replace cohorts.
     #[cfg(target_os = "linux")]
-    if needle.len() >= 4 {
+    {
         let bytes = &hay[from..];
         // SAFETY: memmem reads only these live bounded slices and returns
         // null or the start of a complete match within `bytes`.
@@ -101,31 +99,34 @@ fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
                 needle.len(),
             )
         };
-        return if found.is_null() {
+        if found.is_null() {
             None
         } else {
             // SAFETY: both pointers are in the same live slice allocation.
             Some(from + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize })
-        };
-    }
-    let first = needle[0];
-    let mut at = from;
-    // ponytail: non-Linux first-byte search can remain O(n*m); use a
-    // platform search or two-way implementation if target evidence warrants it.
-    while at <= last {
-        let bytes = &hay[at..=last];
-        // SAFETY: memchr reads this live slice and returns null or a pointer within it.
-        let found = unsafe { libc::memchr(bytes.as_ptr().cast(), first.into(), bytes.len()) };
-        if found.is_null() {
-            return None;
         }
-        let p = at + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize };
-        if hay[p..].starts_with(needle) {
-            return Some(p);
-        }
-        at = p + 1;
     }
-    None
+    #[cfg(not(target_os = "linux"))]
+    {
+        let first = needle[0];
+        let mut at = from;
+        // ponytail: portable first-byte filter can remain O(n*m); use a
+        // platform search or two-way implementation if target evidence warrants it.
+        while at <= last {
+            let bytes = &hay[at..=last];
+            // SAFETY: memchr reads this live slice and returns null or a pointer within it.
+            let found = unsafe { libc::memchr(bytes.as_ptr().cast(), first.into(), bytes.len()) };
+            if found.is_null() {
+                return None;
+            }
+            let p = at + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize };
+            if hay[p..].starts_with(needle) {
+                return Some(p);
+            }
+            at = p + 1;
+        }
+        None
+    }
 }
 
 /// Replace every non-overlapping `from` with `to` (byte version of
