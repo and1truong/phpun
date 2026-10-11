@@ -144,7 +144,7 @@ const COVERAGE_NAMES: [&str; 22] = [
 static COVERAGE: [std::sync::atomic::AtomicU64; 22] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 22];
 
-fn coverage_on() -> bool {
+pub(super) fn coverage_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PHPUN_VMPROF").is_some())
 }
@@ -2744,7 +2744,7 @@ impl<'a> Interp<'a> {
     /// ns per call phase; printed at process exit (registered once).
     /// Clock reads skew timings; exec includes nested calls. Report totals,
     /// then normalize by calls; benchmark speed with profiling disabled.
-    fn callprof_on() -> bool {
+    pub(super) fn callprof_on() -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
         static ON: AtomicBool = AtomicBool::new(false);
         static INIT: std::sync::Once = std::sync::Once::new();
