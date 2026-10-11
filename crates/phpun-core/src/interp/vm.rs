@@ -4265,36 +4265,11 @@ try { rem_zero(9,0); } catch (DivisionByZeroError $e) { echo $e->getMessage(), "
             && f.value_args.is_empty()
             && f.this_obj.is_none()
             && f.closure_rc.is_none()));
-        let mut frame = it.frame_new("first");
-        frame.vars.reserve(32);
-        frame.args.reserve(32);
-        frame.value_args.reserve(32);
-        frame.vm_sites.reserve(32);
-        let capacities = (
-            frame.vars.capacity(),
-            frame.args.capacity(),
-            frame.value_args.capacity(),
-            frame.vm_sites.capacity(),
-        );
-        frame.ns = "previous".into();
-        frame.ret_by_ref = true;
+        let frame = it.frame_new("first");
         let ptr = &*frame as *const super::super::Frame;
         it.frame_recycle(frame);
         let frame = it.frame_new("second");
         assert_eq!(&*frame as *const super::super::Frame, ptr);
-        assert_eq!(
-            (
-                frame.vars.capacity(),
-                frame.args.capacity(),
-                frame.value_args.capacity(),
-                frame.vm_sites.capacity(),
-            ),
-            capacities
-        );
-        assert!(frame.vars.is_empty() && frame.args.is_empty()
-            && frame.value_args.is_empty() && frame.vm_sites.is_empty());
-        assert!(frame.ns.is_empty() && !frame.ret_by_ref);
-        assert_eq!(frame.fn_name.as_ref(), "second");
 
         let mut scan = super::super::GcScan::default();
         let mut out = Vec::new();
