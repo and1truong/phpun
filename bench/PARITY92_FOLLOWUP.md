@@ -1832,7 +1832,7 @@ Separate physical allocator requests/bytes (not speed runs):
 Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
 ONE existing scalar-dimension unit asserts packed writes/CoW and reference normalization; existing lifetime/readonly/canonical fixtures reused. Additional native packed mutator/view probe recorded separately.
 All3406individualPHPT compared; 1 known range crash/timeout swaps,
-no new fail/pass/skip. Parent summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 8, 'applicable': 3343, 'compatibility_pct': 81.63};
+no new fail/pass/skip. Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 8, 'applicable': 3343, 'compatibility_pct': 81.63};
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/compact-packed-*.
@@ -1883,7 +1883,7 @@ Separate physical allocator requests/bytes (not speed runs):
 Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
 Rejected ONE existing receiver unit covered inherited/default/promoted/error/no-op behavior and eligibility; revert restores parent unit. No added framework/fixtures. Existing native main/parent globals probes remain in report.
 All3406individualPHPT compared; 1 known range crash/timeout swaps,
-no new fail/pass/skip. Parent summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+no new fail/pass/skip. Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/empty-method-dispatch-*.
