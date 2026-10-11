@@ -7797,6 +7797,30 @@ impl<'a> Interp<'a> {
         args: &CallArgs,
         visible: bool,
     ) -> Result<Option<Value>, PhpError> {
+        // AST and Cell callers share the exact primitive kernels with the VM.
+        // No binding/coercion/ref output or observable transient frame is needed.
+        if args.named.is_empty()
+            && args.cells.len() <= 3
+            && matches!(
+                name,
+                "sqrt" | "substr" | "str_replace" | "str_ireplace" | "strtoupper" | "strtolower"
+            )
+            && !Self::callprof_on()
+            && !coverage_on()
+            && self.cast_err.is_none()
+            && self.callable_probe_err.is_none()
+            && !crate::value::cmp_notices_pending()
+            && !self.mem_exceeded
+            && self.oom_at.is_none()
+        {
+            let mut values = [Value::Null, Value::Null, Value::Null];
+            for (value, cell) in values.iter_mut().zip(&args.cells) {
+                *value = cell.borrow().clone();
+            }
+            if let Some(value) = builtins::call_scalar(name, &values[..args.cells.len()]) {
+                return Ok(Some(value));
+            }
+        }
         // A builtin frame pushed while dispatched from inside another
         // builtin's own machinery (internal_cb: sort/ob/array-callbacks)
         // reports `[internal function]` — Zend emits no file/line for a
