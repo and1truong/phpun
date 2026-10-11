@@ -1,0 +1,37 @@
+{
+  "runtime": "51a8401 (c73cb94 + shared typed assignment-result fix23c642e + complete ownership guards)",
+  "sha256": {
+    "native-comparator": "a6dab1f57b8a66242aa2cc54c388124a841c56924253ea38813692c77e8d8261",
+    "scalar-dim-writes-fixed": "a6ddbb52b42016d475ec43c8fe2c64c2cd048653d255ab283358d663d9b1dc4c"
+  },
+  "build": "Rust1.99 release LTO/codegen-units1; forced core clean before worktree switch",
+  "gates": "workspace8core/22runtime/19format,fmt/clippy;existing dimension unit includes opcode,CoW,aliases,typed/readonly/ArrayAccess;25script+19workload+extended dimension byte gates;VM-profile;3406PHPT",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes": {
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": [
+      "crash",
+      "timeout"
+    ],
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": [
+      "timeout",
+      "crash"
+    ]
+  },
+  "timing": "7 alternating isolated profiler-off pairs;31 isolated arrays/fib follow-up; nativePHP8.5.11 -n byte/exit/stderr",
+  "prior_trial": "dim-write-timings is initial23c642e before complete owner guards/compiler shape check; retained, superseded by fixed timings",
+  "dirty": "Only untracked vendor symlink; tracked production runtime clean",
+  "compatibility_fix": "Parent returns bool(false) for typed int reference assignment although stores int(0); PHP returns int(0). Shared static/CV/dimension assignment paths now return the value passed to cell_store."
+}

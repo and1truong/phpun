@@ -1032,3 +1032,47 @@ stderr gates, warm comparator MIN/MAX/equal/overflow/capture/bool PHP gate and
 VM-profile pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout; only
 two known pathological range crash/timeout swaps vs parent, no new fail/pass.
 External CI is not yet green. Raw/hash/source manifests preserve all samples.
+
+## #247: guarded scalar dimension writes (2026-10-11)
+
+Reuse DimCv for literal null/bool/int assignment to an existing scalar
+integer-key element in a unique array. Fresh current-table get_cell and shared
+cell_store preserve cell aliases, displaced scalar decrefs and memory charges.
+Shared arrays, missing/nonint/uninitialized keys, globals views, typed/owned/
+merged/readonly cells, containers and pending dimension errors/handlers retain
+full canonical assignment. No offset cache, layout/storage layer or dependency.
+
+The enlarged existing dimension check found a preexisting fallback bug: typed
+reference assignment stored coerced int0 but returned raw false. Shared static/
+CV/dimension assignment paths now return the value committed to cell_store;
+parent mismatch and fixed result verified against PHP. New path rejects these
+typed/readonly cells, so the canonical fallback is tested too.
+
+Final51a8401 release; seven isolated profiler-off PHP-byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/11-sieve.php | 205.174/83.200 | 0.406 |
+| bench/11-sieve.php 5 100000 | 1087.643/426.338 | 0.392 |
+| bench/30-arrays.php | 90.816/92.249 | 1.016 |
+| bench/40-objects.php | 251.942/246.727 | 0.979 |
+| bench/20-strings.php | 166.045/165.885 | 0.999 |
+| bench/10-fib.php | 8.059/8.451 | 1.049 |
+| bench/app/cli.php 100 20 | 35.385/35.346 | 0.999 |
+| examples/composer/run.php | 8.869/8.180 | 0.922 |
+
+Sieve−59.4%, long−60.8%. Arrays+1.6%,fib+4.9% initial medians retained;
+31 follow-up arrays89.678→90.788(+1.2%),fib8.034→7.909(−1.6%).
+No speed claim for nontarget movements; preliminary−63% sieve row retained
+and superseded by final ownership-guard artifact. Still no suite parity.
+
+Separate instrumented sieve physical requests/bytes (not speed timing):
+native-comparator: allocs: 1869802 bytes: 33488028
+scalar-dim-writes-fixed: allocs: 132099 bytes: 13214714
+
+Workspace8core/22runtime/19format,fmt/clippy pass; existing opcode/CoW/alias/
+typed/readonly/ArrayAccess check,25script+19workload byte/exit/stderr gates,
+extended dimension PHP probe andVM-profile pass.3406PHPT2727pass603fail25skip
+38unsupported6crash7timeout; only two known range crash/timeout swaps, no
+new fail/pass/skip. External CI not yet green. Packed/mixed storage #187 is
+still unfinished. Next #249 borrows property declarations during shared stores.
