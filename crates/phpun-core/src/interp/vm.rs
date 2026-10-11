@@ -2605,6 +2605,24 @@ impl<'a> Interp<'a> {
                     // finding: skipped it attributed callee traces to
                     // the previous call's site).
                     let target = targets.pop().expect("InitCall resolved this call");
+                    // A proven scalar kernel cannot rebind globals or call PHP.
+                    // ponytail: exposed $GLOBALS views retain the canonical
+                    // bridge; finer binding epochs need separate evidence.
+                    if comp.top_level
+                        && self.globals_arr.is_none()
+                        && matches!(target, CachedFn::Builtin)
+                    {
+                        self.send_line = Some(*site);
+                        if let Some(value) = self.vm_scalar_builtin(lname, &argv) {
+                            argv.clear();
+                            if self.vm_val_pool.len() < 64 {
+                                self.vm_val_pool.push(argv);
+                            }
+                            vs.push(value);
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     if comp.top_level {
                         // Callees may unset/rebind globals or run GC. Slot
                         // handles must not pin old bindings during the call.
@@ -3548,21 +3566,9 @@ impl<'a> Interp<'a> {
         self.vm_run(decl, comp, args)
     }
 
-    fn vm_call(
-        &mut self,
-        lname: &str,
-        raw: &str,
-        argv: &mut Vec<Value>,
-        site: usize,
-        target: &CachedFn,
-    ) -> Result<Value, PhpError> {
-        self.send_line = Some(site);
-        // Exact scalar kernels cannot expose their transient frame. Preserve
-        // charged arena reservation/free; page growth and every effect/error
-        // domain stay on the canonical builtin/Cell path.
+    fn vm_scalar_builtin(&mut self, lname: &str, argv: &[Value]) -> Option<Value> {
         let span = (super::VM_FRAME_SLOTS + argv.len() as u64) * 16;
-        if matches!(target, CachedFn::Builtin)
-            && !Self::callprof_on()
+        if !Self::callprof_on()
             && !coverage_on()
             && self.cast_err.is_none()
             && self.callable_probe_err.is_none()
@@ -3578,6 +3584,23 @@ impl<'a> Interp<'a> {
                 let mut args = super::CallArgs::empty();
                 self.vm_call_reserve(&mut args, argv.len() as u64);
                 self.vm_frame_free(&args.vm_sites);
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn vm_call(
+        &mut self,
+        lname: &str,
+        raw: &str,
+        argv: &mut Vec<Value>,
+        site: usize,
+        target: &CachedFn,
+    ) -> Result<Value, PhpError> {
+        self.send_line = Some(site);
+        if matches!(target, CachedFn::Builtin) {
+            if let Some(value) = self.vm_scalar_builtin(lname, argv) {
                 return Ok(value);
             }
         }
@@ -3747,6 +3770,27 @@ var_dump($count, $b[2], $c[0]);
     #[test]
     fn callback_values_preserve_live_args_fallbacks_sort_errors_and_owners() {
         let mut it = Interp::new("callbacks.php");
+        let mut root = Interp::new("scalar-root.php");
+        let initial: Vec<_> = root.vm_stack.iter().map(|s| (s.size, s.used)).collect();
+        let result = root.run_source(
+            r#"<?php
+$s = "abcd"; $a = substr($s, 1, 2); echo $a, "\n";
+$GLOBALS['s'] = "WXYZ"; $a = substr($s, 1, 2); echo $a, "\n";
+function change_scalar_root() { unset($GLOBALS['s']); $GLOBALS['s'] = "1234"; return 4; }
+$n = sqrt(change_scalar_root()); echo $n, " ", substr($s, 1, 2), "\n";
+"#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", root.err_buf);
+        assert_eq!(root.out, b"bc\nXY\n2 23\n");
+        assert_eq!(root.err_buf, "");
+        assert_eq!(
+            root.vm_stack
+                .iter()
+                .map(|s| (s.size, s.used))
+                .collect::<Vec<_>>(),
+            initial
+        );
+
         // Builtin binding borrows complete positional Cells; incomplete or
         // named packs still run the canonical owned/default/error binder.
         let exact = super::super::CallArgs::positional(vec![
