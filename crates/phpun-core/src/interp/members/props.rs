@@ -97,12 +97,11 @@ impl<'a> Interp<'a> {
                     let mut o = obj.borrow_mut();
                     if let Some(s) = o.slots.get_mut(i) {
                         match s.take() {
-                            Some(slot) => {
-                                let c = slot.cell();
+                            Some(c) => {
                                 *c.borrow_mut() = v;
-                                *s = Some(crate::value::ObjectSlot::Cell(c));
+                                *s = Some(c);
                             }
-                            None => *s = Some(crate::value::ObjectSlot::Cell(super::cell(v))),
+                            None => *s = Some(super::cell(v)),
                         }
                         o.unset_props.remove(&dc.flat_props.get().unwrap()[i].key);
                         return Ok(());

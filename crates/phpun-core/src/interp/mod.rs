@@ -6371,7 +6371,7 @@ impl<'a> Interp<'a> {
         {
             let b = o.borrow();
             for name in b.prop_order.iter() {
-                let Some(c) = b.prop_gc_cell(name) else {
+                let Some(c) = b.prop_get(name) else {
                     continue;
                 };
                 let cb = c.borrow();
@@ -6886,7 +6886,7 @@ impl<'a> Interp<'a> {
         for (pname, c) in ob
             .prop_order
             .iter()
-            .filter_map(|name| ob.prop_gc_cell(name).map(|cell| (name, cell)))
+            .filter_map(|name| ob.prop_get(name).map(|cell| (name, cell)))
         {
             // Private props on classes whose Zend counterpart keeps its
             // storage in pure-C structures (no zval slots): the container
@@ -7057,7 +7057,7 @@ impl<'a> Interp<'a> {
                         self.gc_dying_acquire(
                             b.prop_order
                                 .iter()
-                                .filter_map(|name| b.prop_gc_cell(name))
+                                .filter_map(|name| b.prop_get(name))
                                 .map(|c| Rc::as_ptr(&c)),
                         )
                     };
@@ -7068,7 +7068,7 @@ impl<'a> Interp<'a> {
                             // the selected Cell. No owned key/table snapshot.
                             b.prop_order
                                 .iter()
-                                .filter_map(|name| b.prop_gc_cell(name))
+                                .filter_map(|name| b.prop_get(name))
                                 .nth(i)
                                 .map(|c| (Rc::strong_count(&c), c.borrow().clone()))
                         };

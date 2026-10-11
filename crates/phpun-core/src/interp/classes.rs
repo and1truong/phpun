@@ -3860,9 +3860,8 @@ impl<'a> Interp<'a> {
                             Value::Float(v) => v,
                             _ => unreachable!("all arguments preflighted"),
                         };
-                        let index = o.borrow().decl_slot(&fp.key).unwrap();
-                        o.borrow_mut().slots[index] =
-                            Some(crate::value::ObjectSlot::inline_float(value));
+                        o.borrow_mut()
+                            .prop_insert(&fp.key, cell(Value::Float(value)));
                     }
                     self.vm_frame_free(&args.vm_sites);
                     self.last_call_by_ref = false;
@@ -3930,7 +3929,7 @@ impl<'a> Interp<'a> {
         // the chain walk, redecl-position and hooked-backing rules
         // are class-fixed, computed once in flat_props_of.
         let flat = self.flat_props_of(&cls);
-        let mut slots: Vec<Option<crate::value::ObjectSlot>> = vec![None; flat.len()];
+        let mut slots: Vec<Option<Cell>> = vec![None; flat.len()];
         let prop_order = cls
             .prop_order_template
             .get_or_init(|| Rc::new(flat.iter().map(|fp| fp.key.clone()).collect()))
@@ -3962,7 +3961,7 @@ impl<'a> Interp<'a> {
             if p.ty.is_some() {
                 default = self.prop_typed_write_check(p, c, default)?;
             }
-            slots[fi] = Some(crate::value::ObjectSlot::Cell(cell(default)));
+            slots[fi] = Some(cell(default));
         }
         let internal = if self.is_throwable_cls(&cls) {
             // A throwable's file/line attribute to the executing code
