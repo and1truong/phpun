@@ -4,3 +4,6 @@ destroy
 caught constructor
 Cannot assign string to reference held by property VmReturnedObject::$n of type int
 destroy
+int(2)
+int(2)
+int(9)

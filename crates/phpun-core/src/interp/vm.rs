@@ -2503,15 +2503,22 @@ impl<'a> Interp<'a> {
                     name,
                     fallback,
                 } => {
-                    match crate::interp::util::lkey_get(&self.classes, name) {
-                        Some(cls) => {
-                            let cls = cls.clone();
-                            let ctor = self.find_method_in(&cls, "__construct");
-                            ntargets.push((cls, ctor));
-                        }
+                    let target =
+                        crate::interp::util::lkey_get(&self.classes, name).and_then(|cls| {
+                            let ctor = self.find_method_in(cls, "__construct");
+                            if ctor
+                                .as_ref()
+                                .is_some_and(|(m, _)| m.decl.params.iter().any(|p| p.by_ref))
+                            {
+                                return None;
+                            }
+                            Some((cls.clone(), ctor))
+                        });
+                    match target {
+                        Some(target) => ntargets.push(target),
                         None => {
-                            // Autoload / not-found path lives in the
-                            // canonical eval — verbatim errors.
+                            // Autoload, missing classes and by-ref ctor arguments
+                            // retain the canonical binder and caller Cells.
                             self.vm_materialize(comp, slots);
                             let r = self.eval(fallback);
                             self.vm_refresh(comp, slots);
