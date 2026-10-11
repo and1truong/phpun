@@ -3043,7 +3043,10 @@ impl<'a> Interp<'a> {
     /// Zend link semantics: at a class's first use, every const
     /// initializer is evaluated — eval errors (undefined constant)
     /// propagate as Errors, then typed checks raise TypeErrors.
-    fn link_const_inits(&mut self, cls: &Rc<PhpClass>) -> Result<(), PhpError> {
+    pub(in crate::interp) fn link_const_inits(
+        &mut self,
+        cls: &Rc<PhpClass>,
+    ) -> Result<(), PhpError> {
         let lname = cls.decl.name.to_lowercase();
         if !self.consts_linked.insert(lname) {
             return Ok(());
@@ -3588,7 +3591,11 @@ impl<'a> Interp<'a> {
                 // The dead closure's per-instance statics table dies
                 // with it — the recycled id must not leak stale
                 // entries to an unrelated decl of the same name.
-                self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
+                let mut key = String::with_capacity(name.len() + 6);
+                key.push_str(name);
+                key.push_str("\0c");
+                key.push_str(&(i + 1).to_string());
+                self.statics.remove(&key);
             }
             self.obj_handles[i] = w;
             self.obj_born[i] = self.spawn_seq;

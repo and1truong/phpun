@@ -2051,12 +2051,7 @@ impl PhpClass {
         // is fixed at registration.
         self.short_name
             .get_or_init(|| {
-                let n = self
-                    .decl
-                    .name
-                    .split('\0')
-                    .next()
-                    .unwrap_or(&self.decl.name);
+                let n = self.decl.name.split('\0').next().unwrap_or(&self.decl.name);
                 // Ordinary names cannot contain the anonymous-class marker.
                 if !n.contains('@') {
                     return n.into();
@@ -2458,8 +2453,7 @@ impl PhpObject {
 /// whose Weak could go dead bumps this — `push_handle`'s tail scan
 /// skips itself entirely while the epoch is unchanged (a dead slot
 /// can only appear after a drop).
-pub(crate) static HANDLE_DROPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HANDLE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Drop for PhpObject {
     fn drop(&mut self) {

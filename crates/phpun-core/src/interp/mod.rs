@@ -3127,12 +3127,23 @@ impl<'a> Interp<'a> {
     /// nested statement's unwind must not free an outer statement's
     /// live temps (bug29368_3).
     fn sweep_expr_temps(&mut self, base: usize) -> Result<(), PhpError> {
+        self.sweep_expr_temps_ret(base, None)
+    }
+
+    /// `keep` = a value the caller is about to receive (this frame's
+    /// return): its temp must outlive this teardown — the enclosing
+    /// statement's discard check finds it by pointer in expr_temps.
+    /// Other survivors already have real owners and drop as before.
+    fn sweep_expr_temps_ret(&mut self, base: usize, keep: Option<usize>) -> Result<(), PhpError> {
         if self.expr_temps.len() == base {
             return Ok(());
         }
         let temps = self.expr_temps.split_off(base);
         for o in temps {
             if Rc::strong_count(&o) != 1 {
+                if keep.is_some_and(|k| Rc::as_ptr(&o) as usize == k) && Rc::strong_count(&o) == 2 {
+                    self.expr_temps.push(o);
+                }
                 continue;
             }
             let key = Rc::as_ptr(&o) as usize;
