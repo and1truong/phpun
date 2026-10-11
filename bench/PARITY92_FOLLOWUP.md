@@ -1929,3 +1929,46 @@ no new fail/pass/skip. Candidate summary retained: {'total': 3406, 'passed': 272
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/pure-root-builtins-*.
+
+## #301: perf(vm): report rejected optional builtin reference-SEND experiment (2026-10-11)
+
+Experiment limited InitCall builtin reference flags to supplied positional args, retaining supplied references/user declarations/named/unpack. This unlocked existing guarded 3-arg replacement kernels. The prototype was tested and measured, then REJECTED; final source uses an ordinary revert and has no runtime delta from #302.
+
+Do not treat the rejected frozen candidate ELF c02f8b6 as final runtime. Original reference SEND is restored. Full raw negatives, physical counters and native alias/error/named/unpack probes retained. No allocation gain implies a speed gain.
+
+Runtime bc148d8df07176022991a40fb2f5697d2e24b735; timing source ebf62d63a4d59e110fb08ea2d0eae5c69660c379; report/integration source ebf62d63a4d59e110fb08ea2d0eae5c69660c379.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 54.599 | 57.701 | 1.0568 |
+| bench/20-strings.php 100 | 241.244 | 246.946 | 1.0236 |
+| bench/profile/strings.php replace 20000 | 689.913 | 626.080 | 0.9075 |
+| bench/profile/strings.php slice 20000 | 68.005 | 71.072 | 1.0451 |
+| bench/40-objects.php | 155.317 | 159.929 | 1.0297 |
+| bench/11-sieve.php | 65.607 | 64.277 | 0.9797 |
+| bench/30-arrays.php | 78.601 | 78.016 | 0.9925 |
+| bench/60-json.php | 519.294 | 516.556 | 0.9947 |
+| bench/10-fib.php | 8.557 | 9.267 | 1.0830 |
+| bench/app/cli.php 100 20 | 34.145 | 33.152 | 0.9709 |
+| examples/composer/run.php | 8.832 | 8.541 | 0.9670 |
+
+7pairs strings+5.7%default/+2.4%long,objects+3.0%,fib+8.3%,slice+4.5%,sieve−2.0%,arrays−.7%,JSON−.5%,app−2.9%,Composer−3.3%.31negativefollowupstrings+1.0%default/+2.8%long,objects+.2%,fib+3.6%,slice−2.9%. Target strings still no speed benefit. Physicalstrings100 requests2902882→2850882(−52000),bytes120177245→114093273; tiny argv path delta included. Replace selector has switch/AST root, physicalrequests992181 unchanged; its timing−9.3% is not proof of InitCall optimization. Revert rather than ship a measured slowdown.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings100: requests 2902882→2850882; bytes 120177245→114093273.
+- replace20000: requests 992181→992181; bytes 5452238184→5452238212.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing callback unit extended in prototype; native omitted/provided aliases,named/unpack,arity/type errors,regex optional outputs,user default/variadic refs byte-identical. Original unit restored by ordinary revert.
+All3406individualPHPT compared; 0 known range crash/timeout swaps,
+no new fail/pass/skip. Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/optional-builtin-ref-args-*.
+
+Final #301 decision: ordinary revert restores exact #302 runtime (crates/Cargo diff empty, checked). Frozen optional-builtin-ref-args ELF is rejected; final uses verified parent pure-root-builtins ELF d193a8f and parent status map. No source rebuild needed for unchanged runtime.
