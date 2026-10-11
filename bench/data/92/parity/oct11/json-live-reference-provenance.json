@@ -1,0 +1,70 @@
+{
+  "source": "6736e0aa8557832912a2ffd425053203754df44a",
+  "runtime": "69f2aceb5908054c803410140174f1a1587c0b18",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "json",
+      "before": {
+        "requests": 4360112,
+        "bytes": 313225786
+      },
+      "after": {
+        "requests": 4360112,
+        "bytes": 296860642
+      }
+    }
+  ],
+  "binary_sha256": "857050a011f1074cd4f1bd40dbc62e61bd12844f10a59e8007b061a7e549251b",
+  "scope": "Fix merged #316 JSON regression: callback mutating a later by-ref scalar must encode [0,7], not main [0,1]. Keep original live Cell snapshots for cell storage, read payload at each encoding step; packed storage snapshots Value vectors with implicit keys and avoids cell materialization. Single shared output loop; no new snapshot abstraction/backend/dependency.",
+  "fallbacks": "Preserve legacy alias/callback/unset/recursion/borrow behavior. Packed decode stays enabled; no blanket revert of JSON perf. ONE existing streaming JSON unit adds referenced scalar callback mutation, native complete probe compared."
+}

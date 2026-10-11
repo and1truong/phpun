@@ -2347,3 +2347,40 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/frame-reset-buffers-*.
+
+## #319: fix(json): keep live reference cells in encode snapshots and packed values cell-free (2026-10-11)
+
+Fix merged #316 JSON regression: callback mutating a later by-ref scalar must encode [0,7], not main [0,1]. Keep original live Cell snapshots for cell storage, read payload at each encoding step; packed storage snapshots Value vectors with implicit keys and avoids cell materialization. Single shared output loop; no new snapshot abstraction/backend/dependency.
+
+Preserve legacy alias/callback/unset/recursion/borrow behavior. Packed decode stays enabled; no blanket revert of JSON perf. ONE existing streaming JSON unit adds referenced scalar callback mutation, native complete probe compared.
+
+Runtime 69f2aceb5908054c803410140174f1a1587c0b18; timing source 69f2aceb5908054c803410140174f1a1587c0b18; report/integration source 6736e0aa8557832912a2ffd425053203754df44a.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/60-json.php | 489.472 | 476.407 | 0.9733 |
+| bench/40-objects.php | 144.828 | 151.117 | 1.0434 |
+| bench/40-objects.php 20 5000 | 587.204 | 579.215 | 0.9864 |
+| bench/20-strings.php | 60.378 | 55.289 | 0.9157 |
+| bench/30-arrays.php | 80.573 | 80.219 | 0.9956 |
+| bench/10-fib.php | 8.174 | 7.977 | 0.9759 |
+| bench/app/cli.php 100 20 | 35.564 | 33.140 | 0.9318 |
+| examples/composer/run.php | 8.224 | 7.966 | 0.9687 |
+
+Oracle/pre316 [0,7],main999 [0,1],fixed [0,7]. All workspace/fmt/clippy/25+19/profile/native pass;full3406only GC77345timeout→pass plus2knownrange swaps,2730pass601fail. Parent serializedGC8728ms alreadyPASS;wall threshold not semantic repair.7JSON489.472→476.407ms(−2.7%);31JSON508.621→492.243(−3.2%).7objects+4.3%,31objects140.497→143.994(+2.5%) retained;unrelatedstrings/app gains not attributed. PhysicalJSON requests4360112UNCHANGED,bytes313225786→296860642 (−16.4MB);no request-elision claim. No overall/PHP parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- json: requests 4360112→4360112; bytes 313225786→296860642.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing JSON unit;complete native probe includes callbacks/hooks/flags/UTF8 and live byref mutation. Original main regression reproducer and frozen hashes already published in321.
+All3406raw:GC77345timeout→pass and2knownrange crash/timeout swaps;2730pass601fail. Parent frozen serialized8728ms alreadyPASS;no semantic repair claimed for wall threshold. Standalone/new unit repairs JSON case missing from PHPT.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/json-live-reference-*.
