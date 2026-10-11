@@ -1,0 +1,49 @@
+{
+  "source": "ebf62d63a4d59e110fb08ea2d0eae5c69660c379",
+  "runtime": "bc148d8df07176022991a40fb2f5697d2e24b735",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "strings100",
+      "before": {
+        "requests": 2902882,
+        "bytes": 120177245
+      },
+      "after": {
+        "requests": 2850882,
+        "bytes": 114093273
+      }
+    },
+    {
+      "label": "replace20000",
+      "before": {
+        "requests": 992181,
+        "bytes": 5452238184
+      },
+      "after": {
+        "requests": 992181,
+        "bytes": 5452238212
+      }
+    }
+  ],
+  "binary_sha256": "c02f8b6007c663ba131cb355c585ec3f7db8558af7e2178968924188a2e2be75",
+  "scope": "Experiment limited InitCall builtin reference flags to supplied positional args, retaining supplied references/user declarations/named/unpack. This unlocked existing guarded 3-arg replacement kernels. The prototype was tested and measured, then REJECTED; final source uses an ordinary revert and has no runtime delta from #302.",
+  "fallbacks": "Do not treat the rejected frozen candidate ELF c02f8b6 as final runtime. Original reference SEND is restored. Full raw negatives, physical counters and native alias/error/named/unpack probes retained. No allocation gain implies a speed gain."
+}
