@@ -1158,10 +1158,14 @@ pub(in crate::builtins) fn php_regex(
             native.jit_error()
         ))?;
     }
-    // ponytail:256patterns,clear on overflow; use byte-budgeted LRU if measured
-    // real working sets exceed this ceiling. Reset also frees request keys.
+    // ponytail:PHP's 4096-pattern ceiling, clear on overflow; use byte-budgeted
+    // LRU if real working sets exceed it. Keys >64KiB stay uncached.
+    // The 256 prototype thrashed and re-JITed ordinary 300-pattern sets.
     // Match contexts/limits stay per invocation, including callback reentry.
-    if it.pcre_patterns.len() == 256 {
+    if pat.len() > 64 * 1024 {
+        return Ok(Ok(re));
+    }
+    if it.pcre_patterns.len() == 4096 {
         it.pcre_patterns.clear();
     }
     it.pcre_patterns.insert(pat.to_vec(), re.clone());
@@ -1418,16 +1422,26 @@ mod tests {
             assert!(php_regex(&mut it, b"/[/", "preg_match").unwrap().is_err());
             assert_eq!(it.pcre_patterns.len(), size);
         }
-        for i in 0..256 {
+        for i in 0..4096 {
             php_regex(&mut it, format!("/{i}/").as_bytes(), "preg_match")
                 .unwrap()
                 .unwrap();
-            assert!(it.pcre_patterns.len() <= 256);
+            assert!(it.pcre_patterns.len() <= 4096);
         }
         assert!(!Rc::ptr_eq(
             &first,
             &php_regex(&mut it, b"/a/i", "preg_match").unwrap().unwrap()
         ));
+        let large = format!("/(?#{}a)a/", " ".repeat(64 * 1024));
+        let count = it.pcre_patterns.len();
+        let one = php_regex(&mut it, large.as_bytes(), "preg_match")
+            .unwrap()
+            .unwrap();
+        let two = php_regex(&mut it, large.as_bytes(), "preg_match")
+            .unwrap()
+            .unwrap();
+        assert_eq!(it.pcre_patterns.len(), count);
+        assert!(!Rc::ptr_eq(&one, &two));
         let re = php_regex(&mut it, b"/(*NO_JIT)a/", "preg_match")
             .unwrap()
             .unwrap();
