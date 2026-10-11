@@ -1157,10 +1157,11 @@ impl<'a> Interp<'a> {
                 let found = cls
                     .as_ref()
                     .and_then(|c| s.find_method_in(c, "__construct"));
+                // The resolved Rc pins immutable metadata through argument
+                // evaluation; avoid cloning every parameter/default/type.
                 let params = found
                     .as_ref()
-                    .map(|m| m.0.decl.params.clone())
-                    .unwrap_or_default();
+                    .map_or(&[][..], |m| m.0.decl.params.as_slice());
                 // ctx is the ctor's diagnostic name — arg_cells wraps
                 // it as "{ctx}()" for arg errors. Oracle prints the
                 // ctor's DECLARING class (`P::__construct():` when C
@@ -1171,8 +1172,9 @@ impl<'a> Interp<'a> {
                 // has no arg diagnostics to name, so the fallback is
                 // only for the not-found/unresolved edge.
                 let owner = found
+                    .as_ref()
                     .map(|(_, o)| o.decl.name.clone())
-                    .or_else(|| cls.map(|c| c.decl.name.clone()))
+                    .or_else(|| cls.as_ref().map(|c| c.decl.name.clone()))
                     .unwrap_or_else(|| name.clone());
                 let base = owner.split('\0').next().unwrap_or(&owner).to_string();
                 let ctx = if base.contains("@anonymous") {
@@ -1182,7 +1184,7 @@ impl<'a> Interp<'a> {
                 };
                 let argvals = s.arg_cells(
                     args,
-                    &params,
+                    params,
                     &ctx,
                     false,
                     Some(*site),
