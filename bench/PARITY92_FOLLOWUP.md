@@ -1329,3 +1329,35 @@ VM-profile pass. All3406individualPHPTstatuses identical to parent2727pass
 ExternalCI not assertedgreen. Next #260 borrows fully positional builtin
 binding; #262 bypasses engine-family interception for proven ordinary PHP
 methods; #263 emits checked remainder and proven bool native roots.
+
+## #260: borrow complete positional builtin binding Cells (2026-10-11)
+
+Existing resolver returns Cow<Cell slice>. Borrow only when all fixed params
+are supplied positionally, plus an allowed variadic tail. No missing/default/
+hole/name/excess-error remap is needed; preserve Cell identity/coercion/by-ref.
+Other packs keep the original owned binder/errors. Builtin trace function name
+uses Rc::from(&str), avoiding a temporary String. No new cache/dependency.
+Runtimefd92682,58add/5delete including ONE existing runnable check for borrowed/
+owned selection, pointer identity, variadic acceptance and missing/excess errors.
+
+Seven alternating isolated profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/20-strings.php | 127.854/119.961 | 0.938 |
+| bench/20-strings.php 100 | 626.463/572.071 | 0.913 |
+| bench/40-objects.php | 238.148/235.921 | 0.991 |
+| bench/30-arrays.php | 88.235/85.992 | 0.975 |
+| bench/11-sieve.php | 79.697/75.469 | 0.947 |
+| bench/10-fib.php | 8.118/8.281 | 1.020 |
+| bench/app/cli.php 100 20 | 35.973/35.983 | 1.000 |
+| examples/composer/run.php | 8.261/8.089 | 0.979 |
+
+Stringsdefault−6.2%,long−8.7%. Physicalrequests1,578,563→1,337,503
+(−241,060/~15.3%),bytes50,991,188→46,018,264 (−9.8%);objects100krequests
+10,963,260→10,863,260 (−100,000/~0.9%),bytes−0.2%. Preserve fib+2.0%
+negative, no nontarget speed attribution or new suite parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass;
+all3406individualPHPTstatuses identical to one-value callback parent2727pass
+603fail25skip38unsupported6crash7timeout. Explicit release clean/rebuild.
+ExternalCI not assertedgreen. Next #262 ordinary user-method dispatcher.
