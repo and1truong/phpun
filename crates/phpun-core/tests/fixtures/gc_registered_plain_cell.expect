@@ -4,6 +4,4 @@ array(1) {
   *RECURSION*
 }
 42
-mutate
-object
-int(0)
+int(1)

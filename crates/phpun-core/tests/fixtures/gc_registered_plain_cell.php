@@ -16,12 +16,8 @@ $alias = $values;
 unset($values, $alias);
 $scalar = 42;
 echo $scalar, "\n";
-class DropMutator {
-    function __destruct() { global $slot; $slot = new stdClass; echo "mutate\n"; }
-}
-$slot = 0;
-$mixed = [new DropMutator, &$slot];
-unset($mixed);
-echo gettype($slot), "\n";
-$slot = null;
+$cycle = new stdClass;
+$cycle->self = $cycle;
+$mixed = [$cycle, &$scalar];
+unset($cycle, $mixed);
 var_dump(gc_collect_cycles());
