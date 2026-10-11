@@ -218,14 +218,25 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
     ) -> Option<(PropDecl, Rc<PhpClass>)> {
+        self.decl_prop_site(o, pn)
+            .map(|(index, c)| (c.decl.props[index].clone(), c))
+    }
+
+    /// Pin immutable declaration metadata without copying it. This resolves
+    /// the same scope/inheritance as decl_prop, not a mutable object offset.
+    pub(in crate::interp) fn decl_prop_site(
+        &self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+    ) -> Option<(usize, Rc<PhpClass>)> {
         if let Some((index, c)) = self.scope_private_prop(o, pn) {
-            return Some((c.decl.props[index].clone(), c));
+            return Some((index, c));
         }
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
-            for p in &c.decl.props {
+            for (index, p) in c.decl.props.iter().enumerate() {
                 if p.name == pn && p.visibility != crate::ast::Visibility::Private {
-                    return Some((p.clone(), c.clone()));
+                    return Some((index, c.clone()));
                 }
             }
             let parent = c.decl.parent.clone();
@@ -244,7 +255,7 @@ impl<'a> Interp<'a> {
         key: &str,
     ) -> bool {
         !o.borrow().prop_has(key)
-            && self.decl_prop(o, pn).is_none()
+            && self.decl_prop_site(o, pn).is_none()
             && !self.obj_is_a(o, "stdclass")
             && !o.borrow().class.decl.attrs.iter().any(|a| {
                 a.name

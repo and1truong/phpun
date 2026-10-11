@@ -5367,7 +5367,8 @@ impl<'a> Interp<'a> {
                             return Ok(v);
                         }
                     }
-                    if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
+                    if let Some((index, dcls)) = self.decl_prop_site(&o, pn) {
+                        let pd = &dcls.decl.props[index];
                         if let Some(sv) = pd.set_vis {
                             if !self.hook_scope_allows(&o, &dcls, pn, sv) {
                                 return self.set_visibility_error(&dcls, &pd.name, sv);
@@ -5375,7 +5376,8 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
+                if let Some((index, dcls)) = self.decl_prop_site(&o, pn) {
+                    let pd = &dcls.decl.props[index];
                     if pd.readonly {
                         // readonly implies protected(set): one-time init
                         // from the declaring scope only; later writes
@@ -5412,7 +5414,7 @@ impl<'a> Interp<'a> {
                             ));
                         }
                     }
-                    v = self.prop_typed_write_check(&pd, &dcls, v)?;
+                    v = self.prop_typed_write_check(pd, &dcls, v)?;
                 }
                 // Declared-prop slot resolution: private decls write
                 // their mangled `\0C\0p` slot even on first write (the
@@ -5420,7 +5422,8 @@ impl<'a> Interp<'a> {
                 // fall through to __set/dynamic.
                 let cls = o.borrow().class.clone();
                 let k = self.obj_prop_key(&o, pn).or_else(|| {
-                    self.decl_prop(&o, pn).map(|(pd, dcls)| {
+                    self.decl_prop_site(&o, pn).map(|(index, dcls)| {
+                        let pd = &dcls.decl.props[index];
                         if pd.visibility == crate::ast::Visibility::Private {
                             format!("\0{}\0{}", dcls.name(), pd.name)
                         } else {
@@ -5440,7 +5443,7 @@ impl<'a> Interp<'a> {
                 // the prop table for names std doesn't know.
                 if k.is_none()
                     && self.aap_active(&o)
-                    && self.decl_prop(&o, pn).is_none()
+                    && self.decl_prop_site(&o, pn).is_none()
                     && !o.borrow().prop_has(pn)
                 {
                     // AAP prop writes route through spl_array_write_
