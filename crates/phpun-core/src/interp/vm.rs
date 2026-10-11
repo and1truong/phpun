@@ -3477,6 +3477,52 @@ set:3:false
     #[test]
     fn callback_values_preserve_live_args_fallbacks_sort_errors_and_owners() {
         let mut it = Interp::new("callbacks.php");
+        // Builtin binding borrows complete positional Cells; incomplete or
+        // named packs still run the canonical owned/default/error binder.
+        let exact = super::super::CallArgs::positional(vec![
+            super::cell(super::Value::str("abcd")),
+            super::cell(super::Value::Int(1)),
+            super::cell(super::Value::Int(2)),
+        ]);
+        let params = crate::builtins::builtin_params("substr").unwrap();
+        let bound = it.resolve_named_builtin("substr", params, &exact).unwrap();
+        assert!(matches!(bound, std::borrow::Cow::Borrowed(_)));
+        assert!(std::rc::Rc::ptr_eq(&bound[0], &exact.cells[0]));
+        let partial = super::super::CallArgs::positional(exact.cells[..2].to_vec());
+        assert!(matches!(
+            it.resolve_named_builtin("substr", params, &partial)
+                .unwrap(),
+            std::borrow::Cow::Owned(_)
+        ));
+        let mut named = super::super::CallArgs::positional(exact.cells[..1].to_vec());
+        named
+            .named
+            .push(("offset".into(), exact.cells[1].clone(), false, false));
+        assert!(matches!(
+            it.resolve_named_builtin("substr", params, &named).unwrap(),
+            std::borrow::Cow::Owned(_)
+        ));
+        let excessive = super::super::CallArgs::positional(vec![exact.cells[0].clone(); 4]);
+        assert!(it
+            .resolve_named_builtin("substr", params, &excessive)
+            .is_err());
+        let variadic = super::super::CallArgs::positional(vec![
+            super::cell(super::Value::Int(3)),
+            super::cell(super::Value::Int(1)),
+        ]);
+        assert!(matches!(
+            it.resolve_named_builtin(
+                "min",
+                crate::builtins::builtin_params("min").unwrap(),
+                &variadic
+            )
+            .unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let missing = super::super::CallArgs::empty();
+        assert!(it
+            .resolve_named_builtin("substr", params, &missing)
+            .is_err());
         let result = it.run_source(r#"<?php
 function liveCallbackArg() { return debug_backtrace(0, 2)[1]['args'][0]; }
 var_dump(array_map(function(int $x): int { $x++; echo json_encode(func_get_args()), "\n"; return liveCallbackArg(); }, ['a'=>1,'b'=>2]));
