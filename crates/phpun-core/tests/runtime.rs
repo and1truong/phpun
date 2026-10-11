@@ -882,6 +882,15 @@ class StreamLiveRef implements JsonSerializable {
 }
 $next = 1; $refs = [new StreamLiveRef, &$next];
 echo json_encode($refs), "\n";
+class StreamArrayRef implements JsonSerializable {
+    function jsonSerialize(): mixed { global $snapshot; $snapshot[1] = 7; return 0; }
+}
+$snapshot = [new StreamArrayRef, 1]; $alias =& $snapshot[1]; unset($alias);
+echo json_encode($snapshot), "\n";
+$snapshot = [new StreamArrayRef, 1]; $alias =& $snapshot[1];
+echo json_encode($snapshot), "\n";
+$snapshot = [new StreamArrayRef, 1]; unset($alias);
+echo json_encode($snapshot), "\n";
 "#,
         &[],
     );
@@ -907,6 +916,9 @@ NULL
 4
 bool(false)
 [0,7]
+[0,1]
+[0,7]
+[0,1]
 "#
     );
     assert_eq!(err, "");
