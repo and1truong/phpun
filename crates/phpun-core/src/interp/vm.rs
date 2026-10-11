@@ -4583,6 +4583,56 @@ unset($a); var_dump($weak->get());
             .vm_method_target(object, "__construct", &std::cell::RefCell::new(None), 1)
             .expect("empty promoted constructor retains direct target");
         assert!(target.1.comp.value_abi);
+        let mut fresh = Interp::new("fresh-float.php");
+        let stmts = crate::parser::parse_source(
+            "<?php class FreshFloat { function __construct(private float $x, public float $y) {} function values() { return [$this->x,$this->y]; } }",
+            false,
+        ).unwrap();
+        assert!(matches!(
+            fresh.exec_block(&stmts),
+            super::super::Flow::Normal
+        ));
+        assert!(fresh.vm_frame_pool.is_empty());
+        let mut args = super::super::CallArgs::positional(vec![
+            super::cell(super::Value::Int(3)),
+            super::cell(super::Value::Float(4.0)),
+        ]);
+        fresh.vm_call_reserve(&mut args, 2);
+        let before: Vec<_> = fresh.vm_stack.iter().map(|s| (s.size, s.used)).collect();
+        let object = fresh.new_instance("FreshFloat", args).unwrap();
+        assert!(
+            fresh.vm_frame_pool.is_empty(),
+            "fresh float promotions bypass canonical frames"
+        );
+        assert_eq!(
+            fresh
+                .vm_stack
+                .iter()
+                .map(|s| (s.size, s.used))
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|(size, used)| (*size, used - (super::super::VM_FRAME_SLOTS + 2) * 16))
+                .collect::<Vec<_>>()
+        );
+        let result = fresh
+            .method_invoke_vis(
+                match object {
+                    super::Value::Object(o) => o,
+                    _ => panic!("object"),
+                },
+                "values",
+                super::super::CallArgs::empty(),
+                None,
+            )
+            .unwrap();
+        let super::Value::Array(values) = result else {
+            panic!("values")
+        };
+        assert!(matches!(
+            *values.borrow().entries.first().unwrap().1.borrow(),
+            super::Value::Float(3.0)
+        ));
         let mut leaf = Interp::new("float-leaf.php");
         let stmts = crate::parser::parse_source(
             r#"<?php

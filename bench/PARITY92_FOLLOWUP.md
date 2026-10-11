@@ -2425,6 +2425,45 @@ this is not full compatibility. Explicit release core clean/rebuild/hash recorde
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/float-method-leaves-*.
 
+## #324: perf(objects): skip call frames for proven fresh float-only promotions (2026-10-11)
+
+Actual AST new_instance path skips frames only for fresh same-class/root-scope public empty userland constructors with fully supplied fixed by-value promoted float parameters. Preflight metadata, argument types and uninitialized unhooked/non-readonly storage before any write; Int-to-Float widening matches PHP. Existing prop_insert and vm_frame_free handle storage/paid arena spans. No benchmark recognizer, new cache/layout/helper/dependency.
+
+Named/default/missing/extra/ref/inherited/nonempty/internal/visibility/readonly/hooks/pending-context/error/profiler/coverage/deadline/OOM or unreserved spans retain full canonical dispatch. ONE existing receiver unit proves actual frame bypass, values and arena repayment; extended native probe covers fallback matrix.
+
+Runtime d5a65fba4d5e54e7f759cfa79d7f24c3117cad17; timing source d5a65fba4d5e54e7f759cfa79d7f24c3117cad17; report/integration source d5a65fba4d5e54e7f759cfa79d7f24c3117cad17.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 148.279 | 115.834 | 0.7812 |
+| bench/40-objects.php 20 5000 | 504.609 | 476.436 | 0.9442 |
+| bench/20-strings.php | 52.881 | 52.318 | 0.9893 |
+| bench/60-json.php | 494.278 | 510.050 | 1.0319 |
+| bench/11-sieve.php | 62.692 | 63.103 | 1.0066 |
+| bench/10-fib.php | 8.057 | 8.346 | 1.0359 |
+| bench/30-arrays.php | 77.082 | 79.632 | 1.0331 |
+| bench/app/cli.php 100 20 | 34.717 | 34.138 | 0.9833 |
+| examples/composer/run.php | 8.302 | 9.195 | 1.1075 |
+
+Pre-P2 JSON-review dataset frozen d5a65fb/9b85d20,not corrected final stack.7objects148.279→115.834ms(−21.9%),long504.609→476.436(−5.6%);31objects120.680→100.577(−16.7%),long480.759→430.403(−10.5%). Physicalobjects1358161→1058127requests(−300034/~22.1%),arrays636049 unchanged; byte differences in arrays4B path/context only. InitialJSON+3.2%,fib+3.6%,arrays+3.3%,Composer+10.7%;31JSON+.8%,arrays−.8%,Composer+2.3% retained. All3406onlyGC77345pass→timeout;serializedparent8297/candidate8620msPASS with strict10s,raw timeout preserved. Current #323 P2 dead-reference fix being validated/backported; PR remains draft until integrated heads verified. No whole-suite/PHP parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1358161→1058127; bytes 64355869→57272483.
+- arrays: requests 636049→636049; bytes 26704237→26704241.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing receiver check proves no canonical frame is allocated, Float values and original arena repayment. Complete native probe verifies default/named/inherited/readonly/hooked/backtrace/body/liveargs/reference/type/visibility fallbacks.
+All3406rawonlyGC77345pass→timeout (2729pass601fail);serializedstrict10s parent8297/candidate8620PASS separately published. No new semantic pass/fail claim.
+Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/fresh-promoted-float-*.
+
 ## #319: fix(json): validate live and dead reference snapshots after review (2026-10-11)
 
 P2 review repair27f7c00: snapshot previously referenced single-owner Cells as fresh value Cells, so JSON snapshot does not revive an unset alias across source-array CoW. Genuinely live references stay live; packed values stay cell-free. ONE existing streaming JSON unit adds dead/live/nonref source mutation cases.
@@ -2496,3 +2535,41 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/float-method-leaves-review-*.
+
+## #324: perf(objects): verify fresh float promotion frame bypass after JSON repair (2026-10-11)
+
+Actual AST new_instance path skips frames only for fresh same-class/root-scope public empty userland constructors with fully supplied fixed by-value promoted float parameters. Preflight metadata, argument types and uninitialized unhooked/non-readonly storage before any write; Int-to-Float widening matches PHP. Existing prop_insert and vm_frame_free handle storage/paid arena spans. No benchmark recognizer, new cache/layout/helper/dependency.
+
+Named/default/missing/extra/ref/inherited/nonempty/internal/visibility/readonly/hooks/pending-context/error/profiler/coverage/deadline/OOM or unreserved spans retain full canonical dispatch. ONE existing receiver unit proves actual frame bypass, values and arena repayment; extended native probe covers fallback matrix.
+
+Runtime af590b100f6243b71a7b061a85df03604aa2e183; timing source af590b100f6243b71a7b061a85df03604aa2e183; report/integration source 1c19eb0bc1828f4ebd10a645210a59a0558d1923.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 123.679 | 102.915 | 0.8321 |
+| bench/40-objects.php 20 5000 | 454.475 | 420.036 | 0.9242 |
+| bench/60-json.php | 536.281 | 511.503 | 0.9538 |
+| bench/20-strings.php | 56.263 | 56.629 | 1.0065 |
+| bench/11-sieve.php | 64.698 | 63.723 | 0.9849 |
+| bench/30-arrays.php | 78.387 | 77.097 | 0.9835 |
+| bench/app/cli.php 100 20 | 32.259 | 32.450 | 1.0059 |
+| examples/composer/run.php | 8.077 | 8.099 | 1.0028 |
+
+Corrected JSON main6c10715 baseline, corrected parentfloat77cd3da/d6dc53c vs freshaf590b1/d261288.7objects123.679→102.915ms(−16.8%),long454.475→420.036(−7.6%);31objects127.486→106.070(−16.8%),long475.879→439.881(−7.6%). Physical1358161→1058127requests(−300034),arrays636049 unchanged.7JSON−4.6%,strings+.7%,sieve−1.5%,arrays−1.6%,app+.6%,Composer+.3% retained;31JSON493.924→515.965(+4.5% negative),app36.453→34.185(−6.2%,not attributed),Composer8.854→8.863(+.1%flat). Whole7rotating nativePHP/main6c107/parent/final:geo3.91818→3.79268×PHP (−3.20%main),parent→candidate−.86%only;objects12.486×PHP,long23.848×,not parity. Whole negative JSON+5.6%,app+5.2%,Composer+8.2% versus parent retained;31followup above. All3406only2knownrangeswaps,2730pass601fail;workspace/fmt/clippy/combined JSON live/dead refs+constructor native probes allPASS. Earlier pre-P2 data kept separately and not multiplied.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1358161→1058127; bytes 64355897→57272511.
+- arrays: requests 636049→636049; bytes 26704265→26704269.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing receiver check proves no canonical frame is allocated, Float values and original arena repayment. Complete native probe verifies default/named/inherited/readonly/hooked/backtrace/body/liveargs/reference/type/visibility fallbacks.
+All3406only2knownrange crash/timeout swaps;2730pass601fail,other individualstatuses identical corrected parent.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/fresh-promoted-float-review-*.

@@ -3782,9 +3782,91 @@ impl<'a> Interp<'a> {
         let obj = self.instantiate(&lname, &[])?;
         // __construct (native for builtins via method_invoke's
         // interception); the ctor may be inherited (property_hooks/foreach).
-        if let Some(ctor) = ctor {
+        if let Some((m, dc)) = ctor {
             if let Value::Object(o) = &obj {
-                if let Err(e) = self.method_invoke_vis(o.clone(), "__construct", args, Some(ctor)) {
+                // ponytail: fresh, same-class, fully supplied float promotions
+                // only. All proof precedes stores; every miss keeps call frames.
+                let flat = cls.flat_props.get();
+                let float_type = |ty: &Option<Vec<String>>| {
+                    ty.as_ref()
+                        .is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("float"))
+                };
+                let direct = Rc::ptr_eq(&cls, &dc)
+                    && cls.decl.parent.is_none()
+                    && !cls.decl.readonly
+                    && !m.is_static
+                    && !m.is_abstract
+                    && m.visibility == crate::ast::Visibility::Public
+                    && m.decl.line > 0
+                    && m.decl.body.is_empty()
+                    && m.decl.attrs.is_empty()
+                    && !m.decl.by_ref
+                    && m.decl.ret.is_none()
+                    && !m.decl.params.is_empty()
+                    && args.named.is_empty()
+                    && args.cells.len() == m.decl.params.len()
+                    && args.vm_slots >= VM_FRAME_SLOTS + args.cells.len() as u64
+                    && !args.vm_sites.is_empty()
+                    && self.cur().decl_class.is_none()
+                    && self.cur().scope_class.is_none()
+                    && self.const_self.is_none()
+                    && self.pending_hook_prop.is_none()
+                    && !self.pending_gen_body
+                    && self.pending_gen_captures.is_empty()
+                    && self.pending_decl_class.is_none()
+                    && self.pending_called_class.is_none()
+                    && self.pending_decl_site.is_none()
+                    && self.last_ret_cell.is_none()
+                    && self.last_prop_ov.is_none()
+                    && !Self::callprof_on()
+                    && !super::vm::coverage_on()
+                    && self.deadline.is_none()
+                    && !self.in_handler
+                    && self.cast_err.is_none()
+                    && self.callable_probe_err.is_none()
+                    && !crate::value::cmp_notices_pending()
+                    && !self.mem_exceeded
+                    && self.oom_at.is_none()
+                    && m.decl.params.iter().zip(&args.cells).all(|(p, c)| {
+                        p.promoted
+                            && !p.by_ref
+                            && !p.variadic
+                            && !p.readonly
+                            && p.hooks.is_none()
+                            && float_type(&p.ty)
+                            && matches!(*c.borrow(), Value::Int(_) | Value::Float(_))
+                            && flat.is_some_and(|flat| {
+                                flat.iter().enumerate().any(|(i, fp)| {
+                                    let prop = &fp.declaring.decl.props[fp.prop_idx];
+                                    Rc::ptr_eq(&fp.declaring, &dc)
+                                        && prop.name == p.name
+                                        && !prop.readonly
+                                        && prop.hooks.is_none()
+                                        && float_type(&prop.ty)
+                                        && o.borrow().slots.get(i).is_some_and(|c| c.is_none())
+                                })
+                            })
+                    });
+                if direct {
+                    let flat = flat.unwrap();
+                    for (p, c) in m.decl.params.iter().zip(&args.cells) {
+                        let fp = flat
+                            .iter()
+                            .find(|fp| dc.decl.props[fp.prop_idx].name == p.name)
+                            .unwrap();
+                        let value = match *c.borrow() {
+                            Value::Int(v) => v as f64,
+                            Value::Float(v) => v,
+                            _ => unreachable!("all arguments preflighted"),
+                        };
+                        o.borrow_mut()
+                            .prop_insert(&fp.key, cell(Value::Float(value)));
+                    }
+                    self.vm_frame_free(&args.vm_sites);
+                    self.last_call_by_ref = false;
+                } else if let Err(e) =
+                    self.method_invoke_vis(o.clone(), "__construct", args, Some((m, dc)))
+                {
                     // A ctor that throws leaves a half-built object;
                     // zend never runs its __destruct (bug29368_1/_3).
                     self.mark_destructed(o);
