@@ -1251,6 +1251,7 @@ impl Compiler {
             | Expr::Index { .. }
             | Expr::Prop { .. }
             | Expr::StaticProp { .. }
+            | Expr::MethodCall { .. }
             | Expr::StaticCall { .. }
             | Expr::StaticCallDyn { .. }
             | Expr::ClassConst { .. }
@@ -2302,8 +2303,9 @@ impl<'a> Interp<'a> {
                         Some(Value::Object(o)) => self.vm_method_target(o, name, cache, *site),
                         _ => None,
                     };
-                    mtargets.push(hit.clone());
-                    if hit.is_none() {
+                    if let Some(hit) = hit {
+                        mtargets.push(Some(hit));
+                    } else {
                         // Receiver or target outside the direct subset —
                         // canonical eval keeps the full semantics (undef
                         // CV warning, member-on-scalar error, __call).
