@@ -1,4 +1,4 @@
-//! A bounded, W^X integer tier. Only proven pure graphs may restart in the VM.
+//! A bounded, W^X integer/boolean tier. Proven pure graphs may restart in the VM.
 use super::{CachedFn, Compiled, FunctionDecl, Interp, Op, Rc, Slot, Value};
 use std::cell::Cell;
 
@@ -138,7 +138,8 @@ impl Graph {
 }
 
 // The accepted value stack contains integers only. Comparisons may create a
-// bool only immediately before its consuming conditional branch. All joins,
+// bool only before its consuming conditional branch or proven bool-root return.
+// All joins,
 // including backward edges, must have one consistent stack depth.
 fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
     let mut depths: Vec<Option<usize>> = vec![None; c.ops.len() + 1];
@@ -180,6 +181,13 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             _ => return None,
         };
         let next = n.checked_sub(take)? + give;
+        // No edge may skip the comparison proving a bool return value.
+        if boolean
+            && matches!(op, Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t)
+            if matches!(c.ops.get(*t), Some(Op::Return)))
+        {
+            return None;
+        }
         if boolean && matches!(op, Op::Return) && !pc.checked_sub(1).is_some_and(|p| {
             matches!(&c.ops[p], Op::Binary(op) | Op::BinaryCv(op, _) | Op::BinaryCvConst(op, _, _)
                 if matches!(*op, "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">="))
