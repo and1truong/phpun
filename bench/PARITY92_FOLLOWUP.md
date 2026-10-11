@@ -3325,3 +3325,5 @@ Retirement: ordinary reverts 51b5f7f/e32813c/2b0410c restore ALL crates byte-for
 
 PR365 P2 artifact review: removed duplicate uncompressed PHPT JSON only after verifying lossless gzip byte identity; inherited PHPT representations also consolidated in #363 and ordinarily merged here. No measurement or runtime change.
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
+
+Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
