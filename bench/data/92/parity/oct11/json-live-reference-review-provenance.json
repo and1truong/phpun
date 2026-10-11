@@ -1,0 +1,70 @@
+{
+  "source": "6c107153902dcda3367dfe3eab835e065121ff79",
+  "runtime": "27f7c00f97d682f6116c6e91c223543ba575299b",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "json",
+      "before": {
+        "requests": 4360112,
+        "bytes": 296860642
+      },
+      "after": {
+        "requests": 4360112,
+        "bytes": 296860670
+      }
+    }
+  ],
+  "binary_sha256": "cae5751c754d3fe52b3a2c42916e7616d6c5c6a7b542b814744dd36ccec2e55f",
+  "scope": "P2 review repair27f7c00: snapshot previously referenced single-owner Cells as fresh value Cells, so JSON snapshot does not revive an unset alias across source-array CoW. Genuinely live references stay live; packed values stay cell-free. ONE existing streaming JSON unit adds dead/live/nonref source mutation cases.",
+  "fallbacks": "Retain shared output loop, alias/CoW/recursion/hooks/UTF8/flag/error behavior. Complete native probe validates PHP [0,1],[0,7],[0,1]; original-fix outputs [0,7],[0,7],[0,1]. Scope is semantics repair, no speed claim."
+}
