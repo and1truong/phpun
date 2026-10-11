@@ -282,10 +282,7 @@ pub(crate) fn dispatch(
             } else {
                 None
             };
-            match php_substr(&s, start, len) {
-                Some(x) => Value::bytes(x),
-                None => Value::Bool(false),
-            }
+            substr_value(&s, start, len)
         }
         "substr_count" => {
             let source = arg(args, 0);
@@ -1406,6 +1403,13 @@ fn str_replace(
         apply(subj)?
     };
     Ok((result, count))
+}
+
+pub(in crate::builtins) fn substr_value(s: &[u8], start: i64, len: Option<i64>) -> Value {
+    match php_substr(s, start, len) {
+        Some(x) => Value::bytes(x),
+        None => Value::Bool(false),
+    }
 }
 
 pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<Vec<u8>> {

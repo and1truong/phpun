@@ -3336,6 +3336,29 @@ impl<'a> Interp<'a> {
         target: &CachedFn,
     ) -> Result<Value, PhpError> {
         self.send_line = Some(site);
+        // Exact scalar kernels cannot expose their transient frame. Preserve
+        // charged arena reservation/free; page growth and every effect/error
+        // domain stay on the canonical builtin/Cell path.
+        let span = (super::VM_FRAME_SLOTS + argv.len() as u64) * 16;
+        if matches!(target, CachedFn::Builtin)
+            && !Self::callprof_on()
+            && !coverage_on()
+            && self.cast_err.is_none()
+            && self.callable_probe_err.is_none()
+            && !crate::value::cmp_notices_pending()
+            && !self.mem_exceeded
+            && self
+                .vm_stack
+                .last()
+                .is_some_and(|top| top.size.saturating_sub(top.used) >= span)
+        {
+            if let Some(value) = builtins::call_scalar(lname, argv) {
+                let mut args = super::CallArgs::empty();
+                self.vm_call_reserve(&mut args, argv.len() as u64);
+                self.vm_frame_free(&args.vm_sites);
+                return Ok(value);
+            }
+        }
         let decl = match target {
             CachedFn::Direct(d, _) | CachedFn::Decl(d) => Some(d.clone()),
             CachedFn::Builtin => None,
@@ -3577,6 +3600,72 @@ DivisionByZeroError:Division by zero
 [1,2]
 "#
         );
+
+        it.trace_pool.clear();
+        let used = it.vm_stack.last().unwrap().used;
+        let mut values = vec![super::Value::Float(4.0)];
+        assert!(
+            matches!(it.vm_call("sqrt", "sqrt", &mut values, 1, &super::CachedFn::Builtin).unwrap(), super::Value::Float(n) if n == 2.0)
+        );
+        let mut values = vec![
+            super::Value::str("a\0b"),
+            super::Value::Int(1),
+            super::Value::Int(2),
+        ];
+        let super::Value::Str(bytes) = it
+            .vm_call(
+                "substr",
+                "substr",
+                &mut values,
+                1,
+                &super::CachedFn::Builtin,
+            )
+            .unwrap()
+        else {
+            panic!("string")
+        };
+        assert_eq!(bytes.as_ref(), b"\0b");
+        let mut values = vec![super::Value::str("abcd"), super::Value::Int(-2)];
+        let super::Value::Str(bytes) = it
+            .vm_call(
+                "substr",
+                "substr",
+                &mut values,
+                1,
+                &super::CachedFn::Builtin,
+            )
+            .unwrap()
+        else {
+            panic!("string")
+        };
+        assert_eq!(bytes.as_ref(), b"cd");
+        assert!(
+            it.trace_pool.is_empty(),
+            "scalar builtin created a transient trace frame"
+        );
+        assert_eq!(it.vm_stack.last().unwrap().used, used);
+        let mut values = vec![super::Value::str("not numeric")];
+        assert!(it
+            .vm_call("sqrt", "sqrt", &mut values, 1, &super::CachedFn::Builtin)
+            .is_err());
+        assert!(
+            !it.trace_pool.is_empty(),
+            "bad type skipped canonical builtin trace"
+        );
+        assert_eq!(it.vm_stack.last().unwrap().used, used);
+        it.trace_pool.clear();
+        it.vm_stack.last_mut().unwrap().used = it.vm_stack.last().unwrap().size;
+        let full = it.vm_stack.last().unwrap().used;
+        let mut values = vec![super::Value::Float(4.0)];
+        assert!(
+            matches!(it.vm_call("sqrt", "sqrt", &mut values, 1, &super::CachedFn::Builtin).unwrap(), super::Value::Float(n) if n == 2.0)
+        );
+        assert_eq!(it.vm_stack.last().unwrap().used, full);
+        assert!(
+            !it.trace_pool.is_empty(),
+            "page growth skipped canonical path"
+        );
+        it.vm_stack.last_mut().unwrap().used = used;
 
         // Weak Rust ownership also covers the callable metadata retained by the
         // shared direct frame. The compile cache may own the decl, never this Rc.
