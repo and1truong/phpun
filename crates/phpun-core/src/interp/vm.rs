@@ -4291,12 +4291,8 @@ try { rem_zero(9,0); } catch (DivisionByZeroError $e) { echo $e->getMessage(), "
             ),
             capacities
         );
-        assert!(
-            frame.vars.is_empty()
-                && frame.args.is_empty()
-                && frame.value_args.is_empty()
-                && frame.vm_sites.is_empty()
-        );
+        assert!(frame.vars.is_empty() && frame.args.is_empty()
+            && frame.value_args.is_empty() && frame.vm_sites.is_empty());
         assert!(frame.ns.is_empty() && !frame.ret_by_ref);
         assert_eq!(frame.fn_name.as_ref(), "second");
 
