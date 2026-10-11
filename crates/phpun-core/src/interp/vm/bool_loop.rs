@@ -107,6 +107,9 @@ impl Interp<'_> {
             || !self.dim_undef_cells.is_empty()
             || self.last_ret_cell.is_some()
             || self.last_prop_ov.is_some()
+            || self.cast_err.is_some()
+            || self.callable_probe_err.is_some()
+            || crate::value::cmp_notices_pending()
             || self.mem_exceeded
             || self.oom_at.is_some()
             || !self.ob_stack.is_empty()
@@ -166,7 +169,13 @@ impl Interp<'_> {
             },
             _ => return Ok(None),
         };
-        if Rc::strong_count(&array) != 2 || array.borrow().is_ref {
+        // ponytail: at most 1MiB of speculative boolean storage. Larger tables
+        // keep canonical execution; use guarded borrowed/register regions only
+        // if measured large-table workloads justify removing this copy ceiling.
+        if Rc::strong_count(&array) != 2
+            || array.borrow().is_ref
+            || array.borrow().entries.len() > 1 << 20
+        {
             return Ok(None);
         }
         let Some(mut bools) = array.borrow().entries.packed_bools() else {

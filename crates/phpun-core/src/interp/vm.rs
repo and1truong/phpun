@@ -3972,19 +3972,33 @@ function overflow_region() {
  for ($i=0; $i<1; $i++) { $a[$i]=false; $v++; }
  return json_encode([$a,is_float($v)]);
 }
-echo typed_region(),"\n",shared_region(),"\n",overflow_region(),"\n";
+function bounded_region() {
+ $a=array_fill(0,1048577,true); $count=0;
+ for($i=0;$i<1;$i++) if($a[$i]) $count++;
+ return $count;
+}
+echo typed_region(),"\n",shared_region(),"\n",overflow_region(),"\n",bounded_region(),"\n";
 "#,
         );
         assert_eq!(result.exit_code, 0, "{}", regions.err_buf);
         assert_eq!(regions.err_buf, "");
         assert_eq!(
             regions.out,
-            b"5\n[[false,false,false,false],[true,true,true,true]]\n[[false],true]\n"
+            b"5\n[[false,false,false,false],[true,true,true,true]]\n[[false],true]\n1\n"
         );
         let decl = regions.functions["typed_region"].clone();
         let compiled = regions.vm_compiled(&decl).unwrap();
         assert!(compiled.ops.iter().any(|op| matches!(op,
             super::Op::BoolLoop { executions, .. } if executions.get() > 0)));
+        for name in ["shared_region", "overflow_region", "bounded_region"] {
+            let decl = regions.functions[name].clone();
+            let compiled = regions.vm_compiled(&decl).unwrap();
+            assert!(
+                compiled.ops.iter().all(|op| !matches!(op,
+                super::Op::BoolLoop { executions, .. } if executions.get() > 0)),
+                "{name}"
+            );
+        }
     }
 
     #[test]
