@@ -498,9 +498,10 @@ fn json_arr(
         };
         let is_list = cx.esc.flags & F_FORCE_OBJECT == 0
             && (packed.is_some()
-                || live.iter().enumerate().all(
-                    |(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64),
-                ));
+                || live
+                    .iter()
+                    .enumerate()
+                    .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64)));
         (packed, live, is_list)
     };
     out.push(if is_list { '[' } else { '{' });
