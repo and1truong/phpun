@@ -3564,6 +3564,7 @@ impl<'a> Interp<'a> {
     /// Worker mode: clear per-request state while keeping the warm world
     /// (classes, functions, global vars, objects) alive.
     pub fn reset_request(&mut self) {
+        self.pcre_patterns.clear();
         self.out.clear();
         self.err_buf.clear();
         self.out_headers.clear();

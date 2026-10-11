@@ -1259,7 +1259,8 @@ pub(in crate::builtins) fn php_regex(it: &mut Interp, pat: &[u8]) -> Result<Rc<P
         crate::pcre::compile(body, opts, extra_opts)
             .map_err(|e| format!("Compilation failed: {}", e))?,
     ));
-    // ponytail: at most 256 patterns per interpreter; clear on overflow.
+    // ponytail:256patterns,clear on overflow; use byte-budgeted LRU if measured
+    // real working sets exceed this ceiling. Reset also frees request keys.
     // Match contexts/limits stay per invocation, including callback reentry.
     if it.pcre_patterns.len() == 256 {
         it.pcre_patterns.clear();
@@ -1390,5 +1391,13 @@ mod tests {
         let (matches, err) = re.caps(b"a", 0, false, None, &mut it);
         assert_eq!(err, 0);
         assert_eq!(matches[0].spans[0], Some((0, 1)));
+        let previous = php_regex(&mut it, b"/request-only/").unwrap();
+        let old = Rc::downgrade(&previous);
+        drop(previous);
+        assert!(old.upgrade().is_some());
+        it.reset_request();
+        assert!(it.pcre_patterns.is_empty());
+        assert!(old.upgrade().is_none());
+        assert!(php_regex(&mut it, b"/request-only/").is_ok());
     }
 }
