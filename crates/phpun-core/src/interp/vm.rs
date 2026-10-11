@@ -3926,45 +3926,6 @@ var_dump($count, $b[2], $c[0]);
             };
             assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
         }
-        let mut keyed = Interp::new("keyed.php");
-        let stmts = crate::parser::parse_source(
-            r#"<?php $map = json_decode('{"name":"first","1":true,"name":"last","nested":{"x":2}}', true);"#,
-            false,
-        ).unwrap();
-        assert!(matches!(
-            keyed.exec_block(&stmts),
-            super::super::Flow::Normal
-        ));
-        let super::Value::Array(map) = keyed.globals.vars["map"].borrow().clone() else {
-            panic!("map")
-        };
-        let name = crate::value::ArrKey::Str("name".into());
-        assert_eq!(
-            map.borrow().entries.keyed_pos(&name),
-            Some(Some(0)),
-            "decoded maps actually retain inline values"
-        );
-        assert!(matches!(map.borrow().get(&name), Some(super::Value::Str(v)) if &*v == b"last"));
-        assert!(matches!(
-            map.borrow().get(&crate::value::ArrKey::Int(1)),
-            Some(super::Value::Bool(true))
-        ));
-        assert_eq!(
-            map.borrow().entries.keyed_pos(&name),
-            Some(Some(0)),
-            "plain reads do not box keys"
-        );
-        let reference = map.borrow().get_cell(&name).unwrap();
-        assert_eq!(
-            map.borrow().entries.keyed_pos(&name),
-            None,
-            "Cell access uses canonical promotion"
-        );
-        *reference.borrow_mut() = super::Value::Int(7);
-        assert!(matches!(
-            map.borrow().get(&name),
-            Some(super::Value::Int(7))
-        ));
     }
 
     #[test]

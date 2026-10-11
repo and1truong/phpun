@@ -92,7 +92,6 @@ enum ArrayStorage {
 struct PackedEntries {
     cells: std::cell::OnceCell<Vec<(ArrKey, Cell)>>,
     scalar: RefCell<Option<Vec<Value>>>,
-    keys: Option<Vec<ArrKey>>,
 }
 
 impl PackedEntries {
@@ -106,12 +105,7 @@ impl PackedEntries {
                 .enumerate()
                 .map(|(i, v)| {
                     alloc_hit(9);
-                    (
-                        self.keys
-                            .as_ref()
-                            .map_or_else(|| ArrKey::Int(i as i64), |keys| keys[i].clone()),
-                        Rc::new(RefCell::new(v)),
-                    )
+                    (ArrKey::Int(i as i64), Rc::new(RefCell::new(v)))
                 })
                 .collect()
         })
@@ -123,12 +117,11 @@ impl ArrayEntries {
         Self(ArrayStorage::Packed(Box::new(PackedEntries {
             cells: std::cell::OnceCell::new(),
             scalar: RefCell::new(Some(values)),
-            keys: None,
         })))
     }
 
     pub(crate) fn is_scalar_packed(&self) -> bool {
-        matches!(&self.0, ArrayStorage::Packed(p) if p.keys.is_none() && p.cells.get().is_none())
+        matches!(&self.0, ArrayStorage::Packed(p) if p.cells.get().is_none())
     }
     pub fn len(&self) -> usize {
         match &self.0 {
@@ -154,17 +147,7 @@ impl ArrayEntries {
     pub(crate) fn packed_clone(&self) -> Option<Vec<Value>> {
         match &self.0 {
             ArrayStorage::Cells(_) => None,
-            ArrayStorage::Packed(p) if p.keys.is_none() => p.scalar.borrow().clone(),
-            ArrayStorage::Packed(_) => None,
-        }
-    }
-    pub(crate) fn keyed_pos(&self, key: &ArrKey) -> Option<Option<usize>> {
-        match &self.0 {
-            ArrayStorage::Packed(p) if p.cells.get().is_none() => p
-                .keys
-                .as_ref()
-                .map(|keys| keys.iter().position(|k| k == key)),
-            _ => None,
+            ArrayStorage::Packed(p) => p.scalar.borrow().clone(),
         }
     }
     fn packed_get(&self, key: &ArrKey) -> Option<Option<Value>> {
@@ -175,17 +158,9 @@ impl ArrayEntries {
             return None;
         }
         let values = p.scalar.borrow();
-        values.as_ref().map(|values| {
-            if let Some(keys) = &p.keys {
-                return keys
-                    .iter()
-                    .position(|k| k == key)
-                    .map(|i| values[i].clone());
-            }
-            match key {
-                ArrKey::Int(i) if *i >= 0 => values.get(*i as usize).cloned(),
-                _ => None,
-            }
+        values.as_ref().map(|values| match key {
+            ArrKey::Int(i) if *i >= 0 => values.get(*i as usize).cloned(),
+            _ => None,
         })
     }
     pub(crate) fn store_packed_scalar(&mut self, key: i64, value: &Value) -> bool {
@@ -200,9 +175,6 @@ impl ArrayEntries {
         let ArrayStorage::Packed(p) = &mut self.0 else {
             return false;
         };
-        if p.keys.is_some() {
-            return false;
-        }
         let Some(values) = p.scalar.get_mut().as_mut() else {
             return false;
         };
@@ -340,18 +312,6 @@ impl PhpArray {
         let mut a = Self::new();
         a.entries = ArrayEntries::packed(vals);
         a.next = a.entries.len() as i64;
-        a
-    }
-
-    /// Bounded decoded maps share packed promotion. Past IDX_MIN, canonical
-    /// storage retains its existing hash index rather than adding a new one.
-    pub(crate) fn keyed_map() -> Self {
-        let mut a = Self::new();
-        a.entries = ArrayEntries::packed(Vec::new());
-        let ArrayStorage::Packed(p) = &mut a.entries.0 else {
-            unreachable!()
-        };
-        p.keys = Some(Vec::new());
         a
     }
 
@@ -581,34 +541,6 @@ impl PhpArray {
     pub fn set(&mut self, k: ArrKey, v: Value) {
         if let ArrKey::Int(i) = &k {
             if self.entries.store_packed_scalar(*i, &v) {
-                return;
-            }
-        }
-        if let Some(position) = self.entries.keyed_pos(&k) {
-            if position.is_some() || self.entries.len() < IDX_MIN {
-                if position.is_none() {
-                    // Meter keys before insertion, exactly as set_cell does.
-                    self.mem_note_key(&k);
-                    if let ArrKey::Int(i) = &k {
-                        if *i >= self.next {
-                            self.next = *i + 1;
-                        }
-                    }
-                }
-                let ArrayStorage::Packed(p) = &mut self.entries.0 else {
-                    unreachable!()
-                };
-                let values = p.scalar.get_mut().as_mut().unwrap();
-                match position {
-                    Some(i) => values[i] = v,
-                    None => {
-                        p.keys.as_mut().unwrap().push(k);
-                        values.push(v);
-                    }
-                }
-                if position.is_none() {
-                    self.mem_note_append();
-                }
                 return;
             }
         }
@@ -2763,21 +2695,13 @@ impl Drop for PhpArray {
         }
         if self.key_bytes > 0 {
             STR_LIVE.fetch_sub(self.key_bytes, std::sync::atomic::Ordering::Relaxed);
-            let keys = match &self.entries.0 {
-                ArrayStorage::Packed(p) if p.keys.is_some() => p
-                    .keys
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .filter(|k| matches!(k, ArrKey::Str(_)))
-                    .count(),
-                _ => self
+            gc_root_note(
+                -(self
                     .entries
                     .iter()
                     .filter(|(k, _)| matches!(k, ArrKey::Str(_)))
-                    .count(),
-            };
-            gc_root_note(-(keys as i64));
+                    .count() as i64),
+            );
         }
         gc_root_note(-1);
     }
