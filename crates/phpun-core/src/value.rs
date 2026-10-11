@@ -80,9 +80,36 @@ const IDX_MIN: usize = 48;
 /// ponytail: only zero-based scalar fills start packed; other producers and
 /// reference/mixed mutators retain Cells until measured storage work extends it.
 #[derive(Debug)]
-pub struct ArrayEntries {
+pub struct ArrayEntries(ArrayStorage);
+
+#[derive(Debug)]
+enum ArrayStorage {
+    Cells(Vec<(ArrKey, Cell)>),
+    Packed(Box<PackedEntries>),
+}
+
+#[derive(Debug)]
+struct PackedEntries {
     cells: std::cell::OnceCell<Vec<(ArrKey, Cell)>>,
     scalar: RefCell<Option<Vec<Value>>>,
+}
+
+impl PackedEntries {
+    fn boxed(&self) -> &Vec<(ArrKey, Cell)> {
+        self.cells.get_or_init(|| {
+            self.scalar
+                .borrow_mut()
+                .take()
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    alloc_hit(9);
+                    (ArrKey::Int(i as i64), Rc::new(RefCell::new(v)))
+                })
+                .collect()
+        })
+    }
 }
 
 impl ArrayEntries {
@@ -91,37 +118,50 @@ impl ArrayEntries {
             v,
             Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
         )));
-        Self {
+        Self(ArrayStorage::Packed(Box::new(PackedEntries {
             cells: std::cell::OnceCell::new(),
             scalar: RefCell::new(Some(values)),
-        }
+        })))
     }
 
     pub(crate) fn is_scalar_packed(&self) -> bool {
-        self.cells.get().is_none()
+        matches!(&self.0, ArrayStorage::Packed(p) if p.cells.get().is_none())
     }
     pub fn len(&self) -> usize {
-        self.cells
-            .get()
-            .map_or_else(|| self.scalar.borrow().as_ref().unwrap().len(), Vec::len)
+        match &self.0 {
+            ArrayStorage::Cells(c) => c.len(),
+            ArrayStorage::Packed(p) => p
+                .cells
+                .get()
+                .map_or_else(|| p.scalar.borrow().as_ref().unwrap().len(), Vec::len),
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     pub fn capacity(&self) -> usize {
-        self.cells.get().map_or_else(
-            || self.scalar.borrow().as_ref().unwrap().capacity(),
-            Vec::capacity,
-        )
+        match &self.0 {
+            ArrayStorage::Cells(c) => c.capacity(),
+            ArrayStorage::Packed(p) => p.cells.get().map_or_else(
+                || p.scalar.borrow().as_ref().unwrap().capacity(),
+                Vec::capacity,
+            ),
+        }
     }
     fn packed_clone(&self) -> Option<Vec<Value>> {
-        self.scalar.borrow().clone()
+        match &self.0 {
+            ArrayStorage::Cells(_) => None,
+            ArrayStorage::Packed(p) => p.scalar.borrow().clone(),
+        }
     }
     fn packed_get(&self, key: &ArrKey) -> Option<Option<Value>> {
-        if self.cells.get().is_some() {
+        let ArrayStorage::Packed(p) = &self.0 else {
+            return None;
+        };
+        if p.cells.get().is_some() {
             return None;
         }
-        let values = self.scalar.borrow();
+        let values = p.scalar.borrow();
         values.as_ref().map(|values| match key {
             ArrKey::Int(i) if *i >= 0 => values.get(*i as usize).cloned(),
             _ => None,
@@ -136,7 +176,10 @@ impl ArrayEntries {
         {
             return false;
         }
-        let Some(values) = self.scalar.get_mut().as_mut() else {
+        let ArrayStorage::Packed(p) = &mut self.0 else {
+            return false;
+        };
+        let Some(values) = p.scalar.get_mut().as_mut() else {
             return false;
         };
         let Some(slot) = values.get_mut(key as usize) else {
@@ -154,10 +197,7 @@ impl Default for ArrayEntries {
 }
 impl From<Vec<(ArrKey, Cell)>> for ArrayEntries {
     fn from(cells: Vec<(ArrKey, Cell)>) -> Self {
-        Self {
-            cells: std::cell::OnceCell::from(cells),
-            scalar: RefCell::new(None),
-        }
+        Self(ArrayStorage::Cells(cells))
     }
 }
 impl FromIterator<(ArrKey, Cell)> for ArrayEntries {
@@ -168,25 +208,22 @@ impl FromIterator<(ArrKey, Cell)> for ArrayEntries {
 impl std::ops::Deref for ArrayEntries {
     type Target = Vec<(ArrKey, Cell)>;
     fn deref(&self) -> &Self::Target {
-        self.cells.get_or_init(|| {
-            self.scalar
-                .borrow_mut()
-                .take()
-                .unwrap()
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    alloc_hit(9);
-                    (ArrKey::Int(i as i64), Rc::new(RefCell::new(v)))
-                })
-                .collect()
-        })
+        match &self.0 {
+            ArrayStorage::Cells(c) => c,
+            ArrayStorage::Packed(p) => p.boxed(),
+        }
     }
 }
 impl std::ops::DerefMut for ArrayEntries {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let _ = std::ops::Deref::deref(self);
-        self.cells.get_mut().unwrap()
+        if let ArrayStorage::Packed(p) = &mut self.0 {
+            let _ = p.boxed();
+            self.0 = ArrayStorage::Cells(p.cells.take().unwrap());
+        }
+        let ArrayStorage::Cells(c) = &mut self.0 else {
+            unreachable!()
+        };
+        c
     }
 }
 impl<'a> IntoIterator for &'a ArrayEntries {
@@ -207,8 +244,7 @@ impl IntoIterator for ArrayEntries {
     type Item = (ArrKey, Cell);
     type IntoIter = std::vec::IntoIter<(ArrKey, Cell)>;
     fn into_iter(mut self) -> Self::IntoIter {
-        let _ = std::ops::Deref::deref(&self);
-        self.cells.take().unwrap().into_iter()
+        std::mem::take(&mut *self).into_iter()
     }
 }
 
