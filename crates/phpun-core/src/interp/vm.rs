@@ -3784,9 +3784,13 @@ impl<'a> Interp<'a> {
                 .is_some_and(|top| top.size.saturating_sub(top.used) >= span)
         {
             if let Some(value) = builtins::call_scalar(lname, argv) {
-                let mut args = super::CallArgs::empty();
-                self.vm_call_reserve(&mut args, argv.len() as u64);
-                self.vm_frame_free(&args.vm_sites);
+                // Exact typed kernels cannot observe this already-proven fit.
+                // Reuse float-leaf repayment; result string charges stay canonical.
+                let want = super::VM_FRAME_SLOTS + argv.len() as u64;
+                let top = self.vm_stack.last_mut()?;
+                let key = Rc::as_ptr(&top.tok) as usize;
+                top.used += span;
+                Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
                 return Some(value);
             }
         }
@@ -4972,6 +4976,23 @@ unset($e); unset($h); var_dump($wh->get());
         }
         let mut it = Interp::new("arena.php");
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
+        let scalar_charges = it.mem_tracked.len();
+        let source = super::Value::str("abcd");
+        for _ in 0..20 {
+            assert!(matches!(it.vm_scalar_builtin("sqrt", &[super::Value::Int(9)]), Some(super::Value::Float(3.0))));
+            let value = it.vm_scalar_builtin("substr", &[source.clone(), super::Value::Int(1), super::Value::Int(2)]).unwrap();
+            assert!(matches!(value, super::Value::Str(ref s) if &s[..] == b"bc"));
+        }
+        assert_eq!(it.mem_tracked.len(), scalar_charges, "fit scalar calls need no temporary site charge");
+        assert_eq!(it.vm_stack.iter().map(|s| (s.size,s.used)).collect::<Vec<_>>(), initial);
+        assert!(it.vm_scalar_builtin("sqrt", &[super::Value::str("9")]).is_none());
+        let last = it.vm_stack.last_mut().unwrap();
+        let old_used = last.used;
+        last.used = last.size;
+        assert!(it.vm_scalar_builtin("sqrt", &[super::Value::Int(9)]).is_none());
+        assert_eq!(it.vm_stack.last().unwrap().used, it.vm_stack.last().unwrap().size);
+        it.vm_stack.last_mut().unwrap().used = old_used;
+
         let frame = it.frame_new("direct");
         it.stack.push(frame);
         let charges = it.mem_tracked.len();
