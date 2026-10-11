@@ -2540,7 +2540,13 @@ impl<'a> Interp<'a> {
                     let (cls, ctor) = ntargets.pop().expect("InitNew resolved this new");
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
                     let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -2558,11 +2564,16 @@ impl<'a> Interp<'a> {
                     };
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
-                    // Direct dispatch never touches the caller's locals —
-                    // canonical fallbacks inside nested ops do their own
-                    // materialize/refresh, so the top-level slot→globals
-                    // sync that wraps Op::Call isn't needed here.
+                    // A direct callee can rebind globals or release their
+                    // last PHP owner. Drop stale caller slot handles before
+                    // dispatch and reload the canonical bindings afterward.
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
                     let result = self.vm_run_method_direct(&core, &mut argv, obj, name, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
