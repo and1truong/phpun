@@ -3347,6 +3347,7 @@ impl<'a> Interp<'a> {
             && self.callable_probe_err.is_none()
             && !crate::value::cmp_notices_pending()
             && !self.mem_exceeded
+            && self.oom_at.is_none()
             && self
                 .vm_stack
                 .last()
@@ -3603,6 +3604,54 @@ DivisionByZeroError:Division by zero
 
         it.trace_pool.clear();
         let used = it.vm_stack.last().unwrap().used;
+        for (name, argv, expected) in [
+            (
+                "str_replace",
+                vec![
+                    super::Value::str("\0"),
+                    super::Value::bytes(vec![255]),
+                    super::Value::str("a\0b\0"),
+                ],
+                vec![97, 255, 98, 255],
+            ),
+            (
+                "str_ireplace",
+                vec![
+                    super::Value::str("AB"),
+                    super::Value::str("x"),
+                    super::Value::str("abABa"),
+                ],
+                b"xxa".to_vec(),
+            ),
+            (
+                "strtoupper",
+                vec![super::Value::bytes(vec![97, 0, 255, 98])],
+                vec![65, 0, 255, 66],
+            ),
+            (
+                "strtolower",
+                vec![super::Value::bytes(vec![65, 0, 255, 66])],
+                vec![97, 0, 255, 98],
+            ),
+        ] {
+            let mut argv = argv;
+            let super::Value::Str(bytes) = it
+                .vm_call(name, name, &mut argv, 1, &super::CachedFn::Builtin)
+                .unwrap()
+            else {
+                panic!("string")
+            };
+            assert_eq!(bytes.as_ref(), expected.as_slice());
+        }
+        let subject = super::Value::str("unchanged");
+        let mut argv = vec![super::Value::str(""), super::Value::str("x"), subject.clone()];
+        let value = it
+            .vm_call("str_replace", "str_replace", &mut argv, 1, &super::CachedFn::Builtin)
+            .unwrap();
+        let (super::Value::Str(before), super::Value::Str(after)) = (&subject, &value) else {
+            panic!("string")
+        };
+        assert!(std::rc::Rc::ptr_eq(&before.rc, &after.rc));
         let mut values = vec![super::Value::Float(4.0)];
         assert!(
             matches!(it.vm_call("sqrt", "sqrt", &mut values, 1, &super::CachedFn::Builtin).unwrap(), super::Value::Float(n) if n == 2.0)

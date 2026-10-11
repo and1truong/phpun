@@ -165,6 +165,12 @@ pub(crate) fn call_scalar(name: &str, args: &[Value]) -> Option<Value> {
         ("substr", [Value::Str(s), Value::Int(start), Value::Int(len)]) => {
             string::substr_value(s, *start, Some(*len))
         }
+        ("str_replace" | "str_ireplace", [Value::Str(f), Value::Str(r), Value::Str(s)]) => {
+            string::replace_value(f, r, s, name == "str_ireplace")
+        }
+        ("strtoupper" | "strtolower", [Value::Str(s)]) => {
+            string::case_value(s.to_vec(), name == "strtoupper")
+        }
         _ => return None,
     })
 }
