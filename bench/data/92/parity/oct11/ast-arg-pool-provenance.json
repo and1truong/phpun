@@ -1,0 +1,49 @@
+{
+  "source": "a8aec125d742f1bebc59b11fb18f2459ee2e59dc",
+  "runtime": "a8aec125d742f1bebc59b11fb18f2459ee2e59dc",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 883118,
+        "bytes": 53670342
+      },
+      "after": {
+        "requests": 833121,
+        "bytes": 51670418
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616040,
+        "bytes": 26541774
+      },
+      "after": {
+        "requests": 616040,
+        "bytes": 26541738
+      }
+    }
+  ],
+  "binary_sha256": "19d80fe0fc308263c3485fab5c0f0b527973f0f6a47fd045937a98dfcbc79d19",
+  "scope": "Extract existing VM scalar-cell acquisition/retirement helpers without new pool/layout/allocator. AST fresh by-value sends reuse scalar cells; successful existing fresh promoted-float constructor bypass returns arguments to the same256cap pool. Shared canonical VM retirement uses same helper. Arena reserve/free and argument evaluation/coercion/order unchanged.",
+  "fallbacks": "Reuse only Null/Bool/Int/Float cells with strongcount1/weakcount0. References/weakanchors/typedowners/captures/traces and non-scalars keep original identity/lifetime. Existing256cap upgrade path documented. ONE existing receiver check proves actual constructor retirement/pointer reuse and weak/shared exclusions. No unsafe/dependency/additional pool."
+}

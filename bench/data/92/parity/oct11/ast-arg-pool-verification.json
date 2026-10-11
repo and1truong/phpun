@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "19d80fe0fc308263c3485fab5c0f0b527973f0f6a47fd045937a98dfcbc79d19",
+  "source": "a8aec125d742f1bebc59b11fb18f2459ee2e59dc",
+  "parent": "inline-float-slots-vm",
+  "summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "changes": []
+}

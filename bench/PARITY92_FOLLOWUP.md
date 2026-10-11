@@ -3017,3 +3017,39 @@ Raw/source/hashes in bench/data/92/parity/oct11/inline-float-slots-vm-*.
 ## #347 / PR349 review: withdraw widened declared slots (2026-10-11)
 
 P2 review correctly identifies 8→24 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31−3.6%/confirm−3.7%,long−1.6%/confirm−.6%,wholedefaultflat/long+2.8% andphysical−50002requests/−1200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.
+
+## #348: perf(calls): reuse existing scalar argument cells for frame-free AST constructors (2026-10-11)
+
+Extract existing VM scalar-cell acquisition/retirement helpers without new pool/layout/allocator. AST fresh by-value sends reuse scalar cells; successful existing fresh promoted-float constructor bypass returns arguments to the same256cap pool. Shared canonical VM retirement uses same helper. Arena reserve/free and argument evaluation/coercion/order unchanged.
+
+Reuse only Null/Bool/Int/Float cells with strongcount1/weakcount0. References/weakanchors/typedowners/captures/traces and non-scalars keep original identity/lifetime. Existing256cap upgrade path documented. ONE existing receiver check proves actual constructor retirement/pointer reuse and weak/shared exclusions. No unsafe/dependency/additional pool.
+
+Runtime a8aec125d742f1bebc59b11fb18f2459ee2e59dc; timing source a8aec125d742f1bebc59b11fb18f2459ee2e59dc; report/integration source a8aec125d742f1bebc59b11fb18f2459ee2e59dc.
+
+31alternating profiler-off byte-gated nativePHP8.5.11-n pairs,negative-cohort followup31,and separate freshwhole7rotatingPHP/main/parent/candidate. Rawcohorts retained separately.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 104.740 | 102.691 | 0.9804 |
+| bench/40-objects.php 20 5000 | 381.853 | 382.754 | 1.0024 |
+| bench/60-json.php | 443.644 | 437.719 | 0.9866 |
+| bench/20-strings.php 100 | 236.035 | 241.452 | 1.0230 |
+| bench/30-arrays.php | 80.765 | 80.066 | 0.9913 |
+| bench/10-fib.php | 8.756 | 8.952 | 1.0223 |
+
+31pairs defaultobjects104.740→102.691ms(−2.0%),long381.853→382.754(+.2%flat),JSON−1.3%,arrays−.9%;negative strings100+2.3%,fib+2.2% retained. Whole7 main3.8563→candidate2.7584×PHP,parent−1.9%;objects−4.5%/10.624×PHP,long−1.9%/20.283×PHP,strings−9.3%/3.533×PHP notattributed. Wholeapp+10.6%,regex+.6%,DB+.7%,Composer+.5% negatives retained. Followup31app36.247→36.047(−.6%flat),strings100242.648→245.525(+1.2%),fib10.590→10.090(−4.7%);largeappregression notconfirmed,smallstringnegative persists. Physicalobjects883118→833121requests(−49997),53670342→51670418bytes(−1999924);arrayssame requests/−36B. Retained target allocation reduction+small default-object gains,not wholelong or string parity. No CPU attribution or cohort multiplication.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 883118→833121; bytes 53670342→51670418.
+- arrays: requests 616040→616040; bytes 26541774→26541738.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing receivercheck+25script/19workload/VMprofile/alias/type/readonly/clone/reflection/GC probe PASS.
+All3406individualPHPT statuses exactly parent;2732pass599knownfail25skip38unsupported6crash6timeout. Not full compatibility.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/ast-arg-pool-*.
