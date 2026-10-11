@@ -3624,7 +3624,6 @@ impl<'a> Interp<'a> {
             || crate::value::cmp_notices_pending()
             || self.mem_exceeded
             || self.oom_at.is_some()
-            || self.vm_site_pool.is_empty()
             || !self.vm_stack.last().is_some_and(|top| {
                 top.size.saturating_sub(top.used)
                     >= (2 * super::VM_FRAME_SLOTS + argv.len() as u64 + 1) * 16
@@ -3686,9 +3685,13 @@ impl<'a> Interp<'a> {
                 }
                 Op::Return => {
                     if used != 1 { return None; }
-                    let mut args = super::CallArgs::empty();
-                    self.vm_call_reserve(&mut args, argv.len() as u64);
-                    self.vm_frame_free(&args.vm_sites);
+                    // Both leaf and builtin spans fit the current page.
+                    // No frame/token is needed; repay through the shared arena.
+                    let want = super::VM_FRAME_SLOTS + argv.len() as u64;
+                    let top = self.vm_stack.last_mut()?;
+                    let key = Rc::as_ptr(&top.tok) as usize;
+                    top.used += want * 16;
+                    Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
                     self.last_call_by_ref = false;
                     self.send_line = Some(self.cur_line);
                     return Some(Value::Float(values[0]));
