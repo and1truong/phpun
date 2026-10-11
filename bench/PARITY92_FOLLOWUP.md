@@ -2056,42 +2056,31 @@ this is not full compatibility. Explicit release core clean/rebuild/hash recorde
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/gc-pointer-tables-main-*.
 
-## #307: docs(perf): reject scalar-object GC snapshot guard after measurements (2026-10-11)
+| bench/40-objects.php | 145.785 | 151.997 | 1.0426 |
+| bench/40-objects.php 20 5000 | 625.761 | 613.187 | 0.9799 |
+| bench/20-strings.php | 60.922 | 57.810 | 0.9489 |
+| bench/20-strings.php 100 | 272.575 | 245.233 | 0.8997 |
+| bench/11-sieve.php | 61.643 | 60.961 | 0.9889 |
+| bench/30-arrays.php | 75.717 | 78.112 | 1.0316 |
+| bench/60-json.php | 504.470 | 504.531 | 1.0001 |
+| bench/10-fib.php | 8.405 | 8.423 | 1.0021 |
+| bench/50-regex.php | 40.695 | 39.967 | 0.9821 |
+| bench/70-db.php | 107.589 | 107.957 | 1.0034 |
+| bench/app/cli.php 100 20 | 33.091 | 31.684 | 0.9575 |
+| examples/composer/run.php | 7.951 | 7.325 | 0.9212 |
 
-Report-only: reject and ordinarily revert #307 scalar-only last-owner object snapshot guard. Actual objects allocator requests fell by only four; no useful ordinary object speed improvement. Preserve candidate source, frozen binary hash, negative measurements and gates.
-
-Final runtime restores the existing GC dying/property traversal, including resource/destructor/callback paths. No production scalar guard retained.
-
-Runtime 207dd613572a5c5fde1dafb7720bd84539c46542; timing source 207dd613572a5c5fde1dafb7720bd84539c46542; report/integration source 207dd613572a5c5fde1dafb7720bd84539c46542.
-
-Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
-cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
-are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
-
-| argv | parent ms | candidate ms | candidate/parent |
-|---|---:|---:|---:|
-| bench/40-objects.php | 148.367 | 148.627 | 1.0017 |
-| bench/40-objects.php 20 5000 | 583.609 | 607.759 | 1.0414 |
-| bench/20-strings.php | 57.973 | 57.119 | 0.9853 |
-| bench/20-strings.php 100 | 238.079 | 242.524 | 1.0187 |
-| bench/11-sieve.php | 63.524 | 66.246 | 1.0428 |
-| bench/30-arrays.php | 81.606 | 80.617 | 0.9879 |
-| bench/60-json.php | 535.174 | 533.550 | 0.9970 |
-| bench/10-fib.php | 8.357 | 9.147 | 1.0946 |
-| bench/app/cli.php 100 20 | 33.197 | 32.306 | 0.9732 |
-| examples/composer/run.php | 8.131 | 8.220 | 1.0109 |
-
-Seven pairs: default objects +0.2% (flat), long objects +4.1%, fib +9.5%. Only four allocator requests saved in default objects. Reject rather than retain a guard without demonstrated target benefit. Serialized bug77345 parent 8340ms and candidate 8221ms both pass; concurrent candidate timeout remains in full raw results.
+7pairs ordinaryobjects+4.3%,long−2.0%,strings−5.1%/long−10%,sieve−1.1%,arrays+3.2%,JSONflat,fibflat,regex−1.8%,DB+.3%,app−4.3%,Composer−7.9%.31followup ordinaryobjects+.2%,long+.3%,arrays−.7%: normal objects effectivelyflat,not a demonstrated broad object speedup. Independent7pairs200000-nodecycle8798.866→8230.058ms(−6.5%),everyexit/stdout/stderr nativePHP-byte-gated. Physicalobjects5 requests1663202→1633154(−30048/~1.8%),bytes69798420→68356112;gcgraph32245→32236. Eventcell225018 unchanged; physical allocator counts are separate. Not attribute unrelated string/fib/app changes solely to GC. No PHP parity or overall claim.
 
 Separate physical allocator requests/bytes (not speed runs):
 
-- objects5: requests 1633154→1633150; bytes 68355753→68355621.
-- scalarleaf: requests 32479→32477; bytes 6010970→6010902.
+- objects5: requests 1663202→1633154; bytes 69798420→68356112.
+- gcgraph: requests 32245→32236; bytes 5997998→5997583.
 
 Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
-ONE existing GC fixture extended during candidate verification; removed with rejected guard. Native output checked. Serialized GC rechecks retained separately.
-All3406 raw results retain bug77345 pass→timeout and two known range crash/timeout swaps. Serialized10s bug77345 parent/candidate BOTH PASS (8340/8221ms); no new semantic fail. Candidate full summary2729pass601fail is not parity.
-Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+Existing GC fixture extended once;native duplicate-property Cell/keep-root/unset-tombstone probe passes. Existing lifetime/readonly/globals/native-graph/160-arg page-growth checks retained.
+All3406individualPHPT compared; 0 known range crash/timeout swaps; no new fail/pass/skip.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
-Raw/source/hashes in bench/data/92/parity/oct11/gc-scalar-properties-*.
+Raw/source/hashes in bench/data/92/parity/oct11/gc-property-traversal-*.
+
