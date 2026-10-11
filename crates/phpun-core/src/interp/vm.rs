@@ -85,6 +85,8 @@ pub(crate) struct Compiled {
     /// extras take the full gate each).
     param_fast: Vec<Option<ScalarGate>>,
     value_abi: bool,
+    /// Bounded, read-only f64 expression leaf; runtime IC/owner guards remain.
+    float_leaf: bool,
 }
 
 pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
@@ -483,6 +485,21 @@ impl Compiled {
         // already. Proven promoted constructors use the same value slots;
         // their early publish pass materializes before observable hooks.
         let value_abi = !hybrid && !needs_bind && (!has_promoted || promoted_slots);
+        let float_type = |ty: &Option<Vec<String>>| {
+            ty.as_ref().is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("float"))
+        };
+        let float_leaf = !needs_bind
+            && decl.attrs.is_empty()
+            && float_type(&decl.ret)
+            && decl.params.iter().all(|p| !p.by_ref && !p.variadic && !p.promoted && float_type(&p.ty))
+            && c.slots.len() == decl.params.len()
+            && c.ops.len() <= 64
+            && c.ops.iter().all(|op| matches!(op,
+                Op::Const(Value::Float(_)) | Op::Load(_) | Op::ThisProp { .. }
+                | Op::Binary("+" | "-" | "*") | Op::Line(_) | Op::Sweep
+                | Op::InitCall { .. } | Op::Return
+            ) || matches!(op, Op::Call { lname, argc: 1, .. } if lname.as_ref() == "sqrt"))
+            && c.ops.iter().any(|op| matches!(op, Op::Return));
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -499,6 +516,7 @@ impl Compiled {
             ret_fast,
             param_fast,
             value_abi,
+            float_leaf,
         }))
     }
 
@@ -540,6 +558,7 @@ impl Compiled {
             ret_fast: None,
             param_fast: Vec::new(),
             value_abi: false,
+            float_leaf: false,
         }))
     }
 }
@@ -2572,6 +2591,17 @@ impl<'a> Interp<'a> {
                     };
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
+                    if comp.top_level {
+                        if let Some(value) = self.vm_float_method(&core, &argv, &obj) {
+                            argv.clear();
+                            if self.vm_val_pool.len() < 64 {
+                                self.vm_val_pool.push(argv);
+                            }
+                            vs.push(value);
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     // A direct callee can rebind globals or release their
                     // last PHP owner. Drop stale caller slot handles before
                     // dispatch and reload the canonical bindings afterward.
@@ -3566,6 +3596,114 @@ impl<'a> Interp<'a> {
         self.vm_run(decl, comp, args)
     }
 
+    /// Pure warmed leaves have no observable frame or global access. Any
+    /// failed proof returns before side effects to the full root bridge.
+    fn vm_float_method(
+        &mut self,
+        core: &MSiteCore,
+        argv: &[Value],
+        obj: &Rc<std::cell::RefCell<PhpObject>>,
+    ) -> Option<Value> {
+        let comp = &core.comp;
+        if !comp.float_leaf
+            || argv.len() != core.fdecl.params.len()
+            || argv.iter().any(|v| !matches!(v, Value::Float(_) | Value::Int(_)))
+            || Rc::strong_count(obj) < 3
+            || self.globals_arr.is_some()
+            || self.pending_hook_prop.is_some()
+            || self.pending_gen_body
+            || !self.pending_gen_captures.is_empty()
+            || !self.expr_temps.is_empty()
+            || self.last_ret_cell.is_some()
+            || self.last_prop_ov.is_some()
+            || Self::callprof_on()
+            || coverage_on()
+            || self.deadline.is_some()
+            || self.cast_err.is_some()
+            || self.callable_probe_err.is_some()
+            || crate::value::cmp_notices_pending()
+            || self.mem_exceeded
+            || self.oom_at.is_some()
+            || self.vm_site_pool.is_empty()
+            || !self.vm_stack.last().is_some_and(|top| {
+                top.size.saturating_sub(top.used)
+                    >= (2 * super::VM_FRAME_SLOTS + argv.len() as u64 + 1) * 16
+            })
+        {
+            return None;
+        }
+        let mut values = [0.0f64; 64];
+        let mut used = 0usize;
+        for op in &comp.ops {
+            let value = match op {
+                Op::Const(Value::Float(v)) => Some(*v),
+                Op::Load(index) => Some(match argv.get(*index as usize)? {
+                    Value::Float(v) => *v,
+                    Value::Int(v) => *v as f64,
+                    _ => return None,
+                }),
+                Op::ThisProp { cache, .. } => {
+                    let hit = cache.borrow();
+                    let hit = hit.as_ref()?;
+                    let ob = obj.borrow();
+                    if !Rc::ptr_eq(&hit.class, &ob.class)
+                        || !hit.scope.as_ref().is_some_and(|scope| Rc::ptr_eq(scope, &core.dc))
+                        || !hit.private_candidate.as_ref().is_none_or(|key| {
+                            key == &hit.key || !ob.prop_has(key)
+                        })
+                    {
+                        return None;
+                    }
+                    let cell = match hit.slot {
+                        Some(i) => ob.slots.get(i).and_then(|s| s.clone()),
+                        None => ob.prop_get(&hit.key),
+                    }?;
+                    let value = match &*cell.borrow() {
+                        Value::Float(v) => *v,
+                        _ => return None,
+                    };
+                    Some(value)
+                }
+                Op::Binary(operator) => {
+                    used = used.checked_sub(1)?;
+                    let right = values[used];
+                    let left = values.get_mut(used.checked_sub(1)?)?;
+                    *left = match *operator {
+                        "+" => *left + right,
+                        "-" => *left - right,
+                        "*" => *left * right,
+                        _ => return None,
+                    };
+                    None
+                }
+                Op::Call { cache, .. } => {
+                    if !matches!(&*cache.borrow(), Some(CachedFn::Builtin)) {
+                        return None;
+                    }
+                    let value = values.get_mut(used.checked_sub(1)?)?;
+                    *value = value.sqrt();
+                    None
+                }
+                Op::Return => {
+                    if used != 1 { return None; }
+                    let mut args = super::CallArgs::empty();
+                    self.vm_call_reserve(&mut args, argv.len() as u64);
+                    self.vm_frame_free(&args.vm_sites);
+                    self.last_call_by_ref = false;
+                    self.send_line = Some(self.cur_line);
+                    return Some(Value::Float(values[0]));
+                }
+                Op::Line(_) | Op::Sweep | Op::InitCall { .. } => None,
+                _ => return None,
+            };
+            if let Some(value) = value {
+                *values.get_mut(used)? = value;
+                used += 1;
+            }
+        }
+        None
+    }
+
     fn vm_scalar_builtin(&mut self, lname: &str, argv: &[Value]) -> Option<Value> {
         let span = (super::VM_FRAME_SLOTS + argv.len() as u64) * 16;
         if !Self::callprof_on()
@@ -4451,6 +4589,36 @@ unset($a); var_dump($weak->get());
             .vm_method_target(object, "__construct", &std::cell::RefCell::new(None), 1)
             .expect("empty promoted constructor retains direct target");
         assert!(target.1.comp.value_abi);
+        let mut leaf = Interp::new("float-leaf.php");
+        let result = leaf.run_source(r#"<?php
+class ArithmeticLeaf {
+ private float $x=3.0;
+ private float $y=4.0;
+ function length(): float { return sqrt($this->x*$this->x+$this->y*$this->y); }
+}
+$o = new ArithmeticLeaf;
+echo $o->length(), "\n";
+"#);
+        assert_eq!(result.exit_code, 0, "{}", leaf.err_buf);
+        assert_eq!(leaf.out, b"5\n");
+        let super::Value::Object(object) = leaf.globals.vars["o"].borrow().clone() else {
+            panic!("receiver")
+        };
+        let (_, core) = leaf.vm_method_target(
+            object.clone(), "length", &std::cell::RefCell::new(None), 1,
+        ).unwrap();
+        assert!(core.comp.float_leaf);
+        let pin = object.clone();
+        assert!(matches!(leaf.vm_float_method(&core, &[], &object), Some(super::Value::Float(5.0))));
+        let x = object.borrow().prop_get("\0ArithmeticLeaf\0x").unwrap();
+        *x.borrow_mut() = super::Value::Int(3);
+        assert!(leaf.vm_float_method(&core, &[], &object).is_none());
+        *x.borrow_mut() = super::Value::Float(3.0);
+        leaf.deadline = Some(std::time::Instant::now());
+        assert!(leaf.vm_float_method(&core, &[], &object).is_none());
+        leaf.deadline = None;
+        drop(pin);
+        assert!(leaf.vm_float_method(&core, &[], &object).is_none());
         let mut it = Interp::new("receiver.php");
         let result = it.run_source(
             r#"<?php
