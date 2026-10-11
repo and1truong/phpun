@@ -3323,6 +3323,40 @@ Raw/source/hashes in bench/data/92/parity/oct11/short-substring-storage-*.
 
 Retirement: ordinary reverts 51b5f7f/e32813c/2b0410c restore ALL crates byte-for-byte to #363. Fresh workspace/fmt/clippy PASS; retired-source proof and logs retained. Prototype samples stay historical, no new release/timing claim.
 
+## #364: docs(perf): reject constructor proof cache without repeatable object gain (2026-10-11)
+
+REJECTED prototype: memoize the existing immutable empty float-promotion constructor proof and flattened slot indices in a standard class OnceCell. All per-call guards and canonical stores/fallback remained. Ordinary revert restores preceding production source; this PR keeps evidence only.
+
+No widened property/object slots, new dependency, unsafe or callback/trace change. ONE existing receiver/constructor check proved actual proof reuse plus original alias/clone/frame repayment. Existing native fallback checks included inherited/named/error/body constructors.
+
+Runtime 04dcbf89d90779c57517be1f9132c49855a8626b; timing source 5407d84c10fbb787ac416f31fe22238b511aa30d; report/integration source 5407d84c10fbb787ac416f31fe22238b511aa30d.
+
+Two independent31 alternating profiler-off PHP8.5.11 -n byte-gated target cohorts; fresh seven rotating PHP/main/parent/candidate pairs. Physical diagnostics separate.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 92.049 | 92.132 | 1.0009 |
+| bench/40-objects.php 20 5000 | 371.535 | 358.628 | 0.9653 |
+| bench/20-strings.php 100 | 210.019 | 210.453 | 1.0021 |
+| bench/60-json.php | 437.166 | 431.645 | 0.9874 |
+| bench/app/cli.php 100 20 | 36.380 | 36.663 | 1.0078 |
+
+First31: objects +0.1% (flat), long objects −3.5%, strings100 +0.2%, JSON −1.3%, app +0.8%. Independent31: objects −2.1%, long objects −0.1% (flat), app −4.5% unrelated. No repeated gain on the same target supports keeping the cache. Whole seven: geomean 2.74578×PHP, candidate/parent +0.38%; objects flat/11.981×PHP, long −2.8%/19.273×PHP. Whole negatives startup +5.3%, arrays +1.0%, regex +4.0%, DB +2.5%, app +5.9% retained; app was not confirmed in independent31. Physical objects requests +2/bytes +2676; arrays requests unchanged/bytes +2604, the class metadata cost remains explicit. Reject complexity without stable target benefit; no CPU or parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 858127→858129; bytes 49972638→49975314.
+- arrays: requests 616040→616040; bytes 26543382→26545986.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Original partial-result4MB native/canonical OOM gate PASS; existing full-range source reuse is untouched.
+Prototype all3406 compared individually: only known GC timeout→pass and generator timeout→fail. Serialized same10s parent/candidate GC PASS (7785/8480ms), generator FAIL (9292/9563ms). Full2732pass600fail25skip38unsupported6crash5timeout retained; no new status after boundary recheck, partial compatibility.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 600, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 5, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/float-ctor-proof-*.
 PR365 P2 artifact review: removed duplicate uncompressed PHPT JSON only after verifying lossless gzip byte identity; inherited PHPT representations also consolidated in #363 and ordinarily merged here. No measurement or runtime change.
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
 
