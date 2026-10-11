@@ -3360,6 +3360,41 @@ Raw/source/hashes in bench/data/92/parity/oct11/float-ctor-proof-*.
 PR365 P2 artifact review: removed duplicate uncompressed PHPT JSON only after verifying lossless gzip byte identity; inherited PHPT representations also consolidated in #363 and ordinarily merged here. No measurement or runtime change.
 
 Retirement: ordinary revert c4d90c2 restores all crates byte-identical #365/#363. Fresh retirement workspace/fmt/clippy PASS; original prototype source/build/hashes retained. PHPT artifacts have one lossless compressed representation; parent P2 artifact fix ordinarily merged. No retirement timing claim.
+
+## #366: perf(objects): avoid cloning constructor diagnostic prefixes (2026-10-11)
+
+AST new already pins resolved constructor/class metadata through argument evaluation. Borrow the declaring class name and its existing null-truncated prefix instead of making two Strings. Use standard Cow for anonymous contexts; ordinary diagnostic context still formats once. No new cache, storage, dependency, unsafe or binder change.
+
+Keep exact original canonical spelling, declaring owner for inherited constructors, anonymous truncation, argument evaluation order and all reference/error/trace handling. ONE existing receiver/constructor test includes inherited and anonymous by-reference Error diagnostics. Parent constructor/substring prototypes are already reverted.
+
+Runtime 09aad1a0302bd16ad65a0a8fde147604007856ef; timing source b25286919dca43be420e55f36da0c61b45a11c1d; report/integration source 20dd88c42fefcd6fd47b18f2683156c6e86726f9.
+
+Two independent31 alternating profiler-off PHP8.5.11 -n byte-gated target cohorts; fresh seven rotating PHP/main/parent/candidate pairs. Physical diagnostics separate.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 98.535 | 97.949 | 0.9941 |
+| bench/40-objects.php 20 5000 | 387.154 | 366.027 | 0.9454 |
+| bench/app/cli.php 100 20 | 37.820 | 37.092 | 0.9807 |
+| bench/20-strings.php 100 | 226.194 | 219.501 | 0.9704 |
+| examples/composer/run.php | 9.880 | 9.671 | 0.9788 |
+
+First31: default objects −0.6% flat, long −5.5%, app −1.9%, strings100 −3.0%, Composer −2.1%. Independent31: default −1.2% small, long +0.9% flat, app −3.3% unrelated. Long speed gain is not confirmed; do not attribute unrelated app/string changes. Whole7 geomean 2.67141×PHP versus main3.88446×PHP, parent −4.03%; objects −6.7%/10.963×PHP, long objects +2.0%/18.317×PHP, strings +2.1%/long +2.1%, app +0.4% retained. Whole startup/array/JSON gains are not attributed or multiplied across cohorts. Separate physical objects requests 858127→808127 (−50000), bytes49974098→49724078 (−250020); arrays requests identical,20-byte diagnostic delta not meaningful. Retain the small shared-path redundant-copy deletion for proven allocation reduction without added common storage; wall-time outcome is mixed and no parity/CPU claim follows.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 858127→808127; bytes 49974098→49724078.
+- arrays: requests 616041→616041; bytes 26545126→26545106.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Original partial-result4MB native/canonical fatal remains byte-identical. Existing full-range source reuse unchanged.
+All3406 individual PHPT statuses IDENTICAL to the corrected parent. Full2731pass599fail25skip38unsupported6crash7timeout retained; partial compatibility, not a suite pass.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/borrowed-new-context-*.
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
 
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
