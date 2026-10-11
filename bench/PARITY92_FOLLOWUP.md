@@ -2750,3 +2750,39 @@ Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/pcre-jit-working-set-*.
+
+## #334: perf(ini): avoid allocating lowercase Strings for boolean reads (2026-10-11)
+
+Interp::ini_on now borrows settings and uses std eq_ignore_ascii_case instead of allocating a lowercase String. All twelve caller paths keep the same helper;no snapshot/cache/dependency/unsafe/new abstraction.
+
+Preserves existing accepted1/On/true/yes and missing/empty/false/nonmatching behavior;does not claim new numericINI compatibility. ONEexistingPCRE check extends mixedcase/rejected values plus mutable toggles.
+
+Runtime 5fbc84574e9900cc351a3783586baff932fe004d; timing source 5fbc84574e9900cc351a3783586baff932fe004d; report/integration source 770e5e93bacef163511ddb03e07604e5348027a0.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/profile/pcre-patterns.php 10000 4 | 82.952 | 79.139 | 0.9540 |
+| bench/profile/pcre-patterns.php 10000 300 | 86.334 | 84.372 | 0.9773 |
+| bench/50-regex.php | 20.790 | 20.655 | 0.9935 |
+| bench/40-objects.php | 111.985 | 111.778 | 0.9981 |
+| bench/60-json.php | 556.761 | 539.700 | 0.9694 |
+| examples/composer/run.php | 8.420 | 8.245 | 0.9792 |
+
+31pairs four-pattern78.003→78.714ms(+.9%,flat),300patterns81.153→79.167(−2.4%),corpus20.391→19.932(−2.2%),objects104.541→103.141(−1.3%),JSON519.682→508.523(−2.1%). Initial7four-pattern−4.6%,300−2.3%,corpus−.6%,objects−.2%,JSON−3.1%,Composer−2.1% retained. Physicalfour-pattern1142112→1122108requests(−20004);corpus−124requests. Retain the small shared std simplification and proven allocation reduction,not a demonstrated primary-workload time win;JSON/objects gains not attributed. No whole-suite/parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- patterns4: requests 1142112→1122108; bytes 59747643→59727619.
+- regex: requests 327940→327816; bytes 29926168→29926024.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+SameONEexistingPCRE/INI check proves accepted/rejected/missing/mixedcase and changingINI inputs;workspace/fmt/clippy/native25+19/profile/probesPASS.
+All3406individualPHPT only2knownrangecrash/timeout swaps,2731pass599fail,GCtimeout unchanged vs frozenparent. No new semantic failure.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/ini-bool-borrow-*.
