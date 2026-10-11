@@ -1405,6 +1405,15 @@ mod tests {
     #[test]
     fn pattern_cache_reuses_code_without_caching_errors_or_match_limits() {
         let mut it = Interp::new("patterns.php");
+        assert!(!it.ini_on("not-set"));
+        for value in ["1", "on", "ON", "On", "true", "TrUe", "yes", "yEs"] {
+            it.ini.insert("probe".into(), value.into());
+            assert!(it.ini_on("probe"));
+        }
+        for value in ["", "0", "off", "false", "no", "2", " yes ", "trué"] {
+            it.ini.insert("probe".into(), value.into());
+            assert!(!it.ini_on("probe"));
+        }
         let first = php_regex(&mut it, b"/a/i", "preg_match").unwrap().unwrap();
         assert!(Rc::ptr_eq(
             &first,

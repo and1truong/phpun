@@ -3379,10 +3379,12 @@ impl<'a> Interp<'a> {
 
     /// INI truthiness — PHP accepts 1/On/true/yes case-insensitively.
     pub fn ini_on(&self, k: &str) -> bool {
-        match self.ini.get(k).map(|s| s.to_lowercase()) {
-            Some(v) => matches!(v.as_str(), "1" | "on" | "true" | "yes"),
-            None => false,
-        }
+        self.ini.get(k).is_some_and(|v| {
+            v == "1"
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+        })
     }
 
     /// `error_reporting` ini value → error_level mask: integer, or an
