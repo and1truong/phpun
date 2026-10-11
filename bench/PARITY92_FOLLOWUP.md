@@ -2573,3 +2573,39 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/fresh-promoted-float-review-*.
+
+## #326: docs(perf): reject constructor diagnostic borrowing without a target time gain (2026-10-11)
+
+Rejected prototype c9cb785 borrows constructor owner/base Strings and uses std Cow for diagnostic labels. Ordinary revert71c207e restores exact #327 runtime; this PR changes reports only. No implemented diagnostic-name optimization.
+
+Prototype preserved declaring class/canonical spelling/anonymous-NUL-truncated label and shared arg_cells behavior, verified by complete native diagnostic probes plus existing constructor checks. No new cache/helper/layout/dependency.
+
+Runtime 0257f488440b58ad06da70421e36e7e025ac8114; timing source 0257f488440b58ad06da70421e36e7e025ac8114; report/integration source 71c207e7fa4891b34062b30c1fb7f48598634b33.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 100.088 | 101.060 | 1.0097 |
+| bench/40-objects.php 20 5000 | 417.440 | 432.725 | 1.0366 |
+| bench/20-strings.php | 55.520 | 56.379 | 1.0155 |
+| bench/60-json.php | 520.755 | 523.666 | 1.0056 |
+| bench/app/cli.php 100 20 | 33.343 | 33.031 | 0.9906 |
+| examples/composer/run.php | 8.310 | 8.311 | 1.0001 |
+
+Frozen0257f48/6714750 passedworkspace/fmt/clippy/25+19/profile/native/full3406only2knownrangeswaps,2730pass601fail. Physicalobjects1058127→1008127requests(−50000),arraysunchanged.7objects+1.0%/long+3.7%,strings+1.5%,JSON+.6%,app−.9%,Composerflat.31objects99.600→101.242ms(+1.6%),long432.797→435.366(+.6%),strings52.742→54.318(+3.0%): no target time gain. Rejected despite physical reduction; no parity gain. Followup31 invocation used child WIP worktree at identical sourceHEAD0257f48 with unchanged PHP benchfiles; frozen binary hashes match source0257f48, child Rust changes were not compiled into binaries. Earlier partial compiler-contended run was interrupted/excluded and retained separately; it is not used for conclusions. All measured complete comparisons were profiler-off and byte-identical to PHP.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1058127→1008127; bytes 57271410→57021370.
+- arrays: requests 636049→636049; bytes 26703069→26703029.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing constructor/range tests retained; native probe explicitly compares by-ref diagnostic owner, inherited canonical-case TypeError, unknown named parameter and anonymous-class label. Earlier compiler-contended partial JSON excluded from performance conclusions and retained as provenance.
+All3406individualPHPT compared; 2 known range crash/timeout swaps; no new fail/pass/skip.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/ctor-label-borrow-*.
