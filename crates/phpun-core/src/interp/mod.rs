@@ -6866,7 +6866,11 @@ impl<'a> Interp<'a> {
             return;
         }
         let ob = o.borrow();
-        for (pname, c) in ob.live_props().into_iter() {
+        for (pname, c) in ob
+            .prop_order
+            .iter()
+            .filter_map(|name| ob.prop_get(name).map(|cell| (name, cell)))
+        {
             // Private props on classes whose Zend counterpart keeps its
             // storage in pure-C structures (no zval slots): the container
             // in that cell is engine modeling, counted out of the dead
@@ -6877,7 +6881,7 @@ impl<'a> Interp<'a> {
                 out,
                 depth - 1,
                 visited,
-                Self::gc_internal_prop(&pname),
+                Self::gc_internal_prop(pname),
             );
         }
         // ArrayIter's AoStore is zend's `intern->array` slot — a real
@@ -7033,14 +7037,23 @@ impl<'a> Interp<'a> {
                 } else {
                     let dying = {
                         let b = o.borrow();
-                        self.gc_dying_acquire(b.live_props().iter().map(|(_, c)| Rc::as_ptr(c)))
+                        self.gc_dying_acquire(
+                            b.prop_order
+                                .iter()
+                                .filter_map(|name| b.prop_get(name))
+                                .map(|c| Rc::as_ptr(&c)),
+                        )
                     };
                     for i in 0.. {
                         let slot = {
                             let b = o.borrow();
-                            b.live_props()
-                                .get(i)
-                                .map(|(_, c)| (Rc::strong_count(c), c.borrow().clone()))
+                            // Re-read live order after each callback, cloning only
+                            // the selected Cell. No owned key/table snapshot.
+                            b.prop_order
+                                .iter()
+                                .filter_map(|name| b.prop_get(name))
+                                .nth(i)
+                                .map(|c| (Rc::strong_count(&c), c.borrow().clone()))
                         };
                         let Some((cstrong, pv)) = slot else { break };
                         self.gc_note_dying_slot(cstrong, &pv, depth - 1);
