@@ -1,0 +1,183 @@
+{
+  "host": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "metric": "cold CLI ms; 7 alternating reps; profilers off",
+  "source": "0257f488440b58ad06da70421e36e7e025ac8114",
+  "dirty": true,
+  "build": "rustc 1.99.0; cargo build --offline --release; LTO=true/codegen-units=1",
+  "binaries": {
+    "/workspace/parity92/oct11/fresh-promoted-float-review": "d26128837db324508417640c16acce4470e9f8344afc935636420d96c7499c95",
+    "/workspace/parity92/oct11/ctor-label-borrow": "671475066b1f97d6d17422eb8e4a2c8d789474121d5cdc1e4f8f8bd1e45b8736",
+    "/workspace/php85": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f"
+  },
+  "php_args": [
+    "-n"
+  ],
+  "cases": [
+    {
+      "argv": [
+        "bench/40-objects.php"
+      ],
+      "before_ms": [
+        96.182295,
+        105.83144,
+        118.138569,
+        94.60534,
+        101.080931,
+        97.185857,
+        100.087939
+      ],
+      "after_ms": [
+        101.290872,
+        93.865037,
+        97.675349,
+        94.000686,
+        105.488095,
+        106.554056,
+        101.060015
+      ],
+      "before_median": 100.087939,
+      "after_median": 101.060015,
+      "ratio": 1.0097122191715826,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "bench/40-objects.php",
+        "20",
+        "5000"
+      ],
+      "before_ms": [
+        431.288802,
+        415.347058,
+        415.060064,
+        443.472474,
+        453.402914,
+        417.439665,
+        402.47765
+      ],
+      "after_ms": [
+        424.58436,
+        431.915001,
+        478.777366,
+        432.725091,
+        551.041133,
+        439.993162,
+        432.716022
+      ],
+      "before_median": 417.439665,
+      "after_median": 432.725091,
+      "ratio": 1.0366170905201355,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "bench/20-strings.php"
+      ],
+      "before_ms": [
+        54.20635,
+        55.52047,
+        56.342085,
+        56.879402,
+        58.049301,
+        54.94831,
+        50.817047
+      ],
+      "after_ms": [
+        58.66532,
+        56.641926,
+        59.880943,
+        56.274759,
+        56.378855,
+        52.775039,
+        53.217659
+      ],
+      "before_median": 55.52047,
+      "after_median": 56.378855,
+      "ratio": 1.0154606940467181,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "bench/60-json.php"
+      ],
+      "before_ms": [
+        521.93939,
+        496.646314,
+        501.833309,
+        520.755301,
+        505.975221,
+        544.142416,
+        548.154439
+      ],
+      "after_ms": [
+        523.666039,
+        491.269594,
+        505.458549,
+        527.048486,
+        531.959486,
+        521.03143,
+        596.341352
+      ],
+      "before_median": 520.755301,
+      "after_median": 523.666039,
+      "ratio": 1.0055894543836816,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "bench/app/cli.php",
+        "100",
+        "20"
+      ],
+      "before_ms": [
+        33.913668,
+        33.342854,
+        32.813127,
+        33.038125,
+        39.580539,
+        34.478732,
+        32.686426
+      ],
+      "after_ms": [
+        34.231085,
+        32.068687,
+        33.979822,
+        33.030645,
+        33.223009,
+        32.634624,
+        32.891044
+      ],
+      "before_median": 33.342854,
+      "after_median": 33.030645,
+      "ratio": 0.9906364044301665,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "examples/composer/run.php"
+      ],
+      "before_ms": [
+        8.040472,
+        8.587684,
+        7.554992,
+        7.655853,
+        8.74432,
+        8.310007,
+        8.997671
+      ],
+      "after_ms": [
+        8.778582,
+        8.310849,
+        8.475646,
+        7.313078,
+        7.785508,
+        7.743265,
+        11.421697
+      ],
+      "before_median": 8.310007,
+      "after_median": 8.310849,
+      "ratio": 1.0001013236210268,
+      "gate": "exit/stdout/stderr == PHP"
+    }
+  ]
+}
