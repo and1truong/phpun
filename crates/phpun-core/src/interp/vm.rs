@@ -4775,6 +4775,33 @@ unset($a); var_dump($weak->get());
             super::super::Flow::Normal
         ));
         assert!(fresh.vm_frame_pool.is_empty());
+        let mut compiled_promote = Interp::new("compiled-float.php");
+        assert!(matches!(
+            compiled_promote.exec_block(&stmts),
+            super::super::Flow::Normal
+        ));
+        let compiled_stmts = crate::parser::parse_source(
+            "<?php for ($i=0;$i<2;$i++) $packed = new FreshFloat(3,4);",
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled_promote.vm_top_exec(&compiled_stmts),
+            Some(super::super::Flow::Normal)
+        ));
+        let super::Value::Object(packed) = compiled_promote.globals.vars["packed"].borrow().clone()
+        else {
+            panic!("compiled promotion")
+        };
+        assert!(
+            packed
+                .borrow()
+                .slots
+                .iter()
+                .flatten()
+                .all(|s| s.existing_cell().is_none()),
+            "compiled constructor must retain inline promotions, not only AST new"
+        );
         let mut args = super::super::CallArgs::positional(vec![
             super::cell(super::Value::Int(3)),
             super::cell(super::Value::Float(4.0)),

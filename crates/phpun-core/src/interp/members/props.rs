@@ -102,7 +102,14 @@ impl<'a> Interp<'a> {
                                 *c.borrow_mut() = v;
                                 *s = Some(crate::value::ObjectSlot::Cell(c));
                             }
-                            None => *s = Some(crate::value::ObjectSlot::Cell(super::cell(v))),
+                            None => {
+                                *s = Some(match v {
+                                    Value::Float(value) => {
+                                        crate::value::ObjectSlot::inline_float(value)
+                                    }
+                                    other => crate::value::ObjectSlot::Cell(super::cell(other)),
+                                });
+                            }
                         }
                         o.unset_props.remove(&dc.flat_props.get().unwrap()[i].key);
                         return Ok(());
