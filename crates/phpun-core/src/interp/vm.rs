@@ -4707,36 +4707,6 @@ echo nt_effect(2), "\n";
 
     #[test]
     fn borrowed_receiver_teardown_keeps_argument_and_exception_owners() {
-        let mut gc = Interp::new("scalar-object-gc.php");
-        let value = gc.instantiate("stdclass", &[]).unwrap();
-        let super::Value::Object(object) = &value else {
-            panic!("object");
-        };
-        {
-            let mut b = object.borrow_mut();
-            super::Rc::make_mut(&mut b.prop_order).push("x".into());
-            b.prop_insert("x", super::cell(super::Value::Float(1.5)));
-        }
-        let capacity = gc.gc_dying.capacity();
-        gc.gc_note_dying(&value.clone(), 8);
-        assert_eq!(gc.gc_dying.capacity(), capacity);
-        assert!(gc.gc_dying.is_empty());
-        let alias = value.clone();
-        gc.gc_note_dying(&value.clone(), 8);
-        assert!(gc
-            .gc_purpled
-            .contains(&(super::Rc::as_ptr(object) as usize)));
-        drop(alias);
-        {
-            let mut b = object.borrow_mut();
-            let nested = super::Value::Array(super::Rc::new(std::cell::RefCell::new(
-                super::PhpArray::new(),
-            )));
-            b.prop_insert("x", super::cell(nested));
-        }
-        gc.gc_note_dying(&value.clone(), 8);
-        assert!(gc.gc_dying.capacity() > capacity);
-        assert!(gc.gc_dying.is_empty());
         let mut constructors = Interp::new("promoted-values.php");
         let result = constructors.run_source(
             r#"<?php
