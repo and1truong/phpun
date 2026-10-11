@@ -2429,13 +2429,11 @@ impl<'a> Interp<'a> {
                     };
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
-                    if comp.top_level {
-                        self.vm_materialize(comp, slots);
-                    }
+                    // Direct dispatch never touches the caller's locals —
+                    // canonical fallbacks inside nested ops do their own
+                    // materialize/refresh, so the top-level slot→globals
+                    // sync that wraps Op::Call isn't needed here.
                     let result = self.vm_run_method_direct(&core, &mut argv, obj, name, *site);
-                    if comp.top_level {
-                        self.vm_refresh(comp, slots);
-                    }
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
