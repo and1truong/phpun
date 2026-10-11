@@ -3649,13 +3649,19 @@ function nt_depth(int $n): int { return $n < 1 ? 0 : nt_depth($n-1) + 1; }
 function nt_bad(int $n): int { return $n + 1; }
 function nt_local($n) { if ($n) { $x=9; } return $x; }
 function nt_effect($n) { echo "effect\n"; return $n + 1; }
+function nt_loop(int $n): int { $s=0; for ($i=0;$i<$n;$i++) { for ($j=0;$j<3;$j++) { if ($j===1) continue; $s+=$i; } if ($i===4) break; } return $s; }
+function nt_loop_bad(int $n): int { for ($i=0;$i<2;$i++) $n++; return $n; }
+function nt_loop_local($n) { while ($n<0) { $x=1; $n++; } return $x; }
 echo nt_fib(16), "\n";
-for ($i=0;$i<70;$i++) { nt_add(1); nt_depth(1); nt_bad(1); nt_local(1); }
+for ($i=0;$i<70;$i++) { nt_add(1); nt_depth(1); nt_bad(1); nt_local(1); nt_loop(10); nt_loop_bad(1); nt_loop_local(-1); }
+echo nt_loop(10), "\n";
+try { nt_loop_bad(PHP_INT_MAX-1); } catch (TypeError $e) { echo get_class($e), "\n"; }
 var_dump(nt_add(PHP_INT_MAX));
 echo nt_depth(100), "\n";
 try { nt_bad(PHP_INT_MAX); } catch (TypeError $e) { echo get_class($e), "\n"; }
 set_error_handler(function () { echo "uninit\n"; return true; });
 var_dump(nt_local(0));
+var_dump(nt_loop_local(0));
 restore_error_handler();
 echo nt_effect(2), "\n";
 "#,
@@ -3664,8 +3670,16 @@ echo nt_effect(2), "\n";
                 assert_eq!(it.err_buf, "");
                 assert_eq!(
                     it.out,
-                    b"987\nfloat(9.223372036854776E+18)\n100\nTypeError\nuninit\nNULL\neffect\n3\n"
+                    b"987\n20\nTypeError\nfloat(9.223372036854776E+18)\n100\nTypeError\nuninit\nNULL\nuninit\nNULL\neffect\n3\n"
                 );
+                let loop_decl = it.functions["nt_loop"].clone();
+                match &it.compiled_fns[&(Rc::as_ptr(&loop_decl) as usize)].3 {
+                    super::native::State::Ready(p) => assert!(p.executions.get() > 0, "loop stayed in VM"),
+                    _ => panic!("pure nested/backward graph did not execute native code"),
+                }
+                it.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                assert!(super::native::execute(&mut it, &loop_decl, &[super::Slot::V(super::Value::Int(10))]).is_none());
+                it.deadline = None;
                 let decl = it.functions["nt_fib"].clone();
                 match &it.compiled_fns[&(Rc::as_ptr(&decl) as usize)].3 {
                     super::native::State::Ready(p) => assert!(p.executions.get() > 0),
@@ -3685,7 +3699,7 @@ echo nt_effect(2), "\n";
                 assert_eq!(it.vm_stack[0].used, it.vm_stack[0].size);
                 assert_eq!(it.mem_tracked.len(), charges);
                 it.vm_stack[0].used = original;
-                for name in ["nt_add", "nt_depth", "nt_bad", "nt_local"] {
+                for name in ["nt_add", "nt_depth", "nt_bad", "nt_local", "nt_loop_bad", "nt_loop_local"] {
                     let decl = it.functions[name].clone();
                     assert!(
                         matches!(

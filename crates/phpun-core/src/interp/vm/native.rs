@@ -130,23 +130,32 @@ impl Graph {
 }
 
 // The accepted value stack contains integers only. Comparisons may create a
-// bool only immediately before its consuming conditional branch. Forward
-// control flow bounds each native activation; backward jumps keep the VM.
+// bool only immediately before its consuming conditional branch. All joins,
+// including backward edges, must have one consistent stack depth.
 fn depths(c: &Compiled) -> Option<Vec<Option<usize>>> {
     let mut depths: Vec<Option<usize>> = vec![None; c.ops.len() + 1];
     depths[0] = Some(0);
-    let set = |depths: &mut Vec<Option<usize>>, pc: usize, depth: usize| -> Option<()> {
+    let mut work = vec![0];
+    let set = |depths: &mut Vec<Option<usize>>,
+               work: &mut Vec<usize>,
+               pc: usize,
+               depth: usize|
+     -> Option<()> {
         let at = depths.get_mut(pc)?;
         if at.is_some_and(|old| old != depth) {
             return None;
         }
-        *at = Some(depth);
+        if at.is_none() {
+            *at = Some(depth);
+            work.push(pc);
+        }
         Some(())
     };
-    for (pc, op) in c.ops.iter().enumerate() {
-        let Some(n) = depths[pc] else {
+    while let Some(pc) = work.pop() {
+        let Some(op) = c.ops.get(pc) else {
             continue;
         };
+        let n = depths[pc]?;
         let (take, give) = match op {
             Op::Const(Value::Int(_))
             | Op::Load(_)
@@ -179,19 +188,13 @@ fn depths(c: &Compiled) -> Option<Vec<Option<usize>>> {
         match op {
             Op::Return => {}
             Op::Jump(t) => {
-                if *t <= pc {
-                    return None;
-                }
-                set(&mut depths, *t, next)?;
+                set(&mut depths, &mut work, *t, next)?;
             }
             Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => {
-                if *t <= pc {
-                    return None;
-                }
-                set(&mut depths, *t, next)?;
-                set(&mut depths, pc + 1, next)?;
+                set(&mut depths, &mut work, *t, next)?;
+                set(&mut depths, &mut work, pc + 1, next)?;
             }
-            _ => set(&mut depths, pc + 1, next)?,
+            _ => set(&mut depths, &mut work, pc + 1, next)?,
         }
     }
     Some(depths)
