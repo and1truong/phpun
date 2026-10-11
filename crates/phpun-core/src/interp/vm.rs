@@ -4980,6 +4980,29 @@ unset($e); unset($h); var_dump($wh->get());
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let scalar_charges = it.mem_tracked.len();
         let source = super::Value::str("abcd");
+        for args in [
+            vec![source.clone(), super::Value::Int(0)],
+            vec![source.clone(), super::Value::Int(-4)],
+            vec![
+                source.clone(),
+                super::Value::Int(-8),
+                super::Value::Int(100),
+            ],
+        ] {
+            let value = it.vm_scalar_builtin("substr", &args).unwrap();
+            let (super::Value::Str(original), super::Value::Str(result)) = (&source, value) else {
+                panic!("strings")
+            };
+            assert!(
+                super::Rc::ptr_eq(&original.rc, &result.rc),
+                "whole range retains source identity"
+            );
+            assert_eq!(
+                it.mem_tracked.len(),
+                scalar_charges,
+                "no new full-range charge"
+            );
+        }
         for _ in 0..20 {
             assert!(matches!(
                 it.vm_scalar_builtin("sqrt", &[super::Value::Int(9)]),

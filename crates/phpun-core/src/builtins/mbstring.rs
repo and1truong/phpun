@@ -165,7 +165,7 @@ pub(crate) fn dispatch(
             match php_substr(&s, start, len) {
                 Some(mut x) => {
                     while !x.is_empty() && !utf8_boundary(&s, start.max(0) as usize + x.len()) {
-                        x.pop();
+                        x = &x[..x.len() - 1];
                     }
                     Value::bytes(x)
                 }
