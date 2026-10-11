@@ -1190,14 +1190,14 @@ impl<'a> Interp<'a> {
                 // only for the not-found/unresolved edge.
                 let owner = found
                     .as_ref()
-                    .map(|(_, o)| o.decl.name.clone())
-                    .or_else(|| cls.as_ref().map(|c| c.decl.name.clone()))
-                    .unwrap_or_else(|| name.clone());
-                let base = owner.split('\0').next().unwrap_or(&owner).to_string();
+                    .map(|(_, o)| o.decl.name.as_str())
+                    .or_else(|| cls.as_ref().map(|c| c.decl.name.as_str()))
+                    .unwrap_or(name.as_str());
+                let base = owner.split('\0').next().unwrap_or(owner);
                 let ctx = if base.contains("@anonymous") {
-                    base
+                    std::borrow::Cow::Borrowed(base)
                 } else {
-                    format!("{base}::__construct")
+                    std::borrow::Cow::Owned(format!("{base}::__construct"))
                 };
                 let argvals = s.arg_cells(
                     args,
