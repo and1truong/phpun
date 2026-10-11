@@ -7582,7 +7582,7 @@ impl<'a> Interp<'a> {
     }
 
     fn check_builtin_types(&mut self, name: &str, cells: &[Cell]) -> Result<(), PhpError> {
-        if let Some(sig) = builtins::strict_sig(name) {
+        if let Some(sig) = builtins::strict_sig_view(name) {
             let zf = matches!(
                 name,
                 "strlen"
