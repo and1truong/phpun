@@ -1,0 +1,14 @@
+array(3) {
+  [0]=>
+  int(1)
+  [1]=>
+  string(1) "s"
+  [2]=>
+  float(2.5)
+}
+int(2)
+
+Fatal error: Uncaught Error: Cannot use a scalar value as an array in %s:%d
+Stack trace:
+#0 {main}
+  thrown in %s on line %d

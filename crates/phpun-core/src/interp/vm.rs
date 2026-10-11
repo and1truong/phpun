@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::calls::builtin_byref;
+use super::expr::{DimArg, DimDetach, DimPre};
 use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, MethodDecl, Param, Stmt};
 use crate::builtins;
@@ -217,6 +218,20 @@ enum Op {
     /// Store top-of-stack into a slot, KEEPING it on the stack
     /// (an assignment is an expression).
     Store(u16),
+    /// `$cv[] = expr` — zend binds the dim container before the RHS:
+    /// snapshot the slot's op-entry value (and `assign`'s dim-throw
+    /// boundary) so StoreAppend's canonical tail detaches a rebound
+    /// root exactly like the eval'd op.
+    AppendSnap {
+        array: u16,
+    },
+    /// `$cv[] = expr` — index_into_key's append arm on the live
+    /// op-entry array, else the canonical assign_index_path tail so
+    /// vivify, string-offset, object and detach cases keep one path.
+    StoreAppend {
+        array: u16,
+        name: Rc<str>,
+    },
     /// Discard top-of-stack — object/callable temps get the same
     /// decref pass exec's statement end runs (methods_003).
     Pop,
@@ -307,6 +322,15 @@ enum Op {
 struct CachedMethod {
     class: Rc<PhpClass>,
     core: Option<MSiteCore>,
+}
+
+/// A pending `$cv[] =` write's op-entry record — container snapshot,
+/// cell identity and `assign()`'s dim-throw boundary, taken at
+/// AppendSnap before the RHS ops run.
+struct AppendSnap {
+    pre: DimPre,
+    pre_cell: usize,
+    outer: Option<(Value, PhpError, bool, bool)>,
 }
 
 /// Class-stable pieces of a direct method target — everything except
@@ -1080,6 +1104,36 @@ impl Compiler {
                                         return Some(());
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // `$cv[] = expr` — zend binds the dim container before
+                    // the RHS; AppendSnap records it, StoreAppend replays
+                    // index_into_key's append arm or the canonical tail.
+                    // A bare-CV RHS stays canonical (pin_rhs defers its
+                    // read into the op for the warn site).
+                    if let Expr::Index { e: base, i: None } = Interp::unmark_rhs(target) {
+                        if let Expr::Var(n) = Interp::unmark_rhs(base) {
+                            if n != "this"
+                                && !Interp::is_superglobal(n)
+                                && self.assigned.contains(n.as_str())
+                                && !Interp::is_cv(Interp::unmark_rhs(value))
+                            {
+                                let array = self.slot(n);
+                                let mark = self.ops.len();
+                                self.emit(Op::AppendSnap { array });
+                                if self.expr(value).is_some() {
+                                    self.emit(Op::StoreAppend {
+                                        array,
+                                        name: Rc::from(n.as_str()),
+                                    });
+                                } else {
+                                    // RHS needs canonical machinery — rewind
+                                    // the snap and partial RHS ops, eval whole.
+                                    self.ops.truncate(mark);
+                                    self.emit(Op::Canonical(Box::new(e.clone())));
+                                }
+                                return Some(());
                             }
                         }
                     }
@@ -2018,6 +2072,58 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// index_into_key's `[]` arm on the live op-entry table: the
+    /// scalar-packed gate first, then the fresh-cell bind + the
+    /// table-growth charge. `is_ref` carries the container cell's ref
+    /// mark — bare slot places have no cell, so no mark and no B1.
+    fn vm_append_place(
+        &mut self,
+        place: &mut Value,
+        is_ref: bool,
+        v: Value,
+    ) -> Result<Value, PhpError> {
+        let packed = !is_ref
+            && matches!(
+                &v,
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+            )
+            && matches!(place, Value::Array(a) if a.borrow().packed
+                && (a.borrow().entries.is_scalar_packed() || a.borrow().entries.is_empty()));
+        self.cow_split(place);
+        let rc = match place {
+            Value::Array(rc) => rc.clone(),
+            _ => unreachable!("same_container kept the op-entry array"),
+        };
+        if packed {
+            let mut arr = rc.borrow_mut();
+            if arr.push_packed_scalar(&v) {
+                let req = Self::ht_req(arr.entries.len(), arr.packed);
+                drop(arr);
+                self.mem_realloc(&rc, req);
+                return Ok(v);
+            }
+            drop(arr);
+        }
+        let nc = {
+            let mut arr = rc.borrow_mut();
+            let k = ArrKey::Int(arr.next);
+            let nc = cell(Value::Null);
+            arr.bind_cell(k, nc.clone());
+            let req = Self::ht_req(arr.entries.len(), arr.packed);
+            drop(arr);
+            self.mem_realloc(&rc, req);
+            nc
+        };
+        let v = self.typed_slot_store(&nc, v)?;
+        // B1 — a live upstream borrow drops the write invisibly.
+        if let Ok(mut nb) = nc.try_borrow_mut() {
+            let old = std::mem::replace(&mut *nb, v.clone());
+            drop(nb);
+            self.destruct_dying_value(&old)?;
+        }
+        Ok(v)
+    }
+
     fn vm_materialize(&mut self, comp: &Compiled, slots: &mut [Slot]) {
         let frame = self.cur();
         if !frame.value_args.is_empty() {
@@ -2088,6 +2194,7 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, PhpError> {
         let mut mtargets: Vec<Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)>> = Vec::new();
         let mut ntargets: Vec<NewTarget> = Vec::new();
+        let mut app_snaps: Vec<AppendSnap> = Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
@@ -2361,6 +2468,109 @@ impl<'a> Interp<'a> {
                         }
                     }
                     self.vm_publish_global(comp, slots, *s);
+                }
+                Op::AppendSnap { array } => {
+                    // assign()'s op boundary at container bind, like the
+                    // canonical: a pending dim throwable rides `outer`
+                    // into the store; the op's conversion caches and
+                    // fresh-prop markers reset here.
+                    let outer = self.dim_throw.take();
+                    if !self.in_handler {
+                        self.dim_key_conv.clear();
+                        self.dim_cv_bound.clear();
+                    }
+                    self.fresh_dyn_props.clear();
+                    self.last_fresh_cell = None;
+                    let (pre, pre_cell) = match &slots[*array as usize] {
+                        Slot::C(c) => (DimPre::of(&c.borrow()), Rc::as_ptr(c) as usize),
+                        Slot::V(v) => (DimPre::of(v), 0),
+                        Slot::Arg(i) => (DimPre::of(&self.cur().value_args[*i as usize]), 0),
+                        Slot::Uninit => (DimPre::Scalar(Value::Null), 0),
+                    };
+                    app_snaps.push(AppendSnap {
+                        pre,
+                        pre_cell,
+                        outer,
+                    });
+                }
+                Op::StoreAppend { array, name } => {
+                    let AppendSnap {
+                        pre,
+                        pre_cell,
+                        outer,
+                    } = app_snaps.pop().expect("AppendSnap precedes StoreAppend");
+                    let v = vs.last().unwrap().clone();
+                    let mut done = false;
+                    let mut r = Ok(v.clone());
+                    if !self.detached_dim && !self.in_handler && self.dim_throw.is_none() {
+                        match &mut slots[*array as usize] {
+                            Slot::C(c) => {
+                                let live = matches!(&*c.borrow(), cur @ Value::Array(_)
+                                    if Self::same_container(&pre, cur));
+                                if live {
+                                    done = true;
+                                    let is_ref = self.is_ref_cell(c);
+                                    r = match c.try_borrow_mut() {
+                                        // B1 — a live upstream borrow lands
+                                        // the write on a dead scratch.
+                                        Err(_) => Ok(v.clone()),
+                                        Ok(mut b) => {
+                                            self.vm_append_place(&mut b, is_ref, v.clone())
+                                        }
+                                    };
+                                }
+                            }
+                            Slot::V(sv) => {
+                                let live = matches!(&*sv, cur @ Value::Array(_)
+                                    if Self::same_container(&pre, cur));
+                                if live {
+                                    done = true;
+                                    r = self.vm_append_place(sv, false, v.clone());
+                                }
+                            }
+                            Slot::Arg(i) => {
+                                let live = matches!(
+                                    &self.cur().value_args[*i as usize],
+                                    cur @ Value::Array(_)
+                                        if Self::same_container(&pre, cur)
+                                );
+                                if live {
+                                    done = true;
+                                    let mut sv = std::mem::replace(
+                                        &mut self.cur().value_args[*i as usize],
+                                        Value::Null,
+                                    );
+                                    r = self.vm_append_place(&mut sv, false, v.clone());
+                                    self.cur().value_args[*i as usize] = sv;
+                                }
+                            }
+                            Slot::Uninit => {}
+                        }
+                    }
+                    if !done {
+                        // The container isn't the op-entry array (rebound,
+                        // scalar, object, undef) — the canonical fetch keeps
+                        // every zend gate: vivify, string-offset Errors,
+                        // ArrayAccess, typed slots, the detach sentinel.
+                        let det = DimDetach {
+                            name: name.to_string(),
+                            pre,
+                            pre_cell,
+                            coalesce: false,
+                        };
+                        self.vm_materialize(comp, slots);
+                        let c = self.var_cell(&det.name);
+                        r = self.assign_index_path(
+                            c,
+                            &[DimArg::Append],
+                            v,
+                            false,
+                            Some(&det),
+                            None,
+                        );
+                        self.vm_refresh(comp, slots);
+                    }
+                    *vs.last_mut().unwrap() = self.dim_op_outlet(r, outer)?;
                 }
                 Op::Pop => {
                     // Statement boundary like exec's Stmt::Expr entry:
