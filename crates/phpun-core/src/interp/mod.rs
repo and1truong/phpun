@@ -231,6 +231,9 @@ pub struct Frame {
     /// destroyed, so the charges outlive arg binding and die with
     /// this frame's pop.
     vm_sites: Vec<Rc<VmSite>>,
+    /// A direct call already owns a live frame. Its current-segment push can
+    /// roll back here without an in-progress CallArgs token or tracked charge.
+    vm_span: Option<(usize, u64, usize)>,
 }
 
 impl Frame {
@@ -256,6 +259,7 @@ impl Frame {
             decl_site: 0,
             gen_body: false,
             vm_sites: Vec::new(),
+            vm_span: None,
         }
     }
 }
@@ -4561,6 +4565,21 @@ impl<'a> Interp<'a> {
         self.vm_site(out, seg_key, extra_slots, 0);
     }
 
+    /// Direct calls reserve only after their frame is live. Keep rollback on
+    /// that frame; segment growth still uses the canonical charged token path.
+    fn vm_direct_reserve(&mut self, out: &mut CallArgs, slots: u64) {
+        let want = VM_FRAME_SLOTS + slots;
+        let top = self.vm_stack.last_mut().unwrap();
+        if top.size.saturating_sub(top.used) >= want * 16 {
+            let key = Rc::as_ptr(&top.tok) as usize;
+            top.used += want * 16;
+            self.stack.last_mut().unwrap().vm_span = Some((key, want, 0));
+            out.vm_slots = want;
+        } else {
+            self.vm_call_reserve(out, slots);
+        }
+    }
+
     /// Record one arena push: the site token's MemCharge carries the
     /// rollback — repaid at the owning frame's pop (vm_frame_free) or
     /// at sweep once a never-dispatched call's token dies.
@@ -4630,6 +4649,7 @@ impl<'a> Interp<'a> {
         f.decl_class = None;
         f.closure_rc = None;
         f.vm_sites.clear();
+        f.vm_span = None;
         if self.vm_frame_pool.len() < 64 {
             self.vm_frame_pool.push(f);
         }
@@ -4643,8 +4663,11 @@ impl<'a> Interp<'a> {
 
     /// Pop a call frame and free its vm_stack span.
     fn stack_pop(&mut self) -> Option<Box<Frame>> {
-        let f = self.stack.pop();
-        if let Some(f) = &f {
+        let mut f = self.stack.pop();
+        if let Some(f) = &mut f {
+            if let Some((seg, slots, own)) = f.vm_span.take() {
+                Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+            }
             self.vm_frame_free(&f.vm_sites);
         }
         f

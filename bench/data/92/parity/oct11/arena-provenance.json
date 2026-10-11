@@ -1,0 +1,12 @@
+{
+  "main_runtime": "e202891d95f9b2acba676a508b2de88e0b91fdb2",
+  "arena_runtime": "9d1544fe3ba65426c9ea7efc307c884380289a14",
+  "rust": "1.99.0 release LTO=true/codegen-units=1, dedicated clean target",
+  "php": "8.5.11 release/non-debug/non-ZTS -n, opcache/JIT not loaded",
+  "hashes": {
+    "main-e202891": "0226a228bc98a38acedc5b2d342d4fa40efce9ef7b7cb67fa247fefc24abcc08",
+    "direct-arena": "9ccbb77607f1be415b014c10f18c4741dfb333c647405538235f0468f45a11c0"
+  },
+  "cpu": "cpu-clock 199Hz DWARF8192, profiler runs separate from speed; zero lost both; raw perf.data stays workspace",
+  "gate": "workspace fmt/clippy/tests,23VM/callback/arena+19workload gates;3406PHPT one preexisting range crash/timeout transition; standalone30s both crash"
+}
