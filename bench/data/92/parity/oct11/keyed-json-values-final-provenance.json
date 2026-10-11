@@ -18,11 +18,6 @@
   },
   "phpt_changes_after_isolation": [
     {
-      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
-      "before": "pass",
-      "after": "timeout"
-    },
-    {
       "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
       "before": "timeout",
       "after": "crash"
@@ -50,7 +45,30 @@
       "after": "timeout"
     }
   ],
-  "isolated_gc_rechecks": [],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "fresh-promoted-float-review",
+      "artifact": "keyed-json-values-final-recheck-fresh-promoted-float-review-gc77345-isolated.json",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8794
+      }
+    },
+    {
+      "binary": "keyed-json-values-final",
+      "artifact": "keyed-json-values-final-recheck-keyed-json-values-final-gc77345-isolated.json",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 9015
+      }
+    }
+  ],
   "physical_allocations": [
     {
       "label": "json",
