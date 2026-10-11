@@ -1510,3 +1510,43 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/weak-liveness-*.
+
+## #267: perf(vm): call exact scalar sqrt and substr kernels from values (2026-10-11)
+
+For already resolved builtin targets with exact Float/Int sqrt or Str/Int substr arguments, reuse the original shared math/byte kernels directly from the VM value stack. Preserve canonical arena reservation/free; avoid argument Cells/transient builtin trace/ZPP/family scans for these effect-free kernels only.
+
+Page growth, memory-exceeded, profilers, pending conversion/probe/compare diagnostics, named/ref/coercion/type/arity/user override retain canonical path. Missing/null length stays canonical; pre-existing explicit null length bug is recorded with parent/candidate matching and scheduled shared parser fix #278.
+
+Runtime 85144a9071432a89c80feae86b3baad964dadc36; measured source 569248f2e26ea0972498cd19e9955731b6a1d981.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 194.512 | 182.742 | 0.9395 |
+| bench/40-objects.php 20 5000 | 793.817 | 727.115 | 0.9160 |
+| bench/profile/objects.php norm 5000 | 49.601 | 46.014 | 0.9277 |
+| bench/20-strings.php | 119.200 | 65.649 | 0.5508 |
+| bench/20-strings.php 100 | 574.443 | 308.738 | 0.5375 |
+| bench/30-arrays.php | 81.697 | 80.020 | 0.9795 |
+| bench/11-sieve.php | 79.467 | 77.921 | 0.9805 |
+| bench/10-fib.php | 8.658 | 9.070 | 1.0475 |
+| bench/app/cli.php 100 20 | 36.217 | 34.345 | 0.9483 |
+| examples/composer/run.php | 7.596 | 7.590 | 0.9993 |
+
+Seven pairs strings−44.9%,long−46.3%,objects−6.1%/long−8.4%,norm−7.2%. Retain nontarget fib+4.8%, not attributed or erased. Native-host parent comparisons, not user2.71× dataset or current suite parity.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects: requests 8763026→8369363; bytes 275059963→264885143.
+- strings: requests 1337503→617503; bytes 46016453→29056481.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing VM runnable check proves actual kernel entry using empty trace-pool and balanced arena span; array-argument error and page-growth create canonical trace frames. Extra boundary byte gate passes for binary/Int-extremes/NaN/-0/named/namespace/type/arity/coercion. Full NULL-length probe matches parent but mismatches PHP (pre-existing parser bug); kept separately and queued #278.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/scalar-builtin-calls-*.
