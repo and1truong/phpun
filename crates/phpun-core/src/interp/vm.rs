@@ -486,19 +486,31 @@ impl Compiled {
         // their early publish pass materializes before observable hooks.
         let value_abi = !hybrid && !needs_bind && (!has_promoted || promoted_slots);
         let float_type = |ty: &Option<Vec<String>>| {
-            ty.as_ref().is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("float"))
+            ty.as_ref()
+                .is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("float"))
         };
         let float_leaf = !needs_bind
             && decl.attrs.is_empty()
             && float_type(&decl.ret)
-            && decl.params.iter().all(|p| !p.by_ref && !p.variadic && !p.promoted && float_type(&p.ty))
+            && decl
+                .params
+                .iter()
+                .all(|p| !p.by_ref && !p.variadic && !p.promoted && float_type(&p.ty))
             && c.slots.len() == decl.params.len()
             && c.ops.len() <= 64
-            && c.ops.iter().all(|op| matches!(op,
-                Op::Const(Value::Float(_)) | Op::Load(_) | Op::ThisProp { .. }
-                | Op::Binary("+" | "-" | "*") | Op::Line(_) | Op::Sweep
-                | Op::InitCall { .. } | Op::Return
-            ) || matches!(op, Op::Call { lname, argc: 1, .. } if lname.as_ref() == "sqrt"))
+            && c.ops.iter().all(|op| {
+                matches!(
+                    op,
+                    Op::Const(Value::Float(_))
+                        | Op::Load(_)
+                        | Op::ThisProp { .. }
+                        | Op::Binary("+" | "-" | "*")
+                        | Op::Line(_)
+                        | Op::Sweep
+                        | Op::InitCall { .. }
+                        | Op::Return
+                ) || matches!(op, Op::Call { lname, argc: 1, .. } if lname.as_ref() == "sqrt")
+            })
             && c.ops.iter().any(|op| matches!(op, Op::Return));
         Ok(Rc::new(Compiled {
             hybrid,
@@ -3607,7 +3619,9 @@ impl<'a> Interp<'a> {
         let comp = &core.comp;
         if !comp.float_leaf
             || argv.len() != core.fdecl.params.len()
-            || argv.iter().any(|v| !matches!(v, Value::Float(_) | Value::Int(_)))
+            || argv
+                .iter()
+                .any(|v| !matches!(v, Value::Float(_) | Value::Int(_)))
             || Rc::strong_count(obj) < 3
             || self.globals_arr.is_some()
             || self.pending_hook_prop.is_some()
@@ -3646,10 +3660,14 @@ impl<'a> Interp<'a> {
                     let hit = hit.as_ref()?;
                     let ob = obj.borrow();
                     if !Rc::ptr_eq(&hit.class, &ob.class)
-                        || !hit.scope.as_ref().is_some_and(|scope| Rc::ptr_eq(scope, &core.dc))
-                        || !hit.private_candidate.as_ref().is_none_or(|key| {
-                            key == &hit.key || !ob.prop_has(key)
-                        })
+                        || !hit
+                            .scope
+                            .as_ref()
+                            .is_some_and(|scope| Rc::ptr_eq(scope, &core.dc))
+                        || !hit
+                            .private_candidate
+                            .as_ref()
+                            .is_none_or(|key| key == &hit.key || !ob.prop_has(key))
                     {
                         return None;
                     }
@@ -3684,7 +3702,9 @@ impl<'a> Interp<'a> {
                     None
                 }
                 Op::Return => {
-                    if used != 1 { return None; }
+                    if used != 1 {
+                        return None;
+                    }
                     // Both leaf and builtin spans fit the current page.
                     // No frame/token is needed; repay through the shared arena.
                     let want = super::VM_FRAME_SLOTS + argv.len() as u64;
@@ -4564,7 +4584,8 @@ unset($a); var_dump($weak->get());
             .expect("empty promoted constructor retains direct target");
         assert!(target.1.comp.value_abi);
         let mut leaf = Interp::new("float-leaf.php");
-        let result = leaf.run_source(r#"<?php
+        let result = leaf.run_source(
+            r#"<?php
 class ArithmeticLeaf {
  private float $x=3.0;
  private float $y=4.0;
@@ -4572,18 +4593,22 @@ class ArithmeticLeaf {
 }
 $o = new ArithmeticLeaf;
 echo $o->length(), "\n";
-"#);
+"#,
+        );
         assert_eq!(result.exit_code, 0, "{}", leaf.err_buf);
         assert_eq!(leaf.out, b"5\n");
         let super::Value::Object(object) = leaf.globals.vars["o"].borrow().clone() else {
             panic!("receiver")
         };
-        let (_, core) = leaf.vm_method_target(
-            object.clone(), "length", &std::cell::RefCell::new(None), 1,
-        ).unwrap();
+        let (_, core) = leaf
+            .vm_method_target(object.clone(), "length", &std::cell::RefCell::new(None), 1)
+            .unwrap();
         assert!(core.comp.float_leaf);
         let pin = object.clone();
-        assert!(matches!(leaf.vm_float_method(&core, &[], &object), Some(super::Value::Float(5.0))));
+        assert!(matches!(
+            leaf.vm_float_method(&core, &[], &object),
+            Some(super::Value::Float(5.0))
+        ));
         let x = object.borrow().prop_get("\0ArithmeticLeaf\0x").unwrap();
         *x.borrow_mut() = super::Value::Int(3);
         assert!(leaf.vm_float_method(&core, &[], &object).is_none());
