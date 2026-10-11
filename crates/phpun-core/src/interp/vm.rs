@@ -2658,8 +2658,7 @@ impl<'a> Interp<'a> {
                     ..
                 } => {
                     let n = *argc as usize;
-                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
-                    argv.extend(vs.drain(vs.len() - n..));
+                    let start = vs.len() - n;
                     // Direct hits bypass invoke_fn — arg values become
                     // the frame's cells inside vm_run_direct. send_line
                     // still pins this call site: call_site() reads it
@@ -2675,16 +2674,15 @@ impl<'a> Interp<'a> {
                         && matches!(target, CachedFn::Builtin)
                     {
                         self.send_line = Some(*site);
-                        if let Some(value) = self.vm_scalar_builtin(lname, &argv) {
-                            argv.clear();
-                            if self.vm_val_pool.len() < 64 {
-                                self.vm_val_pool.push(argv);
-                            }
+                        if let Some(value) = self.vm_scalar_builtin(lname, &vs[start..]) {
+                            vs.truncate(start);
                             vs.push(value);
                             pc += 1;
                             continue;
                         }
                     }
+                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+                    argv.extend(vs.drain(start..));
                     if comp.top_level {
                         // Callees may unset/rebind globals or run GC. Slot
                         // handles must not pin old bindings during the call.
@@ -4969,6 +4967,23 @@ unset($e); unset($h); var_dump($wh->get());
 
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
+        let mut stacked = Interp::new("stacked-scalar.php");
+        let stmts = crate::parser::parse_source(
+            r#"<?php $out=0;for($i=0;$i<4;$i++) {$out+=sqrt(sqrt(81));$text=substr(strtolower("ABCD"),1,2);}echo $out,":",$text;"#,
+            false,
+        ).unwrap();
+        assert!(matches!(
+            stacked.vm_top_exec(&stmts),
+            Some(super::super::Flow::Normal)
+        ));
+        assert_eq!(stacked.out, b"12:bc");
+        assert_eq!(stacked.err_buf, "");
+        assert_eq!(
+            stacked.vm_val_pool.len(),
+            1,
+            "only the value-stack vector, no scalar argument-vector lease"
+        );
+        assert!(stacked.vm_val_pool[0].is_empty());
         {
             let mut limits = Interp::new("limit.php");
             limits.ini.insert("memory_limit".into(), "128M".into());
