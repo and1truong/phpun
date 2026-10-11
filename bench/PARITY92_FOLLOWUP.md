@@ -2645,3 +2645,39 @@ Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/keyed-json-values-final-*.
+
+## #330: perf(pcre): reuse compiled patterns in a bounded interpreter cache (2026-10-11)
+
+All five preg pattern call sites now reuse successful immutable PCRE2 code through the same shared helper, keyed by full pattern bytes. Cache is owned by Interp and freed with it; no cross-request retention.
+
+ponytail ceiling:256patterns, clear-on-capacity. Failed compilations remain uncached; modifiers/binary keys distinguish entries. Match context,backtrack/depth limits,UTF/offset/error state and callback reentry stay per invocation. No dependency/new unsafe/JIT enablement.
+
+Runtime e3983ee56ef017bf32e66d1aabed83307081041b; timing source e3983ee56ef017bf32e66d1aabed83307081041b; report/integration source b0434dff271ea12b5aeb13966c361d0dc5189778.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/50-regex.php | 39.549 | 41.457 | 1.0482 |
+| bench/profile/pcre-patterns.php 10000 4 | 89.667 | 76.603 | 0.8543 |
+| bench/profile/pcre-patterns.php 10000 300 | 93.950 | 89.618 | 0.9539 |
+| bench/40-objects.php | 102.501 | 101.282 | 0.9881 |
+| bench/60-json.php | 524.819 | 508.256 | 0.9684 |
+| examples/composer/run.php | 8.556 | 9.606 | 1.1228 |
+
+31profiler-off pairs:10000small-subject calls/four-pattern working set88.600→77.036ms(−13.1%);300patterns92.547→86.613(−6.4%);regex corpus39.625→39.094(−1.3%,near flat),Composer8.821→8.686(−1.5%). Seven-pair corpus+4.8%/Composer+12.3% retained. Whole7main4e6/runtime-equivalent af590/d261 compared:geo3.88416→3.98753×PHP(+2.66%,negative),objects12.945×PHP. Main/parent used the SAME frozen ELF,so not independent savings.31negative follow-up:startup−.4%,DB−.6%,JSON+1.7%,app+1.0%;all retained. Native timing profilers off, no CPU build/test/profile overlap. No suite/parity gain claimed. New small-subject benchmark was untracked when timed;PHP scripts do not affect frozen runtime e3983ee. Existing gap:default PHPPCREJIT/limit0 differs from BOTH old/new runtime; original failing probe/outputs retained, (*NO_JIT)limit probe passes;#332 handles JIT separately.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- regex: requests 327919→327813; bytes 29929976→29927200.
+- patterns: requests 1142090→1122104; bytes 60207919→59728667.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE new runnable cache check covers pointer reuse/modifiers/binary/errors/eviction/dynamic limits;25+19+VMprofile/native five-family/UTF/callback byte gates pass.
+All3406PHPT onlyGC77345pass→timeout;serialized10s parent9017ms/candidate8195msPASS,raw separately retained;601knownfail unchanged.
+Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/pcre-pattern-cache-*.
