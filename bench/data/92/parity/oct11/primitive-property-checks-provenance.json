@@ -1,0 +1,38 @@
+{
+  "source": "72d0f988c88e2660d7b2b690b9349da8812c1502",
+  "runtime": "91618f6ce934141c2e75d571daf31df312d1b635",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects",
+      "before": {
+        "requests": 8369363,
+        "bytes": 264886938
+      },
+      "after": {
+        "requests": 7569363,
+        "bytes": 257086966
+      }
+    }
+  ],
+  "binary_sha256": "21be565b896c164c8ae2398381da684632d3fb8a2ab4acea75dd35d02d1169c2",
+  "scope": "At the shared prop_typed_write_check, accept exact single primitive Float/Int/Bool/Str values before allocating resolved type-name strings. Actual VM promotion/property-store path, not canonical promoted binder.",
+  "fallbacks": "Int-to-float widening, nullable/unions/class names/coercion/errors keep the canonical check. Hook/readonly/ref/type-owner/slot/GC/memory behavior stays in existing store. ONE existing primitive property check extends widening, aliases and bad-array errors."
+}

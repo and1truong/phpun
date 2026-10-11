@@ -42,6 +42,11 @@ fn arg(args: &[Cell], i: usize) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn nullable_int_arg(args: &[Cell], i: usize) -> Option<i64> {
+    let value = args.get(i)?.borrow();
+    (!matches!(*value, Value::Null)).then(|| value.to_int())
+}
+
 fn arg_str(it: &mut Interp, args: &[Cell], i: usize) -> String {
     it.to_string_of(&arg(args, i))
 }
