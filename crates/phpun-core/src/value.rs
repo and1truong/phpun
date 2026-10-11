@@ -152,6 +152,14 @@ impl PhpArray {
     pub fn mem_note_append(&mut self) {
         let old = arr_foot(self.mem_elems, self.packed);
         self.mem_elems += 1;
+        let new = arr_foot(self.mem_elems, self.packed);
+        // zend's arData only reallocs at pow2 bucket counts, so ARR_LIVE
+        // moves on the same staircase — charging only when the footprint
+        // steps skips the per-append fetch_max atomics (the total and
+        // the limit-trip point are unchanged).
+        if new == old {
+            return;
+        }
         // Zend trips inside the arData grow — a pow2-bucket realloc —
         // so the reported request is the grow alloc's size: packed
         // tables alloc nSize*16+8, mixed tables nSize*40 (oracle:
@@ -162,11 +170,7 @@ impl PhpArray {
         } else {
             n * ARR_ELEM_HASH_BYTES
         };
-        mem_charge(
-            &ARR_LIVE,
-            arr_foot(self.mem_elems, self.packed) - old,
-            request,
-        );
+        mem_charge(&ARR_LIVE, new - old, request);
     }
 
     /// Bulk-charge `n` appended slots — the mass-prepend path in
