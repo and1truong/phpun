@@ -3625,6 +3625,24 @@ DivisionByZeroError:Division by zero
             panic!("string")
         };
         assert_eq!(bytes.as_ref(), b"\0b");
+        let mut values = vec![
+            super::Value::bytes(vec![255, 0, 97]),
+            super::Value::Int(0),
+            super::Value::Int(2),
+        ];
+        let super::Value::Str(bytes) = it
+            .vm_call(
+                "substr",
+                "substr",
+                &mut values,
+                1,
+                &super::CachedFn::Builtin,
+            )
+            .unwrap()
+        else {
+            panic!("string")
+        };
+        assert_eq!(bytes.as_ref(), &[255, 0]);
         let mut values = vec![super::Value::str("abcd"), super::Value::Int(-2)];
         let super::Value::Str(bytes) = it
             .vm_call(
