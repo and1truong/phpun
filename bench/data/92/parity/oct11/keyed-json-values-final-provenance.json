@@ -1,0 +1,92 @@
+{
+  "source": "303428acc38a68f9fd4d08a6732b9ffe15e874b5",
+  "runtime": "edadeddb270ef574a18183756b00d4a443eb16e1",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "json",
+      "before": {
+        "requests": 4360111,
+        "bytes": 296859820
+      },
+      "after": {
+        "requests": 3820111,
+        "bytes": 292540524
+      }
+    },
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1058127,
+        "bytes": 57271410
+      },
+      "after": {
+        "requests": 1058127,
+        "bytes": 57271394
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636049,
+        "bytes": 26703069
+      },
+      "after": {
+        "requests": 636049,
+        "bytes": 26703053
+      }
+    }
+  ],
+  "binary_sha256": "5daaeb312f149254a613249c270192f11f87e34a54159e35b9c5c51ff5c8441c",
+  "scope": "Rejected #328 prototype: bounded keyed decoded JSON maps shared the existing inline Value table and canonical Cell promotion. Ordinary reverts cd9ea63/303428a restore runtime exactly to main4e6b847; this PR contains evidence only.",
+  "fallbacks": "Prototype checked duplicate/numeric keys, order, by-ref/CoW, foreach/unset/sort/splice, >48 keys, and readonly fallbacks. No runtime optimization retained."
+}
