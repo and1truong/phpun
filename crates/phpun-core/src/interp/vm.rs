@@ -4979,18 +4979,43 @@ unset($e); unset($h); var_dump($wh->get());
         let scalar_charges = it.mem_tracked.len();
         let source = super::Value::str("abcd");
         for _ in 0..20 {
-            assert!(matches!(it.vm_scalar_builtin("sqrt", &[super::Value::Int(9)]), Some(super::Value::Float(3.0))));
-            let value = it.vm_scalar_builtin("substr", &[source.clone(), super::Value::Int(1), super::Value::Int(2)]).unwrap();
+            assert!(matches!(
+                it.vm_scalar_builtin("sqrt", &[super::Value::Int(9)]),
+                Some(super::Value::Float(3.0))
+            ));
+            let value = it
+                .vm_scalar_builtin(
+                    "substr",
+                    &[source.clone(), super::Value::Int(1), super::Value::Int(2)],
+                )
+                .unwrap();
             assert!(matches!(value, super::Value::Str(ref s) if &s[..] == b"bc"));
         }
-        assert_eq!(it.mem_tracked.len(), scalar_charges, "fit scalar calls need no temporary site charge");
-        assert_eq!(it.vm_stack.iter().map(|s| (s.size,s.used)).collect::<Vec<_>>(), initial);
-        assert!(it.vm_scalar_builtin("sqrt", &[super::Value::str("9")]).is_none());
+        assert_eq!(
+            it.mem_tracked.len(),
+            scalar_charges,
+            "fit scalar calls need no temporary site charge"
+        );
+        assert_eq!(
+            it.vm_stack
+                .iter()
+                .map(|s| (s.size, s.used))
+                .collect::<Vec<_>>(),
+            initial
+        );
+        assert!(it
+            .vm_scalar_builtin("sqrt", &[super::Value::str("9")])
+            .is_none());
         let last = it.vm_stack.last_mut().unwrap();
         let old_used = last.used;
         last.used = last.size;
-        assert!(it.vm_scalar_builtin("sqrt", &[super::Value::Int(9)]).is_none());
-        assert_eq!(it.vm_stack.last().unwrap().used, it.vm_stack.last().unwrap().size);
+        assert!(it
+            .vm_scalar_builtin("sqrt", &[super::Value::Int(9)])
+            .is_none());
+        assert_eq!(
+            it.vm_stack.last().unwrap().used,
+            it.vm_stack.last().unwrap().size
+        );
         it.vm_stack.last_mut().unwrap().used = old_used;
 
         let frame = it.frame_new("direct");
