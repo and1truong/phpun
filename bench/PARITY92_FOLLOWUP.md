@@ -1703,3 +1703,43 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/scalar-string-calls-*.
+
+## #285: perf(gc): skip no-target scalar decrefs and scalar-array dying maps (2026-10-11)
+
+At shared destruct_dying_value, scalar decrefs return before empty object tally setup. At gc_note_dying, LAST-real-owner arrays whose current elements are all Null/Bool/Int/Float/Str return before dying-cell map/walk/release. Shared-array purple buffering stays first.
+
+Mixed/nested/object/closure/resource tables keep the full snapshot and callback order. No individual filtering inside mixed tables, no cache/threshold/GC disable/deferred drop. ONE existing GC runnable fixture extends scalar aliases and mixed-cycle collection; native/parent outputs identical.
+
+Runtime b5ac32f926801d690aa396ebb5d982829133edac; timing source 8bcecaa3a38fd7fcb99338a65c3cb398f1331b93; report/integration source 8bcecaa3a38fd7fcb99338a65c3cb398f1331b93.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/11-sieve.php | 77.516 | 74.690 | 0.9635 |
+| bench/11-sieve.php 10 100000 | 858.516 | 717.455 | 0.8357 |
+| bench/30-arrays.php | 82.896 | 80.213 | 0.9676 |
+| bench/60-json.php | 536.583 | 521.845 | 0.9725 |
+| bench/40-objects.php | 175.735 | 175.437 | 0.9983 |
+| bench/20-strings.php | 68.214 | 65.354 | 0.9581 |
+| bench/10-fib.php | 8.703 | 9.622 | 1.1056 |
+| bench/app/cli.php 100 20 | 33.276 | 34.022 | 1.0224 |
+| examples/composer/run.php | 8.927 | 8.010 | 0.8973 |
+
+Seven pairs Sieve10×100000−16.4%,default−3.6%,arrays−3.2%,JSON−2.7%,objects flat. Initialfib+10.6%,app+2.2% retained;31follow-upfib+3.9%,app flat. PhysicalSieve10×1000001032554→1032393 requests;bytes105819177→78032005 (−26.3%). Target GC CPU/maps, not a broad whole-suite or fib claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- sieve: requests 1032554→1032393; bytes 105819177→78032005.
+- arrays: requests 635955→635955; bytes 26701670→26701678.
+- json: requests 4540348→4540348; bytes 315894275→315894283.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing GC fixture scalar aliases/mixed-cycle probe matches native PHP and parent. Workspace/fmt/clippy,25+19+VM-profile/core nullable probe pass;3406individualPHPT only2knownrange swaps. Full compatibility remains81.57%, not asserted green.
+All3406individualPHPT compared; 2 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/scalar-array-teardown-*.

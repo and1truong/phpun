@@ -1,0 +1,82 @@
+{
+  "source": "8bcecaa3a38fd7fcb99338a65c3cb398f1331b93",
+  "runtime": "b5ac32f926801d690aa396ebb5d982829133edac",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "sieve",
+      "before": {
+        "requests": 1032554,
+        "bytes": 105819177
+      },
+      "after": {
+        "requests": 1032393,
+        "bytes": 78032005
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 635955,
+        "bytes": 26701670
+      },
+      "after": {
+        "requests": 635955,
+        "bytes": 26701678
+      }
+    },
+    {
+      "label": "json",
+      "before": {
+        "requests": 4540348,
+        "bytes": 315894275
+      },
+      "after": {
+        "requests": 4540348,
+        "bytes": 315894283
+      }
+    }
+  ],
+  "binary_sha256": "c12784ae5a88f5c57843e8c74904dbbbf3ba243e4fb2738f2838444b1adc1471",
+  "scope": "At shared destruct_dying_value, scalar decrefs return before empty object tally setup. At gc_note_dying, LAST-real-owner arrays whose current elements are all Null/Bool/Int/Float/Str return before dying-cell map/walk/release. Shared-array purple buffering stays first.",
+  "fallbacks": "Mixed/nested/object/closure/resource tables keep the full snapshot and callback order. No individual filtering inside mixed tables, no cache/threshold/GC disable/deferred drop. ONE existing GC runnable fixture extends scalar aliases and mixed-cycle collection; native/parent outputs identical."
+}
