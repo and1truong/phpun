@@ -3014,10 +3014,6 @@ this is not full compatibility. Explicit release core clean/rebuild/hash recorde
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/inline-float-slots-vm-*.
 
-## #347 / PR349 review: withdraw widened declared slots (2026-10-11)
-
-P2 review correctly identifies 8→24 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31−3.6%/confirm−3.7%,long−1.6%/confirm−.6%,wholedefaultflat/long+2.8% andphysical−50002requests/−1200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.
-
 ## #348: perf(calls): reuse existing scalar argument cells for frame-free AST constructors (2026-10-11)
 
 Extract existing VM scalar-cell acquisition/retirement helpers without new pool/layout/allocator. AST fresh by-value sends reuse scalar cells; successful existing fresh promoted-float constructor bypass returns arguments to the same256cap pool. Shared canonical VM retirement uses same helper. Arena reserve/free and argument evaluation/coercion/order unchanged.
@@ -3053,3 +3049,6 @@ Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/ast-arg-pool-*.
+## #347 / PR349 review: withdraw widened declared slots (2026-10-11)
+
+P2 review correctly identifies 8→24 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31−3.6%/confirm−3.7%,long−1.6%/confirm−.6%,wholedefaultflat/long+2.8% andphysical−50002requests/−1200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.
