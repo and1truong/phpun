@@ -179,6 +179,8 @@ enum Op {
     BoolLoop {
         end: usize,
         executions: std::cell::Cell<u64>,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        native: std::cell::OnceCell<Option<native::Program>>,
     },
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
@@ -859,6 +861,8 @@ impl Compiler {
                 let region = self.emit(Op::BoolLoop {
                     end: 0,
                     executions: std::cell::Cell::new(0),
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    native: std::cell::OnceCell::new(),
                 });
                 for e in init {
                     self.expr(e)?;
@@ -2102,7 +2106,9 @@ impl<'a> Interp<'a> {
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
-                Op::BoolLoop { end, executions } => {
+                Op::BoolLoop {
+                    end, executions, ..
+                } => {
                     if *end > pc && vs.is_empty() {
                         if let Some(line) = self.vm_bool_loop(comp, slots, pc + 1, *end)? {
                             executions.set(executions.get().saturating_add(1));
@@ -3968,7 +3974,7 @@ function shared_region() {
  return json_encode([$a,$copy]);
 }
 function overflow_region() {
- $a=[true]; $v=PHP_INT_MAX;
+ $a=array_fill(0,1,true); $v=PHP_INT_MAX;
  for ($i=0; $i<1; $i++) { $a[$i]=false; $v++; }
  return json_encode([$a,is_float($v)]);
 }
@@ -3977,20 +3983,35 @@ function bounded_region() {
  for($i=0;$i<1;$i++) if($a[$i]) $count++;
  return $count;
 }
-echo typed_region(),"\n",shared_region(),"\n",overflow_region(),"\n",bounded_region(),"\n";
+function bounds_region() {
+ $a=array_fill(0,1,true);
+ for($i=0;$i<2;$i++) $a[$i]=false;
+ return json_encode($a);
+}
+function infinite_region() { $a=array_fill(0,1,true); for(;;) $a[0]=false; }
+echo typed_region(),"\n",shared_region(),"\n",overflow_region(),"\n",bounded_region(),"\n",bounds_region(),"\n";
 "#,
         );
         assert_eq!(result.exit_code, 0, "{}", regions.err_buf);
         assert_eq!(regions.err_buf, "");
         assert_eq!(
             regions.out,
-            b"5\n[[false,false,false,false],[true,true,true,true]]\n[[false],true]\n1\n"
+            b"5\n[[false,false,false,false],[true,true,true,true]]\n[[false],true]\n1\n[false,false]\n"
         );
         let decl = regions.functions["typed_region"].clone();
         let compiled = regions.vm_compiled(&decl).unwrap();
         assert!(compiled.ops.iter().any(|op| matches!(op,
             super::Op::BoolLoop { executions, .. } if executions.get() > 0)));
-        for name in ["shared_region", "overflow_region", "bounded_region"] {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        assert!(compiled.ops.iter().any(|op| matches!(op,
+            super::Op::BoolLoop { native, .. }
+                if native.get().and_then(Option::as_ref).is_some_and(|p| p.executions.get() > 0))));
+        for name in [
+            "shared_region",
+            "overflow_region",
+            "bounded_region",
+            "bounds_region",
+        ] {
             let decl = regions.functions[name].clone();
             let compiled = regions.vm_compiled(&decl).unwrap();
             assert!(
@@ -3999,6 +4020,42 @@ echo typed_region(),"\n",shared_region(),"\n",overflow_region(),"\n",bounded_reg
                 "{name}"
             );
         }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            for name in ["overflow_region", "bounds_region"] {
+                let decl = regions.functions[name].clone();
+                let compiled = regions.vm_compiled(&decl).unwrap();
+                assert!(compiled.ops.iter().any(|op| matches!(op,
+                    super::Op::BoolLoop { native, .. } if native.get().and_then(Option::as_ref).is_some())), "{name}");
+            }
+            let decl = regions.functions["infinite_region"].clone();
+            let compiled = regions.vm_compiled(&decl).unwrap();
+            let (marker, end) = compiled
+                .ops
+                .iter()
+                .enumerate()
+                .find_map(|(pc, op)| match op {
+                    super::Op::BoolLoop { end, .. } if *end > pc => Some((pc, *end)),
+                    _ => None,
+                })
+                .unwrap();
+            let program =
+                super::native::Program::region(&regions, &compiled, marker + 1, end).unwrap();
+            let mut raw = vec![[0i64; 2]; compiled.nslots];
+            let mut private = vec![true];
+            let mut line = 0;
+            assert!(!program.run_region(&mut raw, &mut private, &mut line));
+            assert_eq!(private, [false]);
+            drop(program);
+            drop(compiled);
+            assert!(regions.native_regions_bytes.get() > 0);
+            regions.compiled_fns.clear();
+            // The earlier typed_region handle deliberately still owns one map.
+            assert!(regions.native_regions_bytes.get() > 0);
+        }
+        drop(compiled);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        assert_eq!(regions.native_regions_bytes.get(), 0);
     }
 
     #[test]

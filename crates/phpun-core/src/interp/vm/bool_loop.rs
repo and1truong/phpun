@@ -193,7 +193,45 @@ impl Interp<'_> {
                 return Ok(None);
             }
         }
-        let result = (|| {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        let native_line = {
+            let Op::BoolLoop { native, .. } = &comp.ops[start - 1] else {
+                unreachable!()
+            };
+            let program =
+                native.get_or_init(|| super::native::Program::region(self, comp, start, end));
+            if let Some(program) = program {
+                // Explicit primitive ABI; never reinterpret a Value or Cell.
+                let mut raw: Vec<[i64; 2]> = locals
+                    .iter()
+                    .map(|v| match v {
+                        Some(Scalar::Int(v)) => [*v, 1],
+                        Some(Scalar::Bool(v)) => [i64::from(*v), 2],
+                        None => [0, 0],
+                    })
+                    .collect();
+                let mut line = self.cur_line;
+                if !program.run_region(&mut raw, &mut bools, &mut line) {
+                    // Native failure may have changed private buffers; discard
+                    // both and retry the original VM, never the modified copy.
+                    return Ok(None);
+                }
+                for (local, [value, kind]) in locals.iter_mut().zip(raw) {
+                    *local = match kind {
+                        0 => None,
+                        1 => Some(Scalar::Int(value)),
+                        2 if value == 0 || value == 1 => Some(Scalar::Bool(value != 0)),
+                        _ => return Ok(None),
+                    };
+                }
+                Some(line)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+        let native_line: Option<usize> = None;
+        let result = native_line.or_else(|| {
             let mut stack = Vec::with_capacity(16);
             let mut pc = start;
             let mut line = self.cur_line;
@@ -274,7 +312,7 @@ impl Interp<'_> {
                 pc += 1;
             }
             None
-        })();
+        });
         let Some(line) = result else {
             return Ok(None);
         };

@@ -915,6 +915,8 @@ pub struct Interp<'a> {
     /// auto-runs like `gc_collect_roots` on buffer overflow
     /// (gc/bug70805).
     gc_pending: usize,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    native_regions_bytes: Rc<std::cell::Cell<usize>>,
     /// Re-entrancy guard — a collect runs userland `__destruct`s whose
     /// own unsets/displaces must not nest a second collect (Zend's
     /// GC_GCOLLECTED flag).
@@ -1960,6 +1962,8 @@ impl<'a> Interp<'a> {
             handle_scan_drops: 0,
             arr_handles: Vec::new(),
             gc_pending: 0,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            native_regions_bytes: Rc::new(std::cell::Cell::new(0)),
             gc_collecting: false,
             gc_purpled: HashSet::new(),
             gc_dying: HashMap::new(),
