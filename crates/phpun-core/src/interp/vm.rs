@@ -4967,6 +4967,41 @@ unset($e); unset($h); var_dump($wh->get());
 
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
+        assert_eq!(
+            std::mem::size_of::<super::Value>(),
+            16,
+            "keep every VM value compact"
+        );
+        assert_eq!(
+            std::mem::size_of::<crate::value::PhpStr>(),
+            std::mem::size_of::<usize>()
+        );
+        let mut small = crate::value::PhpStr::from_slice(b"a\0b");
+        assert!(matches!(&*small.rc, crate::value::PhpBytes::Inline { .. }));
+        let alias = small.clone();
+        let weak = super::Rc::downgrade(&small.rc);
+        drop(small);
+        assert!(weak.upgrade().is_some());
+        small = alias;
+        small.append_unique(&[b'x'; 20]);
+        assert!(matches!(
+            &*small.rc,
+            crate::value::PhpBytes::Inline { len: 23, .. }
+        ));
+        assert!(
+            weak.upgrade().is_none(),
+            "unique append detaches weak byte identity"
+        );
+        small.append_unique(b"y");
+        assert!(matches!(&*small.rc, crate::value::PhpBytes::Heap(_)));
+        assert_eq!(&small[..3], b"a\0b");
+        assert_eq!(small.len(), 24);
+        assert_eq!(&small[23..], b"y");
+        assert!(crate::value::PhpStr::from_slice(b"").is_empty());
+        assert!(matches!(
+            &*crate::value::PhpStr::from_slice(&[0; 24]).rc,
+            crate::value::PhpBytes::Heap(_)
+        ));
         let mut stacked = Interp::new("stacked-scalar.php");
         let stmts = crate::parser::parse_source(
             r#"<?php $out=0;for($i=0;$i<4;$i++) {$out+=sqrt(sqrt(81));$text=substr(strtolower("ABCD"),1,2);}echo $out,":",$text;"#,

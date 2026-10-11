@@ -523,7 +523,7 @@ pub struct Interp<'a> {
     /// re-validating it (bug72685). Weak keys drop when the storage
     /// dies — a recycled pointer then fails upgrade() and re-validates,
     /// so nothing stays pinned and the map can't grow without bound.
-    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<Vec<u8>>>,
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<crate::value::PhpBytes>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
