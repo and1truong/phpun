@@ -1,0 +1,71 @@
+{
+  "source": "1b5cf6fd9cc28f5a16a63bbbcd83043bbb26774a",
+  "runtime": "aa31f3a475018aad739e75711780e884d55a8aa7",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 602,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/bug72685.phpt",
+      "before": "pass",
+      "after": "fail"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/bug72685.phpt",
+      "before": "pass",
+      "after": "fail"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1633144,
+        "bytes": 68354693
+      },
+      "after": {
+        "requests": 1633144,
+        "bytes": 68354681
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636039,
+        "bytes": 26703119
+      },
+      "after": {
+        "requests": 636039,
+        "bytes": 26703107
+      }
+    }
+  ],
+  "binary_sha256": "0f77b51b3a286ff740ca140ef557e988b72226f56d82d71bd5ece8c5985e4be3",
+  "scope": "Report-only: reject #309 live same-capacity Rc weak-probe removal. Restore existing mem_realloc guard by ordinary revert; retain actual candidate/native gates and negative timings.",
+  "fallbacks": "No production memory-accounting change retained. Growth/stale/huge/OOM/reference-lifetime paths remain parent runtime. Candidate ONE existing arena unit extension reverts too."
+}

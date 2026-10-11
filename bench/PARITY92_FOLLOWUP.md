@@ -2137,3 +2137,45 @@ Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/gc-scalar-properties-*.
+
+## #309: docs(perf): reject redundant weak-probe removal without target speed benefit (2026-10-11)
+
+Report-only: reject #309 live same-capacity Rc weak-probe removal. Restore existing mem_realloc guard by ordinary revert; retain actual candidate/native gates and negative timings.
+
+No production memory-accounting change retained. Growth/stale/huge/OOM/reference-lifetime paths remain parent runtime. Candidate ONE existing arena unit extension reverts too.
+
+Runtime aa31f3a475018aad739e75711780e884d55a8aa7; timing source 1b5cf6fd9cc28f5a16a63bbbcd83043bbb26774a; report/integration source 1b5cf6fd9cc28f5a16a63bbbcd83043bbb26774a.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 154.302 | 152.581 | 0.9888 |
+| bench/40-objects.php 20 5000 | 634.569 | 635.699 | 1.0018 |
+| bench/20-strings.php | 53.999 | 52.328 | 0.9691 |
+| bench/20-strings.php 100 | 247.866 | 238.328 | 0.9615 |
+| bench/11-sieve.php | 64.179 | 63.716 | 0.9928 |
+| bench/30-arrays.php | 76.978 | 83.803 | 1.0887 |
+| bench/60-json.php | 526.189 | 519.366 | 0.9870 |
+| bench/10-fib.php | 8.394 | 8.480 | 1.0103 |
+| bench/50-regex.php | 38.891 | 38.740 | 0.9961 |
+| bench/70-db.php | 107.713 | 112.159 | 1.0413 |
+| bench/app/cli.php 100 20 | 33.910 | 33.318 | 0.9826 |
+| examples/composer/run.php | 7.880 | 8.378 | 1.0632 |
+
+Seven pairs arrays +8.9%,long objects +0.2%,default objects −1.1%,JSON −1.3%,Composer +6.3%.31 arrays 76.080→76.058ms (flat),DB−2.1%,Composer+2.7%. No useful target win, reject. Full suite PCRE bug72685 pass→fail was its0.5s wall threshold under concurrent build; serialized parent/candidate BOTH PASS314ms. Raw failure retained; not hidden as full map parity.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1633144→1633144; bytes 68354693→68354681.
+- arrays: requests 636039→636039; bytes 26703119→26703107.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing arena unit extended for live/drop/sweep/same-capacity accounting during candidate verification; reverts with rejected guard. Serialized PCRE rechecks published.
+Full3406 raw map2729pass602fail retains PCRE bug72685 pass→fail wall-time threshold and range32crash→timeout. Serialized parent/candidate PCRE BOTH PASS314ms. Other individual statuses identical; no semantic repair/parity claim.
+Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 602, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/live-owner-realloc-*.
