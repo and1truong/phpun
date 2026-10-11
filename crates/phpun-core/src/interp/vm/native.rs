@@ -38,6 +38,11 @@ fn integer_type(ty: &Option<Vec<String>>) -> bool {
         .is_none_or(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("int"))
 }
 
+fn boolean_type(ty: &Option<Vec<String>>) -> bool {
+    ty.as_ref()
+        .is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("bool"))
+}
+
 fn eligible(d: &FunctionDecl, c: &Compiled) -> bool {
     !c.hybrid
         && !c.needs_bind
@@ -51,7 +56,8 @@ fn eligible(d: &FunctionDecl, c: &Compiled) -> bool {
         && c.nslots >= d.params.len()
         && c.nslots <= 256
         && c.ops.len() <= 1024
-        && integer_type(&d.ret)
+        && (integer_type(&d.ret)
+            || boolean_type(&d.ret) && !c.ops.iter().any(|op| matches!(op, Op::Call { .. })))
         && d.params.iter().all(|p| {
             !p.by_ref && !p.variadic && !p.promoted && p.default.is_none() && integer_type(&p.ty)
         })
@@ -95,7 +101,9 @@ impl Graph {
                         Some(_) => return None,
                         None => it.functions.get(lname.as_ref())?.clone(),
                     };
-                    if d.params.len() != *argc as usize
+                    // Bool results never enter an integer graph value stack.
+                    if !integer_type(&d.ret)
+                        || d.params.len() != *argc as usize
                         || !it
                             .functions
                             .get(lname.as_ref())
@@ -132,7 +140,7 @@ impl Graph {
 // The accepted value stack contains integers only. Comparisons may create a
 // bool only immediately before its consuming conditional branch. All joins,
 // including backward edges, must have one consistent stack depth.
-fn depths(c: &Compiled) -> Option<Vec<Option<usize>>> {
+fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
     let mut depths: Vec<Option<usize>> = vec![None; c.ops.len() + 1];
     depths[0] = Some(0);
     let mut work = vec![0];
@@ -172,14 +180,20 @@ fn depths(c: &Compiled) -> Option<Vec<Option<usize>>> {
             _ => return None,
         };
         let next = n.checked_sub(take)? + give;
+        if boolean && matches!(op, Op::Return) && !pc.checked_sub(1).is_some_and(|p| {
+            matches!(&c.ops[p], Op::Binary(op) | Op::BinaryCv(op, _) | Op::BinaryCvConst(op, _, _)
+                if matches!(*op, "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">="))
+        }) {
+            return None;
+        }
         match op {
             Op::Binary(op) | Op::BinaryCv(op, _) | Op::BinaryCvConst(op, _, _)
-                if !matches!(*op, "+" | "-" | "*" | "<=>")
+                if !matches!(*op, "+" | "-" | "*" | "%" | "<=>")
                     && !(matches!(*op, "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">=")
-                        && matches!(
+                        && (matches!(
                             c.ops.get(pc + 1),
                             Some(Op::JumpIfFalse(_) | Op::JumpIfTrue(_))
-                        )) =>
+                        ) || boolean && matches!(c.ops.get(pc + 1), Some(Op::Return)))) =>
             {
                 return None
             }
@@ -256,6 +270,19 @@ impl Emitter {
             "+" => self.emit(&[0x48, 0x01, 0xd0]),
             "-" => self.emit(&[0x48, 0x29, 0xd0]),
             "*" => self.emit(&[0x48, 0x0f, 0xaf, 0xc2]),
+            "%" => {
+                // Zero and MIN/-1 retain the canonical VM error/edge path.
+                // Refuse all -1 divisors rather than risking a hardware trap.
+                self.emit(&[0x48, 0x85, 0xd2]);
+                fail.push(self.branch(Some(0x84)));
+                self.emit(&[0x48, 0x83, 0xfa, 0xff]);
+                fail.push(self.branch(Some(0x84)));
+                // RCX=divisor, CQO sign-extends RAX into RDX:RAX, IDIV RCX.
+                self.emit(&[
+                    0x48, 0x89, 0xd1, 0x48, 0x99, 0x48, 0xf7, 0xf9, 0x48, 0x89, 0xd0,
+                ]);
+                return;
+            }
             "<=>" => {
                 // Signed integer comparison, including MIN/MAX; SETcc leaves
                 // flags intact until both booleans have been captured.
@@ -288,7 +315,7 @@ impl Emitter {
         c: &Compiled,
         targets: &[Option<usize>],
     ) -> Option<usize> {
-        let depths = depths(c)?;
+        let depths = depths(c, boolean_type(&d.ret))?;
         let start = self.bytes.len();
         let locals = i32::try_from(c.nslots * 16).ok()?;
         let max = depths.iter().flatten().copied().max().unwrap_or(0);
@@ -607,7 +634,11 @@ fn run(
     assert_eq!(top.used, used, "native arena span leak");
     if success == 1 {
         program.executions.set(program.executions.get() + 1);
-        Some(Value::Int(out))
+        Some(if boolean_type(&decl.ret) {
+            Value::Bool(out != 0)
+        } else {
+            Value::Int(out)
+        })
     } else {
         it.compiled_fns.get_mut(&(Rc::as_ptr(decl) as usize))?.3 = State::Disabled;
         None
