@@ -3454,7 +3454,8 @@ DivisionByZeroError:Division by zero
     #[test]
     fn borrowed_receiver_teardown_keeps_argument_and_exception_owners() {
         let mut it = Interp::new("receiver.php");
-        let result = it.run_source(r#"<?php
+        let result = it.run_source(
+            r#"<?php
 class TeardownItem { function __destruct() { echo "item\n"; } }
 class TeardownHost {
  public int $x = 4;
@@ -3472,11 +3473,18 @@ unset($i); var_dump($wi->get());
 try { invoke($h, 'bad'); } catch (TypeError $e) { echo get_class($e), "\n"; }
 echo $h->run(n: 3), "\n";
 unset($e); unset($h); var_dump($wh->get());
-"#);
+"#,
+        );
         assert_eq!(result.exit_code, 0, "{}", it.err_buf);
         assert_eq!(it.err_buf, "");
-        assert_eq!(it.out, b"6\nbool(true)\n4\nitem\nNULL\nTypeError\n7\nhost\nNULL\n");
-        assert!(it.vm_frame_pool.iter().all(|frame| frame.this_obj.is_none() && frame.vars.is_empty()));
+        assert_eq!(
+            it.out,
+            b"6\nbool(true)\n4\nitem\nNULL\nTypeError\n7\nhost\nNULL\n"
+        );
+        assert!(it
+            .vm_frame_pool
+            .iter()
+            .all(|frame| frame.this_obj.is_none() && frame.vars.is_empty()));
     }
 
     #[test]

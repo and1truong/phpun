@@ -3237,15 +3237,17 @@ impl<'a> Interp<'a> {
         // this pass cannot run a destructor. Aliases/object args keep the full
         // cell-counting path; do not assume every method receiver is borrowed.
         if let Some(receiver) = &f.this_obj {
-            let this_owner = f.vars.get("this").is_some_and(|c| {
-                matches!(&*c.borrow(), Value::Object(o) if Rc::ptr_eq(o, receiver))
-            });
+            let this_owner = f.vars.get("this").is_some_and(
+                |c| matches!(&*c.borrow(), Value::Object(o) if Rc::ptr_eq(o, receiver)),
+            );
             if Rc::strong_count(receiver) > 1 + usize::from(this_owner)
                 && f.vars.iter().all(|(name, c)| {
-                    (name == "this" && this_owner)
-                        || !matches!(&*c.borrow(), Value::Object(_))
+                    (name == "this" && this_owner) || !matches!(&*c.borrow(), Value::Object(_))
                 })
-                && !f.args.iter().any(|c| matches!(&*c.borrow(), Value::Object(_)))
+                && !f
+                    .args
+                    .iter()
+                    .any(|c| matches!(&*c.borrow(), Value::Object(_)))
                 && !f.value_args.iter().any(|v| matches!(v, Value::Object(_)))
             {
                 return Ok(());
