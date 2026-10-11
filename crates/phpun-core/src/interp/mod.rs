@@ -7660,6 +7660,32 @@ impl<'a> Interp<'a> {
         r
     }
 
+    /// Exact scalar kernels have no live frame; only OOM observation needs one.
+    fn scalar_builtin_oom(&mut self, name: &str, args: &[Value], visible: bool) {
+        let Some((line, _)) = &self.oom_at else {
+            return;
+        };
+        let line = *line;
+        let (file, site) = self.call_site(false, self.diag_file_shared(), self.cur_line);
+        self.call_trace.push(TraceFrame {
+            args_frame: None,
+            function: Rc::from(name),
+            class: None,
+            ty: String::new(),
+            file,
+            line: site,
+            args: args.iter().cloned().map(cell).collect(),
+            named_args: Vec::new(),
+            internal: true,
+            visible,
+            named_dispatch: false,
+            gen_resume: false,
+            gen_body: false,
+        });
+        self.oom_at = Some((line, self.fatal_frames()));
+        self.trace_pop();
+    }
+
     fn check_builtin_types(&mut self, name: &str, cells: &[Cell]) -> Result<(), PhpError> {
         if let Some(sig) = builtins::strict_sig_view(name) {
             let zf = matches!(
@@ -7872,6 +7898,7 @@ impl<'a> Interp<'a> {
                 *value = cell.borrow().clone();
             }
             if let Some(value) = builtins::call_scalar(self, name, &values[..args.cells.len()]) {
+                self.scalar_builtin_oom(name, &values[..args.cells.len()], visible);
                 return Ok(Some(value));
             }
         }

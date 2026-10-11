@@ -1418,7 +1418,12 @@ pub(in crate::builtins) fn replace_value(
     }
 }
 
-pub(in crate::builtins) fn substr_value(it: &mut Interp, s: &[u8], start: i64, len: Option<i64>) -> Value {
+pub(in crate::builtins) fn substr_value(
+    it: &mut Interp,
+    s: &[u8],
+    start: i64,
+    len: Option<i64>,
+) -> Value {
     let value = match php_substr(s, start, len) {
         Some(x) => Value::bytes(x),
         None => Value::Bool(false),

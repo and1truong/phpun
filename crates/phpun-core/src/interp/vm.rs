@@ -3791,6 +3791,7 @@ impl<'a> Interp<'a> {
                 let key = Rc::as_ptr(&top.tok) as usize;
                 top.used += span;
                 Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
+                self.scalar_builtin_oom(lname, argv, true);
                 return Some(value);
             }
         }
@@ -4975,6 +4976,7 @@ unset($e); unset($h); var_dump($wh->get());
             assert!(limits.mem_exceeded);
         }
         let mut it = Interp::new("arena.php");
+        it.mem_sweep();
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let scalar_charges = it.mem_tracked.len();
         let source = super::Value::str("abcd");
@@ -4990,11 +4992,19 @@ unset($e); unset($h); var_dump($wh->get());
                 )
                 .unwrap();
             assert!(matches!(value, super::Value::Str(ref s) if &s[..] == b"bc"));
-            let super::Value::Str(ref result) = value else { unreachable!() };
-            assert!(it.mem_tracked.contains_key(&(super::Rc::as_ptr(&result.rc) as usize)),
-                "substring result must be charged while still live");
-            assert_eq!(it.mem_tracked.len(), scalar_charges + 1,
-                "one result allocation, no temporary call site");
+            let super::Value::Str(ref result) = value else {
+                unreachable!()
+            };
+            assert!(
+                it.mem_tracked
+                    .contains_key(&(super::Rc::as_ptr(&result.rc) as usize)),
+                "substring result must be charged while still live"
+            );
+            assert_eq!(
+                it.mem_tracked.len(),
+                scalar_charges + 1,
+                "one result allocation, no temporary call site"
+            );
             drop(value);
             it.mem_sweep();
         }
@@ -5063,6 +5073,13 @@ unset($e); unset($h); var_dump($wh->get());
         assert_eq!(result.exit_code, 255, "{}", overlap.err_buf);
         let output = String::from_utf8_lossy(&overlap.out);
         assert_eq!(output.lines().next(), Some("1300000"));
-        assert!(output.contains("tried to allocate 1302528 bytes"), "{output}");
+        assert!(
+            output.contains("tried to allocate 1302528 bytes"),
+            "{output}"
+        );
+        assert!(
+            output.contains(": substr("),
+            "missing builtin OOM frame: {output}"
+        );
     }
 }
