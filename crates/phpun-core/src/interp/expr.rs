@@ -5218,11 +5218,11 @@ impl<'a> Interp<'a> {
             }
             cell(c.borrow().clone())
         };
-        let mut slots: Vec<Option<Cell>> = Vec::with_capacity(ob.slots.len());
+        let mut slots: Vec<Option<crate::value::ObjectSlot>> = Vec::with_capacity(ob.slots.len());
         for (si, s) in ob.slots.iter().enumerate() {
             slots.push(s.as_ref().map(|c| {
                 let key = ob.prop_order.get(si).cloned().unwrap_or_default();
-                copy_cell(&key, c, &mut shared)
+                crate::value::ObjectSlot::Cell(copy_cell(&key, &c.cell(), &mut shared))
             }));
         }
         for (k, c) in ob.live_props().into_iter() {

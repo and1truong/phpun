@@ -2606,14 +2606,61 @@ pub fn mem_last_alloc() -> i64 {
     LAST_ALLOC.load(std::sync::atomic::Ordering::Relaxed).max(0)
 }
 
+/// Declared float promotions stay inline until canonical cell access.
+/// ponytail: only proven fresh float promotions use this representation;
+/// measured scalar-slot work can extend it once owner/reference gates exist.
+#[derive(Debug, Clone)]
+pub enum ObjectSlot {
+    Cell(Cell),
+    Float {
+        value: f64,
+        cell: std::cell::OnceCell<Cell>,
+    },
+}
+
+impl ObjectSlot {
+    pub(crate) fn inline_float(value: f64) -> Self {
+        Self::Float {
+            value,
+            cell: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn cell(&self) -> Cell {
+        match self {
+            Self::Cell(c) => c.clone(),
+            Self::Float { value, cell } => cell
+                .get_or_init(|| {
+                    alloc_hit(9);
+                    Rc::new(RefCell::new(Value::Float(*value)))
+                })
+                .clone(),
+        }
+    }
+
+    pub(crate) fn existing_cell(&self) -> Option<Cell> {
+        match self {
+            Self::Cell(c) => Some(c.clone()),
+            Self::Float { cell, .. } => cell.get().cloned(),
+        }
+    }
+
+    pub(crate) fn read(&self) -> Value {
+        match self {
+            Self::Float { value, cell } if cell.get().is_none() => Value::Float(*value),
+            _ => self.cell().borrow().clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PhpObject {
     pub class: Rc<PhpClass>,
-    /// Declared-prop cells indexed by the class's `flat_props` order —
+    /// Declared properties indexed by the class's `flat_props` order —
     /// `None` = uninitialized (typed, no default) or `unset()`.
     /// Dynamic props live in `props`.
-    pub slots: Vec<Option<Cell>>,
-    /// Dynamic instance properties only — declared cells live in
+    pub slots: Vec<Option<ObjectSlot>>,
+    /// Dynamic instance properties only — declared values/cells live in
     /// `slots`. Use `prop_get`/`prop_insert`/… which route by key.
     pub props: HashMap<String, Cell>,
     /// Property order for var_dump/foreach output: declared keys in
@@ -2640,7 +2687,22 @@ impl PhpObject {
     /// Owning `Cell` clone (Rc bump); callers then borrow as usual.
     pub fn prop_get(&self, key: &str) -> Option<Cell> {
         match self.decl_slot(key) {
-            Some(i) => self.slots.get(i).and_then(|s| s.as_ref().cloned()),
+            Some(i) => self
+                .slots
+                .get(i)
+                .and_then(|s| s.as_ref().map(ObjectSlot::cell)),
+            None => self.props.get(key).cloned(),
+        }
+    }
+
+    /// GC omits only unmaterialized floats: no graph edge, cell alias or callback.
+    pub(crate) fn prop_gc_cell(&self, key: &str) -> Option<Cell> {
+        match self.decl_slot(key) {
+            Some(i) => self
+                .slots
+                .get(i)
+                .and_then(|s| s.as_ref())
+                .and_then(ObjectSlot::existing_cell),
             None => self.props.get(key).cloned(),
         }
     }
@@ -2662,7 +2724,7 @@ impl PhpObject {
                 if self.slots.len() <= i {
                     self.slots.resize_with(i + 1, || None);
                 }
-                self.slots[i].replace(c)
+                self.slots[i].replace(ObjectSlot::Cell(c)).map(|s| s.cell())
             }
             None => self.props.insert(key.to_string(), c),
         }
@@ -2671,7 +2733,11 @@ impl PhpObject {
     /// `unset()` a prop: drop its cell, keep the order tombstone.
     pub fn prop_take(&mut self, key: &str) -> Option<Cell> {
         match self.decl_slot(key) {
-            Some(i) => self.slots.get_mut(i).and_then(|s| s.take()),
+            Some(i) => self
+                .slots
+                .get_mut(i)
+                .and_then(|s| s.take())
+                .map(|s| s.cell()),
             None => self.props.remove(key),
         }
     }

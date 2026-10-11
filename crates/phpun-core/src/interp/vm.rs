@@ -2182,12 +2182,16 @@ impl<'a> Interp<'a> {
                                     && same_scope
                                     && same_resolution
                                 {
-                                    let c = match hit.slot {
-                                        Some(i) => ob.slots.get(i).and_then(|s| s.clone()),
-                                        None => ob.prop_get(&hit.key),
+                                    let value = match hit.slot {
+                                        Some(i) => ob
+                                            .slots
+                                            .get(i)
+                                            .and_then(|s| s.as_ref())
+                                            .map(|s| s.read()),
+                                        None => ob.prop_get(&hit.key).map(|c| c.borrow().clone()),
                                     };
-                                    if let Some(c) = c {
-                                        return Some(c.borrow().clone());
+                                    if value.is_some() {
+                                        return value;
                                     }
                                 }
                             }
@@ -3704,13 +3708,12 @@ impl<'a> Interp<'a> {
                     {
                         return None;
                     }
-                    let cell = match hit.slot {
-                        Some(i) => ob.slots.get(i).and_then(|s| s.clone()),
-                        None => ob.prop_get(&hit.key),
+                    let value = match hit.slot {
+                        Some(i) => ob.slots.get(i).and_then(|s| s.as_ref()).map(|s| s.read()),
+                        None => ob.prop_get(&hit.key).map(|c| c.borrow().clone()),
                     }?;
-                    let value = match &*cell.borrow() {
-                        Value::Float(v) => *v,
-                        _ => return None,
+                    let Value::Float(value) = value else {
+                        return None;
                     };
                     Some(value)
                 }
@@ -4779,6 +4782,52 @@ unset($a); var_dump($weak->get());
         fresh.vm_call_reserve(&mut args, 2);
         let before: Vec<_> = fresh.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let object = fresh.new_instance("FreshFloat", args).unwrap();
+        let super::Value::Object(inline) = &object else {
+            panic!("object")
+        };
+        assert!(inline
+            .borrow()
+            .slots
+            .iter()
+            .flatten()
+            .all(|s| s.existing_cell().is_none()));
+        assert!(fresh.gen_prop_sweep(inline).is_none());
+        let _ = fresh.gc_cycle_collect();
+        assert!(
+            inline
+                .borrow()
+                .slots
+                .iter()
+                .flatten()
+                .all(|s| s.existing_cell().is_none()),
+            "GC and generator scans must not box floats"
+        );
+        let index = inline.borrow().decl_slot("y").unwrap();
+        assert!(matches!(
+            inline.borrow().slots[index].as_ref().unwrap().read(),
+            super::Value::Float(4.0)
+        ));
+        let alias = inline.borrow().prop_get("y").unwrap();
+        let canonical = inline.borrow().prop_get("y").unwrap();
+        assert!(super::Rc::ptr_eq(&alias, &canonical));
+        *alias.borrow_mut() = super::Value::Float(8.0);
+        assert!(
+            matches!(
+                inline.borrow().slots[index].as_ref().unwrap().read(),
+                super::Value::Float(8.0)
+            ),
+            "direct read must use the canonical cell after alias mutation"
+        );
+        let super::Value::Object(copy) = fresh.clone_object(inline).unwrap() else {
+            panic!("clone")
+        };
+        let copied = copy.borrow().prop_get("y").unwrap();
+        assert!(!super::Rc::ptr_eq(&copied, &alias));
+        *copied.borrow_mut() = super::Value::Float(9.0);
+        assert!(matches!(*alias.borrow(), super::Value::Float(8.0)));
+        assert!(copy.borrow_mut().prop_take("y").is_some());
+        assert!(!copy.borrow().prop_has("y"));
+
         assert!(
             fresh.vm_frame_pool.is_empty(),
             "fresh float promotions bypass canonical frames"
