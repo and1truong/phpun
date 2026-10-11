@@ -1533,6 +1533,10 @@ impl<'a> Interp<'a> {
         // Reported as the engine's target PCRE2 level — feature checks
         // like symfony's `>= 10.39` gate on this, not the vendored lib.
         constants.insert("PCRE_VERSION".into(), Value::str("10.49 2026-09-28"));
+        constants.insert(
+            "PCRE_JIT_SUPPORT".into(),
+            Value::Bool(crate::pcre::jit_available()),
+        );
         constants.insert("INI_USER".into(), Value::Int(1));
         constants.insert("INI_PERDIR".into(), Value::Int(2));
         constants.insert("INI_SYSTEM".into(), Value::Int(4));

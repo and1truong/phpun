@@ -13,6 +13,13 @@ use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr;
 
+pub fn jit_available() -> bool {
+    let mut supported = 0u32;
+    unsafe {
+        pcre2_config_8(PCRE2_CONFIG_JIT, (&mut supported as *mut u32).cast()) == 0 && supported != 0
+    }
+}
+
 /// One match: group byte spans (`spans[0]` = whole match; `None` =
 /// unset group) plus the `(*MARK:...)` verb payload if one fired.
 pub struct PcreMatch {
@@ -309,11 +316,7 @@ pub fn compile(src: &[u8], options: u32, extra_options: u32, jit: bool) -> Resul
                 }
             }
         }
-        let mut supported = 0u32;
-        let jit_status = if jit
-            && pcre2_config_8(PCRE2_CONFIG_JIT, (&mut supported as *mut u32).cast()) == 0
-            && supported != 0
-        {
+        let jit_status = if jit && jit_available() {
             pcre2_jit_compile_8(code, PCRE2_JIT_COMPLETE)
         } else {
             0
