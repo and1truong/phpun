@@ -775,7 +775,7 @@ impl<'a> Interp<'a> {
                 }
                 None => {
                     // static-call frame like dt_malformed's ->
-                    self.call_trace.push(TraceFrame {
+                    self.trace_push(TraceFrame {
                         args_frame: None,
                         file: self.diag_file_shared(),
                         line: self.send_line.unwrap_or(self.cur_line) as u32,

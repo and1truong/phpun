@@ -32,7 +32,7 @@ impl<'a> Interp<'a> {
         // Internal calls still get a backtrace frame — zend renders
         // `ArrayObject->unserialize('O:11:"ArrayObje...')` in uncaught
         // traces (arg repr truncates at 15 chars via trace_arg).
-        self.call_trace.push(TraceFrame {
+        self.trace_push(TraceFrame {
             args_frame: None,
             file: self.diag_file_shared(),
             line: self.send_line.unwrap_or(self.cur_line) as u32,
@@ -719,7 +719,7 @@ impl<'a> Interp<'a> {
                 } else {
                     vec![cell(Value::Array(arr.clone())), cell(Value::Int(flag))]
                 };
-                self.call_trace.push(crate::value::TraceFrame {
+                self.trace_push(crate::value::TraceFrame {
                     args_frame: None,
                     function: lname.clone().into(),
                     class: None,
@@ -789,7 +789,7 @@ impl<'a> Interp<'a> {
                 }
                 Self::ao_set_sorting(obj, true);
                 let src = arr.borrow().entries.clone();
-                self.call_trace.push(crate::value::TraceFrame {
+                self.trace_push(crate::value::TraceFrame {
                     args_frame: None,
                     function: lname.clone().into(),
                     class: None,
@@ -2430,7 +2430,7 @@ impl<'a> Interp<'a> {
             if stub {
                 // Native Reflection calls leave a `Cls->m()` frame in
                 // uncaught traces (named_params/attributes_named_flags).
-                self.call_trace.push(TraceFrame {
+                self.trace_push(TraceFrame {
                     args_frame: None,
                     file: self.diag_file_shared(),
                     line: self.send_line.unwrap_or(self.cur_line) as u32,
@@ -2643,7 +2643,7 @@ impl<'a> Interp<'a> {
                     .map(|(p, m)| (*p, m.clone()))
                     .unwrap_or((0, "Unexpected data found.".into()));
                 let first = s[pos as usize..].chars().next().unwrap_or(' ');
-                it.call_trace.push(TraceFrame {
+                it.trace_push(TraceFrame {
                     args_frame: None,
                     file: it.diag_file_shared(),
                     line: it.send_line.unwrap_or(it.cur_line) as u32,
@@ -3130,7 +3130,7 @@ impl<'a> Interp<'a> {
                     return Ok(Value::Null);
                 }
                 None => {
-                    self.call_trace.push(TraceFrame {
+                    self.trace_push(TraceFrame {
                         args_frame: None,
                         file: self.diag_file_shared(),
                         line: self.send_line.unwrap_or(self.cur_line) as u32,
@@ -3275,7 +3275,7 @@ impl<'a> Interp<'a> {
         // `#0 file(L): Exception->__construct('a','b',...)` for a ZPP
         // arity error. Pop it again only when the bind succeeds; the
         // bind's errors snapshot call_trace inside fail().
-        self.call_trace.push(TraceFrame {
+        self.trace_push(TraceFrame {
             args_frame: None,
             file: self.diag_file_shared(),
             line: self.send_line.unwrap_or(self.cur_line) as u32,
@@ -3526,7 +3526,7 @@ impl<'a> Interp<'a> {
         // frame's arg list rather than `name: val` pairs.
         let mut fargs = args.cells.clone();
         fargs.extend(args.named.iter().map(|(_, c, ..)| c.clone()));
-        self.call_trace.push(TraceFrame {
+        self.trace_push(TraceFrame {
             args_frame: None,
             file: self.diag_file_shared(),
             line: self.cur_line as u32,

@@ -1160,7 +1160,7 @@ impl<'a> Interp<'a> {
         });
         let userland = self.iter_calls == 0 && self.gen_internal_resume == 0 && !caller_is_spl_stub;
         if userland {
-            self.call_trace.push(TraceFrame {
+            self.trace_push(TraceFrame {
                 args_frame: None,
                 function: name.to_string().into(),
                 class: Some("Generator".into()),
