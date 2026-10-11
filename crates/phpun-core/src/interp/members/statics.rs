@@ -673,7 +673,7 @@ impl<'a> Interp<'a> {
                         class: oc,
                         slots: Vec::new(),
                         props,
-                        prop_order: order,
+                        prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
                         unset_props: std::collections::HashSet::new(),
@@ -736,7 +736,7 @@ impl<'a> Interp<'a> {
                         class: oc,
                         slots: Vec::new(),
                         props,
-                        prop_order: order,
+                        prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
                         unset_props: std::collections::HashSet::new(),
@@ -767,7 +767,7 @@ impl<'a> Interp<'a> {
                     if let Value::Object(o) = &v {
                         let mut ob = o.borrow_mut();
                         ob.props.retain(|k, _| k.starts_with("\0di\0"));
-                        ob.prop_order = vec!["from_string".into(), "date_string".into()];
+                        ob.prop_order = Rc::new(vec!["from_string".into(), "date_string".into()]);
                         ob.prop_insert("from_string", cell(Value::Bool(true)));
                         ob.prop_insert("date_string", cell(Value::str(&spec)));
                     }

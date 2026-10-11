@@ -13,11 +13,34 @@ use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr;
 
+pub fn jit_available() -> bool {
+    let mut supported = 0u32;
+    unsafe {
+        pcre2_config_8(PCRE2_CONFIG_JIT, (&mut supported as *mut u32).cast()) == 0 && supported != 0
+    }
+}
+
 /// One match: group byte spans (`spans[0]` = whole match; `None` =
 /// unset group) plus the `(*MARK:...)` verb payload if one fired.
 pub struct PcreMatch {
     pub spans: Vec<Option<(usize, usize)>>,
     pub mark: Option<String>,
+}
+
+/// Interpreter-owned native JIT stack; match contexts borrow it per invocation.
+pub struct JitStack(*mut pcre2_jit_stack_8);
+
+impl JitStack {
+    pub fn new() -> Option<Self> {
+        let stack = unsafe { pcre2_jit_stack_create_8(32 * 1024, 192 * 1024, ptr::null_mut()) };
+        (!stack.is_null()).then_some(Self(stack))
+    }
+}
+
+impl Drop for JitStack {
+    fn drop(&mut self) {
+        unsafe { pcre2_jit_stack_free_8(self.0) }
+    }
 }
 
 pub struct PcreRe {
@@ -26,6 +49,8 @@ pub struct PcreRe {
     names: Vec<Option<String>>,
     /// compiled with PCRE2_UTF — matches must stay on char boundaries
     pub utf8: bool,
+    pub jit_status: i32,
+    pub jit: bool,
 }
 
 impl Drop for PcreRe {
@@ -35,6 +60,17 @@ impl Drop for PcreRe {
 }
 
 impl PcreRe {
+    pub fn jit_error(&self) -> String {
+        let mut buf = [0u8; 256];
+        let len =
+            unsafe { pcre2_get_error_message_8(self.jit_status, buf.as_mut_ptr(), buf.len()) };
+        if len > 0 {
+            String::from_utf8_lossy(&buf[..len as usize]).into_owned()
+        } else {
+            format!("error {}", self.jit_status)
+        }
+    }
+
     pub fn captures_len(&self) -> usize {
         self.names.len()
     }
@@ -60,9 +96,10 @@ impl PcreRe {
         start_offset: usize,
         global: bool,
         first_opts: u32,
-        match_limit: u32,
-        depth_limit: u32,
+        limits: (u32, u32),
+        jit_stack: Option<&JitStack>,
     ) -> (Vec<PcreMatch>, i32) {
+        let (match_limit, depth_limit) = limits;
         unsafe {
             let md = pcre2_match_data_create_from_pattern_8(self.code, ptr::null_mut());
             if md.is_null() {
@@ -72,6 +109,9 @@ impl PcreRe {
             if !mctx.is_null() {
                 pcre2_set_match_limit_8(mctx, match_limit);
                 pcre2_set_depth_limit_8(mctx, depth_limit);
+                if let Some(stack) = jit_stack {
+                    pcre2_jit_stack_assign_8(mctx, None, stack.0.cast());
+                }
             }
             let ovc = pcre2_get_ovector_count_8(md) as usize;
             let mut out = Vec::new();
@@ -199,7 +239,7 @@ impl PcreRe {
 /// Compile a PCRE2 pattern (without delimiters — options already
 /// inlined as `(?imsx)` or passed in `options` by the caller).
 /// Err is the engine's message plus the byte offset, PHP style.
-pub fn compile(src: &[u8], options: u32, extra_options: u32) -> Result<PcreRe, String> {
+pub fn compile(src: &[u8], options: u32, extra_options: u32, jit: bool) -> Result<PcreRe, String> {
     unsafe {
         let mut errcode: std::os::raw::c_int = 0;
         let mut erroff: usize = 0;
@@ -276,10 +316,23 @@ pub fn compile(src: &[u8], options: u32, extra_options: u32) -> Result<PcreRe, S
                 }
             }
         }
+        let jit_status = if jit && jit_available() {
+            pcre2_jit_compile_8(code, PCRE2_JIT_COMPLETE)
+        } else {
+            0
+        };
+        let mut jit_size = 0usize;
+        pcre2_pattern_info_8(
+            code,
+            PCRE2_INFO_JITSIZE,
+            (&mut jit_size as *mut usize).cast(),
+        );
         Ok(PcreRe {
             code,
             names,
             utf8: options & PCRE2_UTF != 0,
+            jit_status,
+            jit: jit_size != 0,
         })
     }
 }

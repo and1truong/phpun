@@ -1,0 +1,12 @@
+[
+  {
+    "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+    "before": "pass",
+    "after": "timeout"
+  },
+  {
+    "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+    "before": "fail",
+    "after": "timeout"
+  }
+]

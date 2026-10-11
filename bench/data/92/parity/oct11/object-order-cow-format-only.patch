@@ -1,0 +1,48 @@
+diff --git a/crates/phpun-core/src/interp/classes.rs b/crates/phpun-core/src/interp/classes.rs
+index 4086d7c..5af5979 100644
+--- a/crates/phpun-core/src/interp/classes.rs
++++ b/crates/phpun-core/src/interp/classes.rs
+@@ -3930,9 +3930,10 @@ impl<'a> Interp<'a> {
+         // are class-fixed, computed once in flat_props_of.
+         let flat = self.flat_props_of(&cls);
+         let mut slots: Vec<Option<Cell>> = vec![None; flat.len()];
+-        let prop_order = cls.prop_order_template.get_or_init(|| {
+-            Rc::new(flat.iter().map(|fp| fp.key.clone()).collect())
+-        }).clone();
++        let prop_order = cls
++            .prop_order_template
++            .get_or_init(|| Rc::new(flat.iter().map(|fp| fp.key.clone()).collect()))
++            .clone();
+         for (fi, fp) in flat.iter().enumerate() {
+             if fp.uninit {
+                 continue;
+diff --git a/crates/phpun-core/src/interp/vm.rs b/crates/phpun-core/src/interp/vm.rs
+index 0382fcb..78ca6b2 100644
+--- a/crates/phpun-core/src/interp/vm.rs
++++ b/crates/phpun-core/src/interp/vm.rs
+@@ -4580,14 +4580,22 @@ unset($a); var_dump($weak->get());
+             panic!("object")
+         };
+         let super::Value::Object(other) = constructors.instantiate("valuector", &[]).unwrap()
+-        else { panic!("object"); };
+-        assert!(super::Rc::ptr_eq(&object.borrow().prop_order, &other.borrow().prop_order));
++        else {
++            panic!("object");
++        };
++        assert!(super::Rc::ptr_eq(
++            &object.borrow().prop_order,
++            &other.borrow().prop_order
++        ));
+         {
+             let mut first = object.borrow_mut();
+             super::Rc::make_mut(&mut first.prop_order).push("extra".into());
+             first.prop_insert("extra", super::cell(super::Value::Int(1)));
+         }
+-        assert!(!super::Rc::ptr_eq(&object.borrow().prop_order, &other.borrow().prop_order));
++        assert!(!super::Rc::ptr_eq(
++            &object.borrow().prop_order,
++            &other.borrow().prop_order
++        ));
+         assert!(object.borrow().prop_has("extra"));
+         assert!(!other.borrow().prop_order.iter().any(|key| key == "extra"));
+         assert!(!other.borrow().prop_has("extra"));

@@ -1,0 +1,99 @@
+{
+  "source": "3911b6c6160fd6f195461fb25ee606a6c43be54f",
+  "runtime": "3911b6c6160fd6f195461fb25ee606a6c43be54f",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 8,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "bool-native",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8951
+      }
+    },
+    {
+      "binary": "weak-owner",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 9348
+      }
+    }
+  ],
+  "physical_allocations": [
+    {
+      "label": "strings100",
+      "before": {
+        "requests": 2902886,
+        "bytes": 120172689
+      },
+      "after": {
+        "requests": 2098281,
+        "bytes": 113735845
+      }
+    },
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 983133,
+        "bytes": 55269712
+      },
+      "after": {
+        "requests": 933120,
+        "bytes": 54869604
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636053,
+        "bytes": 26701030
+      },
+      "after": {
+        "requests": 616040,
+        "bytes": 26540922
+      }
+    },
+    {
+      "label": "json",
+      "before": {
+        "requests": 4360116,
+        "bytes": 296858212
+      },
+      "after": {
+        "requests": 4344960,
+        "bytes": 296736960
+      }
+    }
+  ],
+  "binary_sha256": "1042bda18d5128c871a82e748e88be9008380d8ccc004c940bc1e8478a11fc9e",
+  "scope": "The shared MemCharge ledger retains std Weak<dynAny> directly instead of boxing a closure that only checksstrong_count()>0. Four constructors and all readers use the same shared helper/type. Sized trackedowners retain exact weak controlblock identity,no extra strong handle/rawpointer/unsafe/layout assumptions. PCRE onlyunsizedowner was anemptydummy scratch token,now Rcunit with identical explicitbyte/grow/retire accounting;credit/retire APIs retainunsized support.",
+  "fallbacks": "ONE existing frame/owner check proves live/alias/deadcounts,typeerasure,realloc/credit/sweep/retirement and no new strong owner. All recycledaddress/chunk/huge/VMspan/limit paths preserve their existing logic. No dependency/new allocator/new bookkeeping abstraction.",
+  "whole_suite": "weak-owner-whole.json"
+}

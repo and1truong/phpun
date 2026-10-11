@@ -1,0 +1,26 @@
+{
+  "binary_sha256": "dd26c597ba3086ee0ede9590ececde1d4eef6226e072f88b26bfbb581cccabc2",
+  "source": "0f1245b2e5be7206fe38077c121b80e32d96e82a",
+  "parent": "ast-arg-pool",
+  "summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 600,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 5,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "timeout",
+      "after": "fail"
+    }
+  ]
+}

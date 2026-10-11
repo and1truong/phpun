@@ -165,7 +165,7 @@ pub(crate) fn dispatch(
             match php_substr(&s, start, len) {
                 Some(mut x) => {
                     while !x.is_empty() && !utf8_boundary(&s, start.max(0) as usize + x.len()) {
-                        x.pop();
+                        x = &x[..x.len() - 1];
                     }
                     Value::bytes(x)
                 }
@@ -311,7 +311,7 @@ pub(crate) fn dispatch(
             let subj = arg_bs(it, args, 1);
             // mb_* regexes are delimiter-free oniguruma patterns — the
             // whole argument is the body; empty = match-everywhere.
-            let re = match crate::pcre::compile(&pat, 0, 0).map(PhpRe::Pcre) {
+            let re = match crate::pcre::compile(&pat, 0, 0, false).map(PhpRe::Pcre) {
                 Ok(r) => r,
                 Err(e) => {
                     it.warn_pub(&format!("mb_split(): {}", e))?;

@@ -1,0 +1,31 @@
+{
+  "binary_sha256": "73787429d9801f2c31b923b9d0b2db0bea548e93cb7934893a5979aa14641e83",
+  "source": "3049d578badebd67347eac16d69b6dd0921f29c7",
+  "parent": "surviving-object-dtor",
+  "summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ]
+}

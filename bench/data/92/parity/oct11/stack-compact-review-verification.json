@@ -1,0 +1,26 @@
+{
+  "binary_sha256": "eca4dd2a9c2e496976741fe8f42cd9ac75f74ae32c73311a543b4d0af4f9d7cc",
+  "source": "7e87997aa1ea80c04c8457111d302aaed0e55adf",
+  "parent": "substr-result-charge",
+  "summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ]
+}

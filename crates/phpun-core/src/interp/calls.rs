@@ -862,11 +862,11 @@ impl<'a> Interp<'a> {
             } else {
                 let v = self.eval(expr)?;
                 if let Some(n) = name {
-                    out.named.push((n, cell(v), false, false));
+                    out.named.push((n, self.vm_scalar_arg(v), false, false));
                     seen_named = true;
                 } else {
                     crate::interp::util::alloc_hit(6);
-                    out.cells.push(cell(v));
+                    out.cells.push(self.vm_scalar_arg(v));
                     pos += 1;
                 }
             }
@@ -1602,6 +1602,7 @@ impl<'a> Interp<'a> {
                     parent_rc: RefCell::new(None),
                     throwable: std::cell::Cell::new(None),
                     flat_props: std::cell::OnceCell::new(),
+                    prop_order_template: std::cell::OnceCell::new(),
                     prop_slot: std::cell::OnceCell::new(),
                     method_ic: std::cell::RefCell::new(None),
                     short_name: std::cell::OnceCell::new(),

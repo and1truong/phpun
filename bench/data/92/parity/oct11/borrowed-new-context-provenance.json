@@ -1,0 +1,49 @@
+{
+  "source": "20dd88c42fefcd6fd47b18f2683156c6e86726f9",
+  "runtime": "09aad1a0302bd16ad65a0a8fde147604007856ef",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 858127,
+        "bytes": 49974098
+      },
+      "after": {
+        "requests": 808127,
+        "bytes": 49724078
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26545126
+      },
+      "after": {
+        "requests": 616041,
+        "bytes": 26545106
+      }
+    }
+  ],
+  "binary_sha256": "2303232de9c7cea8f63e5a8f9a4a8a74766d44ea5e02b8d1f743e4f82bfe85e6",
+  "scope": "AST new already pins resolved constructor/class metadata through argument evaluation. Borrow the declaring class name and its existing null-truncated prefix instead of making two Strings. Use standard Cow for anonymous contexts; ordinary diagnostic context still formats once. No new cache, storage, dependency, unsafe or binder change.",
+  "fallbacks": "Keep exact original canonical spelling, declaring owner for inherited constructors, anonymous truncation, argument evaluation order and all reference/error/trace handling. ONE existing receiver/constructor test includes inherited and anonymous by-reference Error diagnostics. Parent constructor/substring prototypes are already reverted."
+}

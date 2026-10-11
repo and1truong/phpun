@@ -1190,14 +1190,14 @@ impl<'a> Interp<'a> {
                 // only for the not-found/unresolved edge.
                 let owner = found
                     .as_ref()
-                    .map(|(_, o)| o.decl.name.clone())
-                    .or_else(|| cls.as_ref().map(|c| c.decl.name.clone()))
-                    .unwrap_or_else(|| name.clone());
-                let base = owner.split('\0').next().unwrap_or(&owner).to_string();
+                    .map(|(_, o)| o.decl.name.as_str())
+                    .or_else(|| cls.as_ref().map(|c| c.decl.name.as_str()))
+                    .unwrap_or(&name);
+                let base = owner.split('\0').next().unwrap_or(owner);
                 let ctx = if base.contains("@anonymous") {
-                    base
+                    std::borrow::Cow::Borrowed(base)
                 } else {
-                    format!("{base}::__construct")
+                    std::borrow::Cow::Owned(format!("{base}::__construct"))
                 };
                 let argvals = s.arg_cells(
                     args,
@@ -4328,7 +4328,7 @@ impl<'a> Interp<'a> {
                             .unwrap_or_else(|| pn.clone());
                         let mut ob = o.borrow_mut();
                         if !ob.prop_order.contains(&key) {
-                            ob.prop_order.push(key.clone());
+                            Rc::make_mut(&mut ob.prop_order).push(key.clone());
                         }
 
                         let old = ob.prop_insert(key.clone(), src.clone());
@@ -5517,7 +5517,7 @@ impl<'a> Interp<'a> {
                             return Ok(v);
                         }
                         if !ob.prop_order.contains(&k) {
-                            ob.prop_order.push(k.clone());
+                            Rc::make_mut(&mut ob.prop_order).push(k.clone());
                         }
                         ob.prop_insert(k, cell(v.clone()));
                         drop(ob);
@@ -5581,7 +5581,7 @@ impl<'a> Interp<'a> {
                     let mut ob = o.borrow_mut();
                     let pn = pn.to_string();
                     if !ob.prop_order.contains(&pn) {
-                        ob.prop_order.push(pn.clone());
+                        Rc::make_mut(&mut ob.prop_order).push(pn.clone());
                     }
                     ob.prop_insert(pn, cell(v.clone()));
                     drop(ob);
@@ -6278,6 +6278,39 @@ impl<'a> Interp<'a> {
                     c = self.index_cell_object(&c, k.clone())?;
                 }
                 continue;
+            }
+            // Root-variable append after all existing container/detach gates.
+            // Scalar tables cannot run a PHP callback during CoW or the store.
+            if k.is_none()
+                && matches!(
+                    &v,
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+                )
+                && n == 0
+                && last == 0
+                && rhs_late.is_none()
+                && !compound
+                && !self.detached_dim
+                && !self.in_handler
+                && self.dim_throw.is_none()
+                && !self.is_ref_cell(&c)
+                && det.is_some_and(|d| !Self::is_superglobal(&d.name))
+                && matches!(&*c.borrow(), Value::Array(a) if a.borrow().packed
+                    && (a.borrow().entries.is_scalar_packed() || a.borrow().entries.is_empty()))
+            {
+                let mut b = c.borrow_mut();
+                self.cow_split(&mut b);
+                if let Value::Array(a) = &*b {
+                    let rc = a.clone();
+                    drop(b);
+                    let mut array = rc.borrow_mut();
+                    if array.push_packed_scalar(&v) {
+                        let req = Self::ht_req(array.entries.len(), array.packed);
+                        drop(array);
+                        self.mem_realloc(&rc, req);
+                        return Ok(v);
+                    }
+                }
             }
             // An existing packed scalar has no exported Cell or typed-slot
             // owner. Keep the validated final write inline; deferred RHS,
@@ -9360,7 +9393,7 @@ impl<'a> Interp<'a> {
                             self.warn(&format!("Undefined property: {}::${}", cn, pn))?;
                             let mut ob = o.borrow_mut();
                             if !ob.prop_order.contains(&pn) {
-                                ob.prop_order.push(pn.clone());
+                                Rc::make_mut(&mut ob.prop_order).push(pn.clone());
                             }
                             ob.props
                                 .entry(pn.clone())
@@ -10613,7 +10646,7 @@ impl<'a> Interp<'a> {
                     }
                     let ob = o.borrow();
                     let cls = ob.class.clone();
-                    for n in &ob.prop_order {
+                    for n in ob.prop_order.iter() {
                         if let Some(c) = ob.prop_get(n) {
                             // Int-keyed buckets decode to int keys like
                             // zend's property-HT int slots.
@@ -10675,7 +10708,7 @@ impl<'a> Interp<'a> {
                         class: cls,
                         slots: Vec::new(),
                         props,
-                        prop_order: order,
+                        prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
                         unset_props: std::collections::HashSet::new(),

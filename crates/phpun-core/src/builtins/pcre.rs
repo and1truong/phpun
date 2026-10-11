@@ -101,7 +101,7 @@ fn apply_cb_pattern(
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0usize;
     let mut n = 0i64;
-    let mut scratch: (Option<Rc<[u8]>>, usize) = (None, 0);
+    let mut scratch: (Option<Rc<()>>, usize) = (None, 0);
     let (caps, rc) = re.caps(cur, 0, true, None, it);
     if rc != 0 {
         it.last_preg_error = preg_rc_err(rc);
@@ -208,13 +208,13 @@ fn apply_cb_pattern(
 /// figure than the final result. `scratch` is (dummy Rc, sim alloc).
 fn preg_scratch_grow(
     it: &mut Interp,
-    scratch: &mut (Option<Rc<[u8]>>, usize),
+    scratch: &mut (Option<Rc<()>>, usize),
     new_len: usize,
 ) -> Result<(), PhpError> {
     if new_len >= scratch.1 {
         scratch.1 = 2 * new_len;
         let req = scratch.1 as u64 + 25;
-        let fresh: Rc<[u8]> = Rc::from(&b""[..]);
+        let fresh = Rc::new(());
         match &scratch.0 {
             // erealloc — old run stays held until the grow commits.
             Some(old) => it.mem_grow_str(old, &fresh, req),
@@ -236,11 +236,11 @@ fn preg_scratch_grow(
 /// the dummy so it isn't counted twice.
 fn preg_scratch_done(
     it: &mut Interp,
-    scratch: (Option<Rc<[u8]>>, usize),
+    scratch: (Option<Rc<()>>, usize),
     final_len: usize,
 ) -> Result<(), PhpError> {
     if let Some(old) = scratch.0 {
-        let prod: Rc<[u8]> = Rc::from(&b""[..]);
+        let prod = Rc::new(());
         it.mem_grow_str(&old, &prod, final_len as u64 + 25);
         if it.mem_tripped() {
             it.mem_exceeded = true;
@@ -342,7 +342,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 Value::Str(s) => Some(s),
                 _ => None,
             };
-            let re = match php_regex(&pat) {
+            let re = match php_regex(it, &pat, name)? {
                 Ok(r) => r,
                 Err(e) => {
                     regex_err(it, name, &e)?;
@@ -721,7 +721,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         );
                     }
                     let p = pat_elem_str(it, &cell(pv.clone()))?;
-                    let re = match php_regex(&p) {
+                    let re = match php_regex(it, &p, name)? {
                         Ok(r) => r,
                         Err(e) => {
                             regex_err(it, name, &e)?;
@@ -833,7 +833,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             break;
                         }
                     };
-                    let re = match php_regex(&p) {
+                    let re = match php_regex(it, &p, name)? {
                         Ok(r) => r,
                         Err(e) => {
                             // Compile failure = NULL result for this
@@ -879,7 +879,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         // mid-chain on a smaller scratch figure, not the
                         // final result. Simulate the chain so the trip
                         // site and 'tried to allocate' figure match.
-                        let mut scratch: (Option<Rc<[u8]>>, usize) = (None, 0);
+                        let mut scratch: (Option<Rc<()>>, usize) = (None, 0);
                         let (caps, rc) = re.caps(&src, 0, true, None, it);
                         if rc != 0 {
                             it.last_preg_error = preg_rc_err(rc);
@@ -1007,7 +1007,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             let subj = arg_bs(it, args, 1);
             let flags = arg(args, 3).to_int();
             let limit = arg(args, 2).to_int();
-            let re = match php_regex(&pat) {
+            let re = match php_regex(it, &pat, name)? {
                 Ok(r) => r,
                 Err(e) => {
                     regex_err(it, name, &e)?;
@@ -1074,7 +1074,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
         "preg_grep" => {
             let pat = preg_pattern_str(it, name, args)?;
             let flags = arg(args, 2).to_int();
-            let re = match php_regex(&pat) {
+            let re = match php_regex(it, &pat, name)? {
                 Ok(r) => r,
                 Err(e) => {
                     regex_err(it, name, &e)?;
@@ -1135,7 +1135,44 @@ pub(in crate::builtins) struct PhpCap {
 /// Translate a PHP `/pat/flags` regex to a `PhpRe`. Err is the full
 /// warning text PHP emits (`Compilation failed: ...`, `Unknown
 /// modifier 'x'`, delimiter problems) — callers prefix `fname(): `.
-pub(in crate::builtins) fn php_regex(pat: &[u8]) -> Result<PhpRe, String> {
+pub(in crate::builtins) fn php_regex(
+    it: &mut Interp,
+    pat: &[u8],
+    name: &str,
+) -> Result<Result<Rc<PhpRe>, String>, PhpError> {
+    if let Some(re) = it.pcre_patterns.get(pat) {
+        return Ok(Ok(re.clone()));
+    }
+    let jit = !it.ini.contains_key("pcre.jit") || it.ini_on("pcre.jit");
+    let re = match compile_regex(pat, jit) {
+        Ok(re) => Rc::new(re),
+        Err(err) => return Ok(Err(err)),
+    };
+    let PhpRe::Pcre(native) = &*re;
+    if native.jit_status == pcre2_sys::PCRE2_ERROR_NOMEMORY {
+        it.ini.insert("pcre.jit".into(), "0".into());
+        it.warn_pub(&format!("{name}(): Allocation of JIT memory failed, PCRE JIT will be disabled. This is likely caused by security restrictions. Either grant PHP permission to allocate executable memory, or set pcre.jit=0"))?;
+    } else if native.jit_status < 0 {
+        it.warn_pub(&format!(
+            "{name}(): JIT compilation failed: {}",
+            native.jit_error()
+        ))?;
+    }
+    // ponytail:PHP's 4096-pattern ceiling, clear on overflow; use byte-budgeted
+    // LRU if real working sets exceed it. Keys >64KiB stay uncached.
+    // The 256 prototype thrashed and re-JITed ordinary 300-pattern sets.
+    // Match contexts/limits stay per invocation, including callback reentry.
+    if pat.len() > 64 * 1024 {
+        return Ok(Ok(re));
+    }
+    if it.pcre_patterns.len() == 4096 {
+        it.pcre_patterns.clear();
+    }
+    it.pcre_patterns.insert(pat.to_vec(), re.clone());
+    Ok(Ok(re))
+}
+
+fn compile_regex(pat: &[u8], jit: bool) -> Result<PhpRe, String> {
     // PHP skips leading whitespace before the delimiter; a pattern of
     // only whitespace is the same "Empty regular expression" error.
     let ws = pat.iter().take_while(|c| c.is_ascii_whitespace()).count();
@@ -1252,13 +1289,13 @@ pub(in crate::builtins) fn php_regex(pat: &[u8]) -> Result<PhpRe, String> {
         }
     }
     let _ = (need_pcre, has_backref, pcre_only);
-    crate::pcre::compile(body, opts, extra_opts)
+    crate::pcre::compile(body, opts, extra_opts, jit)
         .map(PhpRe::Pcre)
         .map_err(|e| format!("Compilation failed: {}", e))
 }
 
 /// A PHP pattern compiled by PCRE2 — PHP's own engine.
-pub(in crate::builtins) enum PhpRe {
+pub(crate) enum PhpRe {
     Pcre(crate::pcre::PcreRe),
 }
 
@@ -1289,6 +1326,10 @@ impl PhpRe {
     ) -> (Vec<PhpCap>, i32) {
         match self {
             PhpRe::Pcre(r) => {
+                let jit_enabled = !it.ini.contains_key("pcre.jit") || it.ini_on("pcre.jit");
+                if r.jit && jit_enabled && it.pcre_jit_stack.is_none() {
+                    it.pcre_jit_stack = crate::pcre::JitStack::new();
+                }
                 // PHP's options decision (is_known_valid_utf8): skip
                 // UTF-8 validation only when the storage was already
                 // proven valid AND the offset sits on a char boundary.
@@ -1320,11 +1361,18 @@ impl PhpRe {
                     } else {
                         0
                     },
-                    it.ini_int("pcre.backtrack_limit", 1_000_000).max(0) as u32,
-                    // Vendored pcre2 10.45 counts one more frame than
-                    // PHP's 10.49 for the same depth_limit (grep2 needs
-                    // recursion_limit=1 to still match a flat pattern).
-                    (it.ini_int("pcre.recursion_limit", 100_000).max(0) as u32) + 1,
+                    (
+                        it.ini_int("pcre.backtrack_limit", 1_000_000).max(0) as u32,
+                        // Vendored pcre2 10.45 counts one more frame than
+                        // PHP's 10.49 for the same depth_limit (grep2 needs
+                        // recursion_limit=1 to still match a flat pattern).
+                        (it.ini_int("pcre.recursion_limit", 100_000).max(0) as u32) + 1,
+                    ),
+                    if jit_enabled {
+                        it.pcre_jit_stack.as_ref()
+                    } else {
+                        None
+                    },
                 );
                 // A clean offset-0 scan under /u marks the storage
                 // valid — later calls skip re-validation entirely.
@@ -1347,5 +1395,99 @@ impl PhpRe {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pattern_cache_reuses_code_without_caching_errors_or_match_limits() {
+        let mut it = Interp::new("patterns.php");
+        assert!(!it.ini_on("not-set"));
+        for value in ["1", "on", "ON", "On", "true", "TrUe", "yes", "yEs"] {
+            it.ini.insert("probe".into(), value.into());
+            assert!(it.ini_on("probe"));
+        }
+        for value in ["", "0", "off", "false", "no", "2", " yes ", "trué"] {
+            it.ini.insert("probe".into(), value.into());
+            assert!(!it.ini_on("probe"));
+        }
+        let first = php_regex(&mut it, b"/a/i", "preg_match").unwrap().unwrap();
+        assert!(Rc::ptr_eq(
+            &first,
+            &php_regex(&mut it, b"/a/i", "preg_match").unwrap().unwrap()
+        ));
+        assert!(!Rc::ptr_eq(
+            &first,
+            &php_regex(&mut it, b"/(*NO_JIT)a/", "preg_match")
+                .unwrap()
+                .unwrap()
+        ));
+        assert!(php_regex(&mut it, b"/a\0/", "preg_match").unwrap().is_ok());
+        let size = it.pcre_patterns.len();
+        for _ in 0..2 {
+            assert!(php_regex(&mut it, b"/[/", "preg_match").unwrap().is_err());
+            assert_eq!(it.pcre_patterns.len(), size);
+        }
+        for i in 0..4096 {
+            php_regex(&mut it, format!("/{i}/").as_bytes(), "preg_match")
+                .unwrap()
+                .unwrap();
+            assert!(it.pcre_patterns.len() <= 4096);
+        }
+        assert!(!Rc::ptr_eq(
+            &first,
+            &php_regex(&mut it, b"/a/i", "preg_match").unwrap().unwrap()
+        ));
+        let large = format!("/(?#{}a)a/", " ".repeat(64 * 1024));
+        let count = it.pcre_patterns.len();
+        let one = php_regex(&mut it, large.as_bytes(), "preg_match")
+            .unwrap()
+            .unwrap();
+        let two = php_regex(&mut it, large.as_bytes(), "preg_match")
+            .unwrap()
+            .unwrap();
+        assert_eq!(it.pcre_patterns.len(), count);
+        assert!(!Rc::ptr_eq(&one, &two));
+        let re = php_regex(&mut it, b"/(*NO_JIT)a/", "preg_match")
+            .unwrap()
+            .unwrap();
+        it.ini.insert("pcre.backtrack_limit".into(), "0".into());
+        assert_eq!(re.caps(b"a", 0, false, None, &mut it).1, -47);
+        it.ini
+            .insert("pcre.backtrack_limit".into(), "1000000".into());
+        let (matches, err) = re.caps(b"a", 0, false, None, &mut it);
+        assert_eq!(err, 0);
+        assert_eq!(matches[0].spans[0], Some((0, 1)));
+        let PhpRe::Pcre(native) = &*first;
+        if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            assert!(native.jit);
+            it.ini.insert("pcre.backtrack_limit".into(), "0".into());
+            for enabled in ["1", "0", "1"] {
+                it.ini.insert("pcre.jit".into(), enabled.into());
+                assert_eq!(first.caps(b"a", 0, false, None, &mut it).1, 0);
+            }
+            assert!(it.pcre_jit_stack.is_some());
+        }
+        it.ini.insert("pcre.jit".into(), "0".into());
+        let disabled = php_regex(&mut it, b"/b/", "preg_match").unwrap().unwrap();
+        let PhpRe::Pcre(native) = &*disabled;
+        assert!(!native.jit);
+        it.ini.insert("pcre.jit".into(), "1".into());
+        assert_eq!(disabled.caps(b"b", 0, false, None, &mut it).1, -47);
+        let previous = php_regex(&mut it, b"/request-only/", "preg_match")
+            .unwrap()
+            .unwrap();
+        let old = Rc::downgrade(&previous);
+        drop(previous);
+        assert!(old.upgrade().is_some());
+        it.reset_request();
+        assert!(it.pcre_patterns.is_empty());
+        assert!(old.upgrade().is_none());
+        assert!(php_regex(&mut it, b"/request-only/", "preg_match")
+            .unwrap()
+            .is_ok());
     }
 }

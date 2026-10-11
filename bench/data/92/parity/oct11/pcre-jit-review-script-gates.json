@@ -1,0 +1,127 @@
+[
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_array_insert_bound.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_arrow_imports.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_call_namespace_snapshot.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_call_order.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_canonical_control_flow.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_canonical_expressions.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_canonical_lifetimes.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_canonical_unset.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_cell_pool_alias.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_closure_dispatch.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_extract_scope.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_foreach_bodies.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_frame_lifetime.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_lazy_trace.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_method_properties.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_namespace_precedence.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_ref_send.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_store_destruct.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_top_global_unset.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_top_level.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "crates/phpun-core/tests/fixtures/vm_uninitialized_locals.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "/workspace/parity92/oct11/arena-wide.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "/workspace/parity92/oct11/receiver.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "/workspace/parity92/oct11/native-guards.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  },
+  {
+    "file": "/workspace/parity92/oct11/native-graphs.php",
+    "exit": 0,
+    "gate": "stdout/stderr/exit == nativePHP8.5.11 -n"
+  }
+]

@@ -1,0 +1,22 @@
+   Compiling phpun-phpt v0.0.0 (/workspace/phpun-bool-loop/crates/phpun-phpt)
+   Compiling phpun-core v0.0.0 (/workspace/phpun-bool-loop/crates/phpun-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.70s
+     Running unittests src/lib.rs (/workspace/phpun-lean-target/debug/deps/phpun_core-e99319b369bce072)
+
+running 1 test
+test interp::vm::tests::scalar_dimension_slots_preserve_mutation_refs_views_and_fallbacks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.06s
+
+     Running tests/fmt.rs (/workspace/phpun-lean-target/debug/deps/fmt-08162a6597f9c592)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.00s
+
+     Running tests/runtime.rs (/workspace/phpun-lean-target/debug/deps/runtime-0923c8529d42ebdf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+

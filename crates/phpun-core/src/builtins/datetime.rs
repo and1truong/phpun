@@ -2253,7 +2253,7 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
         ts -= off;
         for k in ["date", "timezone_type", "timezone"] {
             ob.prop_take(k);
-            ob.prop_order.retain(|x| x != k);
+            Rc::make_mut(&mut ob.prop_order).retain(|x| x != k);
         }
         for (k, v) in [
             ("\0dt\0ts", ts),
@@ -2265,13 +2265,13 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
                 k,
                 std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::Int(v))),
             );
-            ob.prop_order.push(k.to_string());
+            Rc::make_mut(&mut ob.prop_order).push(k.to_string());
         }
         ob.prop_insert(
             "\0dt\0tz",
             std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::str(tz))),
         );
-        ob.prop_order.push("\0dt\0tz".to_string());
+        Rc::make_mut(&mut ob.prop_order).push("\0dt\0tz".to_string());
     } else if cn == "dateinterval" {
         // rebuild \0di\0{months,days,secs} from the public fields, or
         // re-parse a from_string payload's date_string.
@@ -2320,7 +2320,7 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
         };
         for k in ["timezone_type", "timezone"] {
             ob.prop_take(k);
-            ob.prop_order.retain(|x| x != k);
+            Rc::make_mut(&mut ob.prop_order).retain(|x| x != k);
         }
         for (k, v) in [("\0tz\0name", tz), ("\0tz\0ty", ty.to_string())] {
             let val = if k.ends_with("ty") {
@@ -2329,7 +2329,7 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
                 crate::value::Value::str(v)
             };
             ob.prop_insert(k, std::rc::Rc::new(std::cell::RefCell::new(val)));
-            ob.prop_order.push(k.to_string());
+            Rc::make_mut(&mut ob.prop_order).push(k.to_string());
         }
     }
 }

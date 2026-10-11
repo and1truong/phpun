@@ -1,0 +1,71 @@
+{
+  "source": "5407d84c10fbb787ac416f31fe22238b511aa30d",
+  "runtime": "04dcbf89d90779c57517be1f9132c49855a8626b",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 600,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 5,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "timeout",
+      "after": "fail"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "timeout",
+      "after": "fail"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 858127,
+        "bytes": 49972638
+      },
+      "after": {
+        "requests": 858129,
+        "bytes": 49975314
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616040,
+        "bytes": 26543382
+      },
+      "after": {
+        "requests": 616040,
+        "bytes": 26545986
+      }
+    }
+  ],
+  "binary_sha256": "ac7984b0a746161b0cf43ed04978b4d2ef14a50c26975a21bade416cfdf35fd4",
+  "scope": "REJECTED prototype: memoize the existing immutable empty float-promotion constructor proof and flattened slot indices in a standard class OnceCell. All per-call guards and canonical stores/fallback remained. Ordinary revert restores preceding production source; this PR keeps evidence only.",
+  "fallbacks": "No widened property/object slots, new dependency, unsafe or callback/trace change. ONE existing receiver/constructor check proved actual proof reuse plus original alias/clone/frame repayment. Existing native fallback checks included inherited/named/error/body constructors."
+}

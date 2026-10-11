@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "53a0e08b77c9074f88eac5511ab20c7d35e227da2b71650b55db8567caa95a9a",
+  "source": "7aa40eb7b8582a4a198070469efbe3476611dd05",
+  "parent": "object-order-cow",
+  "summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "changes": []
+}

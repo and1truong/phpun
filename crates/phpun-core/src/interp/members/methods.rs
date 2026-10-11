@@ -517,7 +517,7 @@ impl<'a> Interp<'a> {
                                 let mut so = src.borrow_mut();
                                 let pk = crate::value::int_prop_key(next);
                                 if !so.prop_has(&pk) {
-                                    so.prop_order.push(pk.clone());
+                                    Rc::make_mut(&mut so.prop_order).push(pk.clone());
                                 }
                                 so.prop_insert(pk, pc);
                             }
@@ -639,7 +639,7 @@ impl<'a> Interp<'a> {
                             class: icls,
                             slots: Vec::new(),
                             props: Default::default(),
-                            prop_order: Vec::new(),
+                            prop_order: Rc::new(Vec::new()),
                             id: 0,
                             internal: Some(ObjectInternal::ArrayIter {
                                 // The shared slot — the iterator sees
@@ -1075,7 +1075,7 @@ impl<'a> Interp<'a> {
                             class: icls,
                             slots: Vec::new(),
                             props: Default::default(),
-                            prop_order: Vec::new(),
+                            prop_order: Rc::new(Vec::new()),
                             id: 0,
                             internal: Some(ObjectInternal::ArrayIter {
                                 store: Rc::new(RefCell::new(crate::value::AoStore {
@@ -1293,7 +1293,7 @@ impl<'a> Interp<'a> {
         }
         let mut ob = obj.borrow_mut();
         if !ob.prop_order.contains(&kn) {
-            ob.prop_order.push(kn.clone());
+            Rc::make_mut(&mut ob.prop_order).push(kn.clone());
         }
         ob.prop_insert(kn, c);
         Ok(())
@@ -1372,7 +1372,7 @@ impl<'a> Interp<'a> {
         {
             let mut so = src.borrow_mut();
             if !so.prop_has(&pname) {
-                so.prop_order.push(pname.clone());
+                Rc::make_mut(&mut so.prop_order).push(pname.clone());
             }
             so.prop_insert(pname.clone(), pc.clone());
         }
@@ -1403,7 +1403,7 @@ impl<'a> Interp<'a> {
             return;
         }
         let so = src.borrow();
-        for pname in &so.prop_order {
+        for pname in so.prop_order.iter() {
             // `\0Class\0priv` mangled names are visibility metadata,
             // not storage keys — zend keeps private props out of the
             // spl storage hash entirely.
@@ -1679,7 +1679,7 @@ impl<'a> Interp<'a> {
     fn ao_props_arr(&mut self, obj: &Rc<RefCell<PhpObject>>) -> PhpArray {
         let ob = obj.borrow();
         let mut props = PhpArray::new();
-        for name in &ob.prop_order {
+        for name in ob.prop_order.iter() {
             if let Some(c) = ob.prop_get(name) {
                 props.set(ArrKey::Str(Rc::from(name.as_str())), c.borrow().clone());
             }
@@ -3127,7 +3127,7 @@ impl<'a> Interp<'a> {
                         ("s", se),
                     ] {
                         ob.prop_insert(k, cell(Value::Int(v)));
-                        ob.prop_order.push(k.into());
+                        Rc::make_mut(&mut ob.prop_order).push(k.into());
                     }
                     for (k, v) in [
                         ("f", Value::Float(0.0)),
@@ -3136,7 +3136,7 @@ impl<'a> Interp<'a> {
                         ("from_string", Value::Bool(false)),
                     ] {
                         ob.prop_insert(k, cell(v));
-                        ob.prop_order.push(k.into());
+                        Rc::make_mut(&mut ob.prop_order).push(k.into());
                     }
                     ob.prop_insert("\0di\0months", cell(Value::Int(y * 12 + mo)));
                     ob.prop_insert("\0di\0days", cell(Value::Int(d)));
@@ -3485,7 +3485,7 @@ impl<'a> Interp<'a> {
             class: dc,
             slots: Vec::new(),
             props,
-            prop_order: order,
+            prop_order: Rc::new(order),
             id: 0,
             internal: None,
             unset_props: std::collections::HashSet::new(),
@@ -3973,13 +3973,13 @@ impl<'a> Interp<'a> {
                 ob.prop_insert("message", cell(Value::str(msg)));
                 ob.prop_insert("code", cell(Value::Int(code)));
                 if !ob.prop_order.contains(&"message".into()) {
-                    ob.prop_order.push("message".into());
-                    ob.prop_order.push("code".into());
+                    Rc::make_mut(&mut ob.prop_order).push("message".into());
+                    Rc::make_mut(&mut ob.prop_order).push("code".into());
                 }
                 if ee {
                     ob.prop_insert("severity", cell(Value::Int(severity)));
                     if !ob.prop_order.contains(&"severity".into()) {
-                        ob.prop_order.push("severity".into());
+                        Rc::make_mut(&mut ob.prop_order).push("severity".into());
                     }
                     // zend lets the ctor override the throw site's
                     // file/line — both the props and getFile()/getLine()
@@ -4027,7 +4027,7 @@ impl<'a> Interp<'a> {
                         };
                         let pk = format!("\0{}\0previous", pscope);
                         if !ob.prop_order.contains(&pk) {
-                            ob.prop_order.push(pk.clone());
+                            Rc::make_mut(&mut ob.prop_order).push(pk.clone());
                         }
                         ob.prop_insert(pk, cell(pv));
                     }
@@ -4065,7 +4065,7 @@ impl<'a> Interp<'a> {
         let mut ob = o.borrow_mut();
         let put = |ob: &mut PhpObject, k: String, v: Value| {
             if !ob.prop_order.contains(&k) {
-                ob.prop_order.push(k.clone());
+                Rc::make_mut(&mut ob.prop_order).push(k.clone());
             }
             ob.prop_insert(k, cell(v));
         };
@@ -4096,6 +4096,7 @@ impl<'a> Interp<'a> {
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
+                        prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
                         method_ic: std::cell::RefCell::new(None),
                         short_name: std::cell::OnceCell::new(),

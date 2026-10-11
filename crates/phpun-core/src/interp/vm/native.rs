@@ -2,6 +2,8 @@
 use super::{CachedFn, Compiled, FunctionDecl, Interp, Op, Rc, Slot, Value};
 use std::cell::Cell;
 
+mod region;
+
 pub(in crate::interp) enum State {
     Cold(u32),
     Disabled,
@@ -23,6 +25,7 @@ pub(in crate::interp) struct Program {
     // gain another Rc<Compiled> cycle through this tier.
     dependencies: Vec<(Rc<str>, Rc<FunctionDecl>)>,
     pub(super) executions: Cell<u64>,
+    region_budget: Option<Rc<Cell<usize>>>,
 }
 
 impl Drop for Program {
@@ -30,6 +33,9 @@ impl Drop for Program {
         // SAFETY: this mapping is owned by this Program, never shared with a
         // running invocation (the invocation retains an Rc until it returns).
         unsafe { libc::munmap(self.code, self.len) };
+        if let Some(budget) = &self.region_budget {
+            budget.set(budget.get() - self.len);
+        }
     }
 }
 
@@ -177,7 +183,9 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             Op::Call { argc, .. } => (*argc as usize, 1),
             Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => (1, 0),
             Op::Return => (1, 0),
-            Op::Line(_) | Op::Sweep | Op::InitCall { .. } | Op::Jump(_) => (0, 0),
+            Op::Line(_) | Op::Sweep | Op::BoolLoop { .. } | Op::InitCall { .. } | Op::Jump(_) => {
+                (0, 0)
+            }
             _ => return None,
         };
         let next = n.checked_sub(take)? + give;
@@ -461,7 +469,7 @@ impl Emitter {
                     self.emit(&[0x49, 0x89, 0x06, 0xb0, 1]);
                     returns.push(self.branch(None));
                 }
-                Op::Line(_) | Op::InitCall { .. } | Op::Sweep | Op::Pop => {}
+                Op::Line(_) | Op::BoolLoop { .. } | Op::InitCall { .. } | Op::Sweep | Op::Pop => {}
                 _ => return None,
             }
         }
@@ -519,19 +527,32 @@ impl Program {
         if e.bytes.len() > 131072 {
             return None;
         }
+        let used = Self::mapped_bytes(it);
+        Self::map(&e.bytes, graph.dependencies, used, None)
+    }
+
+    fn mapped_bytes(it: &Interp<'_>) -> usize {
+        it.native_regions_bytes.get()
+            + it.compiled_fns
+                .values()
+                .filter_map(|entry| match &entry.3 {
+                    State::Ready(p) => Some(p.len),
+                    _ => None,
+                })
+                .sum::<usize>()
+    }
+
+    fn map(
+        bytes: &[u8],
+        dependencies: Vec<(Rc<str>, Rc<FunctionDecl>)>,
+        used: usize,
+        region_budget: Option<Rc<Cell<usize>>>,
+    ) -> Option<Self> {
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        if page == 0 {
+        if page == 0 || bytes.is_empty() {
             return None;
         }
-        let len = e.bytes.len().checked_add(page - 1)? / page * page;
-        let used: usize = it
-            .compiled_fns
-            .values()
-            .filter_map(|entry| match &entry.3 {
-                State::Ready(p) => Some(p.len),
-                _ => None,
-            })
-            .sum();
+        let len = bytes.len().checked_add(page - 1)? / page * page;
         if len > (8 * 1024 * 1024usize).saturating_sub(used) {
             return None;
         }
@@ -551,17 +572,21 @@ impl Program {
             return None;
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(e.bytes.as_ptr(), code.cast::<u8>(), e.bytes.len());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), code.cast::<u8>(), bytes.len());
             if libc::mprotect(code, len, libc::PROT_READ | libc::PROT_EXEC) != 0 {
                 libc::munmap(code, len);
                 return None;
             }
         }
+        if let Some(budget) = &region_budget {
+            budget.set(budget.get() + len);
+        }
         Some(Self {
             code,
             len,
-            dependencies: graph.dependencies,
+            dependencies,
             executions: Cell::new(0),
+            region_budget,
         })
     }
 }

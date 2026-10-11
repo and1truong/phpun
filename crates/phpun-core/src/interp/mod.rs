@@ -274,9 +274,10 @@ pub(crate) type FilterBinding = (
     Rc<RefCell<PhpResource>>,
 );
 
-/// Liveness probe for a charged allocation: weak ref to the owning
-/// Rc — returns false once every strong handle died (zend's efree).
-pub(crate) type MemProbe = Box<dyn Fn() -> bool>;
+/// Weak ownership alone decides charged-allocation liveness (Zend efree).
+/// All tracked owners are sized; std Any erases their type without a closure
+/// allocation, extra strong handle, or raw refcount/layout assumptions.
+pub(crate) type MemProbe = std::rc::Weak<dyn std::any::Any>;
 
 /// A charge booked against a live Rc. `inner` is footprint inside
 /// committed chunks, `huge` footprint in dedicated huge segments
@@ -515,6 +516,8 @@ pub struct Interp<'a> {
     pub(crate) json_enc_stack: Vec<usize>,
     /// Set by the preg_* builtins for preg_last_error().
     pub last_preg_error: i64,
+    pub(crate) pcre_jit_stack: Option<crate::pcre::JitStack>,
+    pub(crate) pcre_patterns: HashMap<Vec<u8>, Rc<crate::builtins::pcre::PhpRe>>,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
     /// pointer) proven fully valid UTF-8 — /u preg calls skip
     /// re-validating it (bug72685). Weak keys drop when the storage
@@ -913,6 +916,8 @@ pub struct Interp<'a> {
     /// auto-runs like `gc_collect_roots` on buffer overflow
     /// (gc/bug70805).
     gc_pending: usize,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    native_regions_bytes: Rc<std::cell::Cell<usize>>,
     /// Re-entrancy guard — a collect runs userland `__destruct`s whose
     /// own unsets/displaces must not nest a second collect (Zend's
     /// GC_GCOLLECTED flag).
@@ -1531,6 +1536,10 @@ impl<'a> Interp<'a> {
         // Reported as the engine's target PCRE2 level — feature checks
         // like symfony's `>= 10.39` gate on this, not the vendored lib.
         constants.insert("PCRE_VERSION".into(), Value::str("10.49 2026-09-28"));
+        constants.insert(
+            "PCRE_JIT_SUPPORT".into(),
+            Value::Bool(crate::pcre::jit_available()),
+        );
         constants.insert("INI_USER".into(), Value::Int(1));
         constants.insert("INI_PERDIR".into(), Value::Int(2));
         constants.insert("INI_SYSTEM".into(), Value::Int(4));
@@ -1857,6 +1866,8 @@ impl<'a> Interp<'a> {
             last_json_error: 0,
             json_enc_stack: Vec::new(),
             last_preg_error: 0,
+            pcre_patterns: HashMap::new(),
+            pcre_jit_stack: None,
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
@@ -1952,6 +1963,8 @@ impl<'a> Interp<'a> {
             handle_scan_drops: 0,
             arr_handles: Vec::new(),
             gc_pending: 0,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            native_regions_bytes: Rc::new(std::cell::Cell::new(0)),
             gc_collecting: false,
             gc_purpled: HashSet::new(),
             gc_dying: HashMap::new(),
@@ -2016,6 +2029,7 @@ impl<'a> Interp<'a> {
             deadline: None,
             deadline_secs: 0,
             ini: HashMap::from([
+                ("pcre.jit".into(), "1".into()),
                 ("error_reporting".to_string(), "30719".to_string()),
                 // Zend's compiled-in default (hardcoded in main/php.ini).
                 ("memory_limit".to_string(), "128M".to_string()),
@@ -3198,6 +3212,10 @@ impl<'a> Interp<'a> {
         if matches!(v, Value::Array(_) | Value::Object(_) | Value::Callable(_)) {
             self.gc_note_dying(&v.clone(), 8);
         }
+        // GC above may release owners; only the current count proves no destructor.
+        if matches!(v, Value::Object(o) if Rc::strong_count(o) > 1) {
+            return Ok(());
+        }
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
             held.entry(Rc::as_ptr(o) as usize)
@@ -3370,10 +3388,12 @@ impl<'a> Interp<'a> {
 
     /// INI truthiness — PHP accepts 1/On/true/yes case-insensitively.
     pub fn ini_on(&self, k: &str) -> bool {
-        match self.ini.get(k).map(|s| s.to_lowercase()) {
-            Some(v) => matches!(v.as_str(), "1" | "on" | "true" | "yes"),
-            None => false,
-        }
+        self.ini.get(k).is_some_and(|v| {
+            v == "1"
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+        })
     }
 
     /// `error_reporting` ini value → error_level mask: integer, or an
@@ -3562,6 +3582,7 @@ impl<'a> Interp<'a> {
     /// Worker mode: clear per-request state while keeping the warm world
     /// (classes, functions, global vars, objects) alive.
     pub fn reset_request(&mut self) {
+        self.pcre_patterns.clear();
         self.out.clear();
         self.err_buf.clear();
         self.out_headers.clear();
@@ -4296,7 +4317,7 @@ impl<'a> Interp<'a> {
             return s.hole;
         }
         match self.mem_tracked.get(&s.key) {
-            Some(c) if !(c.probe)() => c.seg_cap,
+            Some(c) if c.probe.strong_count() == 0 => c.seg_cap,
             _ => 0,
         }
     }
@@ -4452,7 +4473,7 @@ impl<'a> Interp<'a> {
 
     /// Charge `req` bytes and tie the footprint to `rc`'s lifetime —
     /// released when every strong ref dies (zend's efree).
-    pub(crate) fn mem_track<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+    pub(crate) fn mem_track<T: 'static>(&mut self, rc: &Rc<T>, req: u64) {
         crate::interp::util::alloc_hit(2);
         let (fp, chunk) = self.mem_commit(req);
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
@@ -4460,7 +4481,7 @@ impl<'a> Interp<'a> {
         let mut stale_cap = 0u64;
         match self.mem_tracked.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                if !(e.get().probe)() {
+                if e.get().probe.strong_count() == 0 {
                     // Allocator recycled a dead owner's pointer —
                     // release the stale charge, then re-register.
                     let dead = e.get();
@@ -4499,8 +4520,8 @@ impl<'a> Interp<'a> {
                             dead_chunk,
                         );
                     }
-                    let weak = Rc::downgrade(rc);
-                    c.probe = Box::new(move || weak.strong_count() > 0);
+                    let weak: MemProbe = Rc::<T>::downgrade(rc);
+                    c.probe = weak;
                 }
                 if inner > 0 {
                     e.get_mut().chunk = chunk;
@@ -4512,7 +4533,7 @@ impl<'a> Interp<'a> {
                 e.get_mut().huge += huge;
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let weak = Rc::downgrade(rc);
+                let weak: MemProbe = Rc::<T>::downgrade(rc);
                 e.insert(MemCharge {
                     inner,
                     huge,
@@ -4524,7 +4545,7 @@ impl<'a> Interp<'a> {
                         0
                     },
                     chunk: if inner > 0 { chunk } else { usize::MAX },
-                    probe: Box::new(move || weak.strong_count() > 0),
+                    probe: weak,
                 });
             }
         }
@@ -4724,14 +4745,14 @@ impl<'a> Interp<'a> {
     /// zend's erealloc transiently holds both, so charge-then-credit.
     /// A same-capacity call is a no-op (zend only reallocs when the
     /// pow2 class advances).
-    pub(crate) fn mem_realloc<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+    pub(crate) fn mem_realloc<T: 'static>(&mut self, rc: &Rc<T>, req: u64) {
         let key = Rc::as_ptr(rc) as *const u8 as usize;
         let mut old_live = None;
         if let Some(c) = self.mem_tracked.get(&key) {
-            if (c.probe)() && c.table_req == req {
+            if c.probe.strong_count() > 0 && c.table_req == req {
                 return;
             }
-            if (c.probe)() {
+            if c.probe.strong_count() > 0 {
                 old_live = Some((c.table_req, c.chunk));
             }
         }
@@ -4928,7 +4949,7 @@ impl<'a> Interp<'a> {
                 e.get_mut().huge += huge;
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let weak = Rc::downgrade(rc);
+                let weak: MemProbe = Rc::<T>::downgrade(rc);
                 e.insert(MemCharge {
                     inner,
                     huge,
@@ -4940,7 +4961,7 @@ impl<'a> Interp<'a> {
                         0
                     },
                     chunk: if inner > 0 { chunk } else { usize::MAX },
-                    probe: Box::new(move || weak.strong_count() > 0),
+                    probe: weak,
                 });
             }
         }
@@ -5061,7 +5082,7 @@ impl<'a> Interp<'a> {
                 return true;
             }
             match tracked.get(&s.key) {
-                Some(c) if (c.probe)() && c.huge > 0 => true,
+                Some(c) if c.probe.strong_count() > 0 && c.huge > 0 => true,
                 Some(c) => {
                     s.key = usize::MAX;
                     s.hole = c.seg_cap;
@@ -5077,7 +5098,7 @@ impl<'a> Interp<'a> {
         let chunks = &mut self.mem_chunks;
         let mut vacate = Vec::new();
         self.mem_tracked.retain(|_, c| {
-            if (c.probe)() {
+            if c.probe.strong_count() > 0 {
                 true
             } else {
                 inner += c.inner;
@@ -5125,7 +5146,7 @@ impl<'a> Interp<'a> {
         let fp = Self::mem_fp(req);
         let key = Rc::as_ptr(rc) as *const u8 as usize;
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.mem_tracked.entry(key) {
-            if !(e.get().probe)() {
+            if e.get().probe.strong_count() == 0 {
                 // Stale entry of a dead owner at a recycled pointer —
                 // release it now; the caller's container was never
                 // charged for it.
@@ -5191,7 +5212,7 @@ impl<'a> Interp<'a> {
     /// zend checks whether the pages immediately after the old run
     /// are free, which needs the real page map PR #88 owns; without
     /// it the boundary can land one growth step off.
-    pub(crate) fn mem_grow_str<T: ?Sized + 'static>(&mut self, old: &Rc<T>, new: &Rc<T>, req: u64) {
+    pub(crate) fn mem_grow_str<T: 'static>(&mut self, old: &Rc<T>, new: &Rc<T>, req: u64) {
         // zend frees dead allocs before sizing the grow — sweep
         // unconditionally so freed runs feed the extend test.
         self.mem_sweep();
@@ -5200,7 +5221,7 @@ impl<'a> Interp<'a> {
 
     // Called after sweeping while the old owner was still live. A unique append
     // may detach its weak handles, so carry the old charge by key across mutation.
-    fn mem_grow_str_key<T: ?Sized + 'static>(&mut self, old_key: usize, new: &Rc<T>, req: u64) {
+    fn mem_grow_str_key<T: 'static>(&mut self, old_key: usize, new: &Rc<T>, req: u64) {
         let fp = Self::mem_fp(req);
         let (old_inner, old_huge, old_chunk) = self
             .mem_tracked
@@ -5337,7 +5358,7 @@ impl<'a> Interp<'a> {
             }
         }
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
-        let weak = Rc::downgrade(new);
+        let weak: MemProbe = Rc::<T>::downgrade(new);
         self.mem_tracked.insert(
             key,
             MemCharge {
@@ -5347,7 +5368,7 @@ impl<'a> Interp<'a> {
                 vm: None,
                 seg_cap: new_seg_cap,
                 chunk: new_chunk,
-                probe: Box::new(move || weak.strong_count() > 0),
+                probe: weak,
             },
         );
     }
@@ -6353,7 +6374,7 @@ impl<'a> Interp<'a> {
         let mut gens: Vec<(Rc<RefCell<PhpObject>>, usize)> = Vec::new();
         {
             let b = o.borrow();
-            for name in &b.prop_order {
+            for name in b.prop_order.iter() {
                 let Some(c) = b.prop_get(name) else {
                     continue;
                 };
@@ -7590,8 +7611,8 @@ impl<'a> Interp<'a> {
                 previous: None,
             });
             if !o.prop_order.contains(&"message".into()) {
-                o.prop_order.push("message".into());
-                o.prop_order.push("code".into());
+                Rc::make_mut(&mut o.prop_order).push("message".into());
+                Rc::make_mut(&mut o.prop_order).push("code".into());
             }
         }
         obj
@@ -7641,6 +7662,32 @@ impl<'a> Interp<'a> {
             self.vm_frame_free(&args.vm_sites);
         }
         r
+    }
+
+    /// Exact scalar kernels have no live frame; only OOM observation needs one.
+    fn scalar_builtin_oom(&mut self, name: &str, args: &[Value], visible: bool) {
+        let Some((line, _)) = &self.oom_at else {
+            return;
+        };
+        let line = *line;
+        let (file, site) = self.call_site(false, self.diag_file_shared(), self.cur_line);
+        self.call_trace.push(TraceFrame {
+            args_frame: None,
+            function: Rc::from(name),
+            class: None,
+            ty: String::new(),
+            file,
+            line: site,
+            args: args.iter().cloned().map(cell).collect(),
+            named_args: Vec::new(),
+            internal: true,
+            visible,
+            named_dispatch: false,
+            gen_resume: false,
+            gen_body: false,
+        });
+        self.oom_at = Some((line, self.fatal_frames()));
+        self.trace_pop();
     }
 
     fn check_builtin_types(&mut self, name: &str, cells: &[Cell]) -> Result<(), PhpError> {
@@ -7854,7 +7901,8 @@ impl<'a> Interp<'a> {
             for (value, cell) in values.iter_mut().zip(&args.cells) {
                 *value = cell.borrow().clone();
             }
-            if let Some(value) = builtins::call_scalar(name, &values[..args.cells.len()]) {
+            if let Some(value) = builtins::call_scalar(self, name, &values[..args.cells.len()]) {
+                self.scalar_builtin_oom(name, &values[..args.cells.len()], visible);
                 return Ok(Some(value));
             }
         }

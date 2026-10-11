@@ -1,0 +1,71 @@
+{
+  "source": "770e5e93bacef163511ddb03e07604e5348027a0",
+  "runtime": "5fbc84574e9900cc351a3783586baff932fe004d",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "patterns4",
+      "before": {
+        "requests": 1142112,
+        "bytes": 59747643
+      },
+      "after": {
+        "requests": 1122108,
+        "bytes": 59727619
+      }
+    },
+    {
+      "label": "regex",
+      "before": {
+        "requests": 327940,
+        "bytes": 29926168
+      },
+      "after": {
+        "requests": 327816,
+        "bytes": 29926024
+      }
+    }
+  ],
+  "binary_sha256": "38d0c02469754da0e60807503f420e217193d69c303308fc2599ac4fccc9db47",
+  "scope": "Interp::ini_on now borrows settings and uses std eq_ignore_ascii_case instead of allocating a lowercase String. All twelve caller paths keep the same helper;no snapshot/cache/dependency/unsafe/new abstraction.",
+  "fallbacks": "Preserves existing accepted1/On/true/yes and missing/empty/false/nonmatching behavior;does not claim new numericINI compatibility. ONEexistingPCRE check extends mixedcase/rejected values plus mutable toggles."
+}

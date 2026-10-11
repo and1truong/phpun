@@ -1,0 +1,174 @@
+{
+  "source": "3ae60dfe57fde751d53464242b620f7e631df0e5",
+  "runtime": "0938d8f8818180ac925cb7b5a67c05ec72fd7634",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/errors05.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/preg_match_error3.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/errors05.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/preg_match_error3.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "pcre-pattern-cache-review",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8595
+      }
+    },
+    {
+      "binary": "pcre-jit-working-set",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8664
+      }
+    }
+  ],
+  "physical_allocations": [
+    {
+      "label": "regex",
+      "before": {
+        "requests": 327812,
+        "bytes": 29923534
+      },
+      "after": {
+        "requests": 327940,
+        "bytes": 29923679
+      }
+    },
+    {
+      "label": "patterns4",
+      "before": {
+        "requests": 1122104,
+        "bytes": 59725153
+      },
+      "after": {
+        "requests": 1142112,
+        "bytes": 59745178
+      }
+    },
+    {
+      "label": "patterns300",
+      "before": {
+        "requests": 1152098,
+        "bytes": 60810763
+      },
+      "after": {
+        "requests": 1143302,
+        "bytes": 59952014
+      }
+    },
+    {
+      "label": "patterns5000",
+      "before": {
+        "requests": 1152098,
+        "bytes": 60925966
+      },
+      "after": {
+        "requests": 1182106,
+        "bytes": 61462931
+      }
+    }
+  ],
+  "binary_sha256": "0b0445c2b4b64af1110fb4be9069ca53a46396c7df5d3336e2510b45a7198be7",
+  "scope": "Enable native PCRE2 JIT through the existing vendored engine. Compile once on successful cache misses with PHP pcre.jit default enabled;cached patterns retain their initial JIT choice across INI toggles. Expose native PCRE_JIT_SUPPORT;owned interpreter stack uses PHP32\u2013192KiB bounds.",
+  "fallbacks": "UTF validation,offset/global-empty matching,limits and JIT stacklimit errors remain native. NO_JIT/unsupported targets keep canonical PCRE2. Allocation/compilation warnings propagate through PHP error handlers. Worker pattern reset correction from333included. Measured300-pattern thrash required PHP4096capacity;rawkeys>64KiB are not retained. Ceiling/byte-budgeted LRU upgrade documented. No dependency/benchmark recognition.",
+  "isolated_jit_error_checks": [
+    {
+      "binary": "pcre-pattern-cache-review",
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/errors05.phpt",
+          "name": "Test preg_match() function : error conditions - jit stacklimit exhausted",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 51
+        },
+        {
+          "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/preg_match_error3.phpt",
+          "name": "Test preg_match() function : error conditions - jit stacklimit exhausted",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 51
+        }
+      ]
+    },
+    {
+      "binary": "pcre-jit-working-set",
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/errors05.phpt",
+          "name": "Test preg_match() function : error conditions - jit stacklimit exhausted",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 41
+        },
+        {
+          "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/preg_match_error3.phpt",
+          "name": "Test preg_match() function : error conditions - jit stacklimit exhausted",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 41
+        }
+      ]
+    }
+  ]
+}

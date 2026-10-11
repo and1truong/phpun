@@ -1,0 +1,26 @@
+{
+  "binary_sha256": "2fd2111cc61a9e8334256dc3d2c6e3b205c4556936d15a81a2ca873a83ee30ce",
+  "source": "f1c4f28d84e5e0d7d1a9df441edfea51ae67571f",
+  "parent": "surviving-object-dtor",
+  "summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ]
+}

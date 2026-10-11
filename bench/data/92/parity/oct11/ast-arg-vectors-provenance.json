@@ -1,0 +1,49 @@
+{
+  "source": "80c2f239d76b861f2e6ec1e335a40db52c120fb5",
+  "runtime": "87d5ff1544e4de3de3e955d3400004e766e497d7",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 833120,
+        "bytes": 51672708
+      },
+      "after": {
+        "requests": 808121,
+        "bytes": 50872720
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26544298
+      },
+      "after": {
+        "requests": 616041,
+        "bytes": 26544278
+      }
+    }
+  ],
+  "binary_sha256": "1221735daedfc47783a57cee7656c3f4d22ee8975338e9557caf6c7568045b18",
+  "scope": "Historical prototype87d5ff1 reused existing empty VM argument-vector pool at AST send creation and drained fresh frame-free ctor retirement. Existing receiver unit proved actual capacity pointer reuse and correct scalar values. No new pool/layout/dependency/unsafe. REJECTED;ordinaryrevert80c2f23 restoresPR357runtime exactly before incomingPR349review correction.",
+  "fallbacks": "Prototype owners/by-ref/introspection/error guards unchanged;existing scalar pool retirement retained canonical identities. No runtime prototype remains. Initialrelease94e05cf/ELF1221735,not reverted runtime,was tested/timed."
+}

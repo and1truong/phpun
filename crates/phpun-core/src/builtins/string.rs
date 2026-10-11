@@ -270,7 +270,11 @@ pub(crate) fn dispatch(
             let s = bytes_view(it, &source);
             let start = arg(args, 1).to_int();
             let len = nullable_int_arg(args, 2);
-            substr_value(&s, start, len)
+            let original = match &source {
+                Value::Str(s) => Some(s),
+                _ => None,
+            };
+            substr_value(it, &s, start, len, original)
         }
         "substr_count" => {
             let source = arg(args, 0);
@@ -1418,14 +1422,29 @@ pub(in crate::builtins) fn replace_value(
     }
 }
 
-pub(in crate::builtins) fn substr_value(s: &[u8], start: i64, len: Option<i64>) -> Value {
-    match php_substr(s, start, len) {
+pub(in crate::builtins) fn substr_value(
+    it: &mut Interp,
+    s: &[u8],
+    start: i64,
+    len: Option<i64>,
+    original: Option<&crate::value::PhpStr>,
+) -> Value {
+    let value = match php_substr(s, start, len) {
+        Some(x) if x.len() == s.len() && original.is_some() => {
+            // Full normalized range retains Zend's source string and its charge.
+            return Value::Str(original.unwrap().clone());
+        }
         Some(x) => Value::bytes(x),
         None => Value::Bool(false),
+    };
+    if let Value::Str(s) = &value {
+        // The new result overlaps the caller's old target until assignment.
+        it.mem_track(&s.rc, s.len() as u64 + 25);
     }
+    value
 }
 
-pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<Vec<u8>> {
+pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<&[u8]> {
     let n = s.len() as i64;
     let start = if start < 0 {
         (n + start).max(0)
@@ -1445,7 +1464,7 @@ pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) ->
     if len < 0 {
         return None;
     }
-    Some(s[start as usize..(start + len) as usize].to_vec())
+    Some(&s[start as usize..(start + len) as usize])
 }
 
 fn substr_replace(s: &[u8], r: &[u8], start: i64, len: Option<i64>) -> Vec<u8> {

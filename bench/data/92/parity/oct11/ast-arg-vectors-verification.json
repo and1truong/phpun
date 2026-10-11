@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "1221735daedfc47783a57cee7656c3f4d22ee8975338e9557caf6c7568045b18",
+  "source": "94e05cf246d96805555255da705dde646eed2242",
+  "parent": "substr-result-charge",
+  "summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "changes": []
+}

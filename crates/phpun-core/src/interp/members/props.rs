@@ -120,7 +120,7 @@ impl<'a> Interp<'a> {
                         // instantiate, the cell lands now.
                         o.prop_insert(key.clone(), cell(v));
                         if !o.prop_order.contains(&key) {
-                            o.prop_order.push(key.clone());
+                            Rc::make_mut(&mut o.prop_order).push(key.clone());
                         }
                     }
                 }
@@ -1213,7 +1213,7 @@ impl<'a> Interp<'a> {
             v = self.prop_typed_write_check(p, dcls, v)?;
             let mut ob = o.borrow_mut();
             if !ob.prop_order.contains(&p.name) {
-                ob.prop_order.push(p.name.clone());
+                Rc::make_mut(&mut ob.prop_order).push(p.name.clone());
             }
             ob.prop_insert(p.name.clone(), cell(v));
             return Ok(());
@@ -1504,7 +1504,7 @@ impl<'a> Interp<'a> {
             let v = argvals.into_iter().next().unwrap_or(Value::Null);
             let mut ob = o.borrow_mut();
             if !ob.prop_order.iter().any(|k| k == pn) {
-                ob.prop_order.push(pn.to_string());
+                Rc::make_mut(&mut ob.prop_order).push(pn.to_string());
             }
             ob.prop_insert(pn, cell(v.clone()));
             Ok(v)
@@ -2115,7 +2115,7 @@ impl<'a> Interp<'a> {
                 let mut ob = o.borrow_mut();
                 if !ob.prop_has(&key) {
                     if !ob.prop_order.contains(&key) {
-                        ob.prop_order.push(key.clone());
+                        Rc::make_mut(&mut ob.prop_order).push(key.clone());
                     }
                     let nc = cell(Value::Null);
                     self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);

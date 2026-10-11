@@ -1,0 +1,78 @@
+{
+  "source": "b0434dff271ea12b5aeb13966c361d0dc5189778",
+  "runtime": "e3983ee56ef017bf32e66d1aabed83307081041b",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "fresh-promoted-float-review",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8794
+      },
+      "artifact": "pcre-pattern-cache-recheck-fresh-promoted-float-review-gc77345-isolated.json"
+    },
+    {
+      "binary": "pcre-pattern-cache",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8195
+      },
+      "artifact": "pcre-pattern-cache-recheck-pcre-pattern-cache-gc77345-isolated.json"
+    }
+  ],
+  "physical_allocations": [
+    {
+      "label": "regex",
+      "before": {
+        "requests": 327919,
+        "bytes": 29929976
+      },
+      "after": {
+        "requests": 327813,
+        "bytes": 29927200
+      }
+    },
+    {
+      "label": "patterns",
+      "before": {
+        "requests": 1142090,
+        "bytes": 60207919
+      },
+      "after": {
+        "requests": 1122104,
+        "bytes": 59728667
+      }
+    }
+  ],
+  "binary_sha256": "70620800e96d3365251603fa902a2751e08e2c86e4490e373ddb35c675263790",
+  "scope": "All five preg pattern call sites now reuse successful immutable PCRE2 code through the same shared helper, keyed by full pattern bytes. Cache is owned by Interp and freed with it; no cross-request retention.",
+  "fallbacks": "ponytail ceiling:256patterns, clear-on-capacity. Failed compilations remain uncached; modifiers/binary keys distinguish entries. Match context,backtrack/depth limits,UTF/offset/error state and callback reentry stay per invocation. No dependency/new unsafe/JIT enablement."
+}

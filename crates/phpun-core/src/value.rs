@@ -77,8 +77,8 @@ const IDX_MIN: usize = 48;
 
 /// Dense scalar tables keep values inline. Exporting Cell handles or using
 /// a canonical Vec mutator materializes the same ordered Cell table once.
-/// ponytail: only zero-based scalar fills start packed; other producers and
-/// reference/mixed mutators retain Cells until measured storage work extends it.
+/// ponytail: scalar fills and dense scalar appends start packed; exported
+/// references/mixed mutators retain Cells, extend other producers only with measured gates.
 #[derive(Debug)]
 pub struct ArrayEntries(ArrayStorage);
 
@@ -150,6 +150,30 @@ impl ArrayEntries {
             ArrayStorage::Packed(p) => p.scalar.borrow().clone(),
         }
     }
+    pub(crate) fn packed_bools(&self) -> Option<Vec<bool>> {
+        let ArrayStorage::Packed(p) = &self.0 else {
+            return None;
+        };
+        p.scalar
+            .borrow()
+            .as_ref()?
+            .iter()
+            .map(|v| match v {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .collect()
+    }
+    pub(crate) fn replace_packed_bools(&mut self, values: &[bool]) {
+        let ArrayStorage::Packed(p) = &mut self.0 else {
+            unreachable!()
+        };
+        let slots = p.scalar.get_mut().as_mut().unwrap();
+        assert_eq!(slots.len(), values.len());
+        for (slot, value) in slots.iter_mut().zip(values) {
+            *slot = Value::Bool(*value);
+        }
+    }
     fn packed_get(&self, key: &ArrKey) -> Option<Option<Value>> {
         let ArrayStorage::Packed(p) = &self.0 else {
             return None;
@@ -163,6 +187,21 @@ impl ArrayEntries {
             _ => None,
         })
     }
+    fn append_packed_scalar(&mut self, value: &Value) -> bool {
+        // The sole caller proves a non-graph scalar before this storage mutation.
+        if matches!(&self.0, ArrayStorage::Cells(c) if c.is_empty()) {
+            *self = Self::packed(Vec::new());
+        }
+        let ArrayStorage::Packed(p) = &mut self.0 else {
+            return false;
+        };
+        let Some(values) = p.scalar.get_mut().as_mut() else {
+            return false;
+        };
+        values.push(value.clone());
+        true
+    }
+
     pub(crate) fn store_packed_scalar(&mut self, key: i64, value: &Value) -> bool {
         if key < 0
             || !matches!(
@@ -520,7 +559,31 @@ impl PhpArray {
         self.pos_of(k).map(|p| self.entries[p].1.clone())
     }
 
+    /// Dense scalar append needs no exported Cell. References/mixed storage keep the original path.
+    pub(crate) fn push_packed_scalar(&mut self, value: &Value) -> bool {
+        if !matches!(
+            value,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        ) || !self.packed
+            || i64::try_from(self.entries.len()).ok() != Some(self.next)
+        {
+            return false;
+        }
+        let Some(next) = self.next.checked_add(1) else {
+            return false;
+        };
+        if !self.entries.append_packed_scalar(value) {
+            return false;
+        }
+        self.next = next;
+        self.mem_note_append();
+        true
+    }
+
     pub fn push(&mut self, v: Value) {
+        if self.push_packed_scalar(&v) {
+            return;
+        }
         let k = ArrKey::Int(self.next);
         self.mem_note_key(&k);
         alloc_hit(9);
@@ -543,6 +606,9 @@ impl PhpArray {
             if self.entries.store_packed_scalar(*i, &v) {
                 return;
             }
+        }
+        if matches!(&k, ArrKey::Int(i) if *i == self.next) && self.push_packed_scalar(&v) {
+            return;
         }
         alloc_hit(9);
         self.set_cell(k, Rc::new(RefCell::new(v)));
@@ -2229,6 +2295,7 @@ pub struct PhpClass {
     /// prop_order — built once on first `new`: the seen/backed/order
     /// machinery is class-fixed so it needn't rerun per object.
     pub flat_props: std::cell::OnceCell<Rc<Vec<FlatProp>>>,
+    pub prop_order_template: std::cell::OnceCell<Rc<Vec<String>>>,
     /// Storage key → `flat_props` index, filled alongside `flat_props`:
     /// routes `prop_get`/`prop_insert` to `PhpObject.slots`.
     pub prop_slot: std::cell::OnceCell<Rc<HashMap<String, usize>>>,
@@ -2593,7 +2660,8 @@ pub struct PhpObject {
     pub props: HashMap<String, Cell>,
     /// Property order for var_dump/foreach output: declared keys in
     /// `flat_props` order, then dynamic inserts; `unset()` tombstones.
-    pub prop_order: Vec<String>,
+    /// Class-fixed names are shared; each mutator uses Rc::make_mut.
+    pub prop_order: Rc<Vec<String>>,
     /// PHP's per-process object handle counter.
     pub id: u64,
     /// Internal payload for builtin classes (e.g. Exception fields).

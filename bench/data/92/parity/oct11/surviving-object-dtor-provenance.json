@@ -1,0 +1,128 @@
+{
+  "source": "6b6339d2051665d3bd453be9fd61271d05c6e78c",
+  "runtime": "6e5a05e26691747ef9c942119815e6b1feae41e4",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 883122,
+        "bytes": 52873857
+      },
+      "after": {
+        "requests": 858127,
+        "bytes": 49974441
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26545498
+      },
+      "after": {
+        "requests": 616041,
+        "bytes": 26545502
+      }
+    }
+  ],
+  "binary_sha256": "7200f09b4d2792ea5aa5a1dd6af7cd6f0e2f9107519c4642f5b4b24c8d1026e9",
+  "scope": "After existing gc_note_purple/gc_note_dying callbacks, direct Object with currentRcstrong>1 cannot satisfy original destructor tally n+1 ownership test. Return before building held HashMap. Both GC calls/order preserved,final-owner/callable/capture/destructor/unwind paths unchanged. Four-line shared guard,no new storage/cache/pool/dependency/unsafe.",
+  "fallbacks": "Guard checks current count after GC callbacks can release owners. All non-object/final-owner paths retain existing tally and lifetime handling. ONEexisting receiver unit includes alias surviving owner thenfinal destructor S/D order;canonical nativecycle/destructor probe and previousGC/unwind/memory/alias checks reused.",
+  "serialized_gc_rechecks": [
+    {
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+          "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 8440
+        }
+      ]
+    },
+    {
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+          "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 8493
+        }
+      ]
+    }
+  ]
+}

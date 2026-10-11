@@ -1,0 +1,64 @@
+{
+  "source": "61f9d69da205ade2d9672debea31510606786c92",
+  "runtime": "61f9d69da205ade2d9672debea31510606786c92",
+  "tracked_clean": "report source tracked clean before artifact/report writes; only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1058129,
+        "bytes": 57271042
+      },
+      "after": {
+        "requests": 983133,
+        "bytes": 55272038
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636052,
+        "bytes": 26702518
+      },
+      "after": {
+        "requests": 636052,
+        "bytes": 26703402
+      }
+    },
+    {
+      "label": "json",
+      "before": {
+        "requests": 4360115,
+        "bytes": 296859462
+      },
+      "after": {
+        "requests": 4360115,
+        "bytes": 296860346
+      }
+    }
+  ],
+  "binary_sha256": "728111616dfe46fded60f712235536a9ff917c2150c5ad852cf7fb30d85cbddd",
+  "scope": "PhpObject shares the class-fixed property-order template through Rc<Vec<String>>. Existing order mutations use Rc::make_mut; slots, defaults and dynamic property values retain their existing independent storage. Standard-library sharing, no unsafe/new dependency.",
+  "fallbacks": "ONE existing receiver/constructor check proves template sharing and mutation isolation. Native probes cover inherited private keys, unset/reinsert, references, clone, serialize/unserialize and readonly behavior. Existing inherited AllowDynamicProperties gap is retained separately; corrected probe explicitly marks both classes.",
+  "build_head": "466240dd8d1521c42d8afb1b3280b4b87fcfa1e7",
+  "build_tracked_status": "format-only Rust patch present during build; committed unchanged as61f9d69 after build",
+  "build_patch": "object-order-cow-format-only.patch",
+  "whole_suite": "object-order-cow-whole.json"
+}

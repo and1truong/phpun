@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "2303232de9c7cea8f63e5a8f9a4a8a74766d44ea5e02b8d1f743e4f82bfe85e6",
+  "source": "b25286919dca43be420e55f36da0c61b45a11c1d",
+  "parent": "scalar-value-stack-review",
+  "summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "changes": []
+}

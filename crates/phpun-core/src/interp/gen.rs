@@ -313,7 +313,7 @@ impl<'a> Interp<'a> {
             class: cls,
             slots: Vec::new(),
             props: HashMap::new(),
-            prop_order: Vec::new(),
+            prop_order: Rc::new(Vec::new()),
             id: 0,
             internal: Some(ObjectInternal::Generator(state)),
             unset_props: std::collections::HashSet::new(),

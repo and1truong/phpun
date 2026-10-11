@@ -126,7 +126,7 @@ pub(crate) fn dispatch(
                     // (property_hooks/dump); int-keyed buckets decode
                     // to int keys.
                     let ob = o.borrow();
-                    for n in &ob.prop_order {
+                    for n in ob.prop_order.iter() {
                         if let Some(c) = ob.prop_get(n) {
                             let k = match crate::value::int_prop_index(n) {
                                 Some(i) => ArrKey::Int(i),

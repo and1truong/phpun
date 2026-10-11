@@ -1,0 +1,89 @@
+{
+  "source": "b261dfcd47b426092bd20fe3360926577d2b7139",
+  "runtime": "b261dfcd47b426092bd20fe3360926577d2b7139",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "borrowed-new-context",
+      "label": "gc77345-isolated",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 7933
+      }
+    },
+    {
+      "binary": "packed-scalar-append-guard-first",
+      "label": "gc77345-isolated",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8530
+      }
+    }
+  ],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 808127,
+        "bytes": 49724078
+      },
+      "after": {
+        "requests": 808127,
+        "bytes": 49723982
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26545106
+      },
+      "after": {
+        "requests": 616045,
+        "bytes": 25728098
+      }
+    }
+  ],
+  "binary_sha256": "03dce959cb54b999adc45331a53008afb460b8086e58bbe772069aba0d3a86c1",
+  "scope": "Reuse existing ArrayEntries packed scalar/lazy Cell storage for empty or still-unboxed dense scalar appends (next==length); PhpArray push/set share the same helper and original memory bookkeeping. Root-variable AST append enters only after existing container/detach/read-only/diagnostic checks and no reference binding. Closed scalar and append-key guards run first so graph values retain the original path promptly. No new layout, representation backend, allocator, cache, dependency or unsafe.",
+  "fallbacks": "Exported Cells, references, graph values, mixed/sparse keys, compound/deferred/detached writes, properties, superglobals and handlers keep the original path. CoW, next-key overflow, logical array footprint, foreach positions and Cell identities stay canonical. Sequential packed integer keys make mem_note_key a no-op; the shared mem_note_append charge remains. ONE existing packed storage check proves activation,CoW,reference export,mixed fallback and native output."
+}

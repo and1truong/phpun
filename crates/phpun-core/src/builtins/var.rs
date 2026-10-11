@@ -338,7 +338,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 live,
                 tail
             ));
-            for n in &ob.prop_order {
+            for n in ob.prop_order.iter() {
                 if is_dt && (n.starts_with("\0dt\0") || n.starts_with("\0tz\0")) {
                     continue;
                 }
@@ -675,7 +675,7 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
             let mut s = format!("{} Object\n", ob.class.name());
             s.push_str(&"    ".repeat(indent));
             s.push_str("(\n");
-            for n in &ob.prop_order {
+            for n in ob.prop_order.iter() {
                 if let Some(c) = ob.prop_get(n) {
                     // Int-keyed buckets print their bare index;
                     // other props annotate visibility like zend:
@@ -1407,7 +1407,7 @@ pub(crate) fn php_unserialize(
                         let mut ob = obj.borrow_mut();
                         let key = i.to_string();
                         if !ob.prop_order.contains(&key) {
-                            ob.prop_order.push(key.clone());
+                            Rc::make_mut(&mut ob.prop_order).push(key.clone());
                         }
                         ob.prop_insert(key, v);
                         continue;
@@ -1513,7 +1513,7 @@ pub(crate) fn php_unserialize(
                         // (array) keep the chain.
                         let m = cell(previous.clone().unwrap_or(Value::Null));
                         if !ob.prop_order.contains(&prev_slot) {
-                            ob.prop_order.push(prev_slot.clone());
+                            Rc::make_mut(&mut ob.prop_order).push(prev_slot.clone());
                         }
                         ob.prop_insert(prev_slot.clone(), m);
                         continue;
@@ -1521,7 +1521,7 @@ pub(crate) fn php_unserialize(
                 }
                 let key = canon.unwrap_or_else(|| crate::value::lossy(&ks).into_owned());
                 if !ob.prop_order.contains(&key) {
-                    ob.prop_order.push(key.clone());
+                    Rc::make_mut(&mut ob.prop_order).push(key.clone());
                 }
                 ob.prop_insert(key, v);
             }

@@ -1,0 +1,20 @@
+{
+  "summary": {
+    "total": 2,
+    "passed": 0,
+    "failed": 2,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 0,
+    "unsupported": 0,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 2,
+    "compatibility_pct": 0.00
+  },
+  "results": [
+    {"file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/errors05.phpt", "name": "Test preg_match() function : error conditions - jit stacklimit exhausted", "status": "fail", "reason": "", "duration_ms": 51},
+    {"file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/preg_match_error3.phpt", "name": "Test preg_match() function : error conditions - jit stacklimit exhausted", "status": "fail", "reason": "", "duration_ms": 51}
+  ]
+}

@@ -6,6 +6,8 @@
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(in crate::interp) mod native;
 
+mod bool_loop;
+
 use std::cmp::Ordering;
 use std::rc::Rc;
 
@@ -174,6 +176,12 @@ struct CachedProp {
 }
 
 enum Op {
+    BoolLoop {
+        end: usize,
+        executions: std::cell::Cell<u64>,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        native: std::cell::OnceCell<Option<native::Program>>,
+    },
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
     Canonical(Box<Expr>),
@@ -850,6 +858,12 @@ impl Compiler {
                 inc,
                 body,
             } => {
+                let region = self.emit(Op::BoolLoop {
+                    end: 0,
+                    executions: std::cell::Cell::new(0),
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    native: std::cell::OnceCell::new(),
+                });
                 for e in init {
                     self.expr(e)?;
                     self.emit(Op::Pop);
@@ -884,6 +898,11 @@ impl Compiler {
                 }
                 if let Some(jf) = jf {
                     self.patch(jf, end);
+                }
+                if bool_loop::eligible(&self.ops[region + 1..end]) {
+                    if let Op::BoolLoop { end: target, .. } = &mut self.ops[region] {
+                        *target = end;
+                    }
                 }
             }
             Stmt::Break(level) | Stmt::Continue(level) => {
@@ -1809,21 +1828,7 @@ impl<'a> Interp<'a> {
             f.scope_class = None;
             f.called_class = None;
             f.decl_class = None;
-            for c in fa.drain(..) {
-                // Only uniquely owned, untracked scalar cells can be reused.
-                // Trace snapshots, references and captures keep their cells.
-                if self.vm_scalar_cell_pool.len() < 256
-                    && Rc::strong_count(&c) == 1
-                    && Rc::weak_count(&c) == 0
-                    && matches!(
-                        &*c.borrow(),
-                        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
-                    )
-                {
-                    *c.borrow_mut() = Value::Null;
-                    self.vm_scalar_cell_pool.push(c);
-                }
-            }
+            self.vm_recycle_scalar_cells(fa.drain(..));
             if self.vm_cell_pool.len() < 64 {
                 self.vm_cell_pool.push(fa);
             }
@@ -2087,6 +2092,20 @@ impl<'a> Interp<'a> {
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
+                Op::BoolLoop {
+                    end, executions, ..
+                } => {
+                    if *end > pc && vs.is_empty() {
+                        if let Some(line) = self.vm_bool_loop(comp, slots, pc + 1, *end)? {
+                            executions.set(executions.get().saturating_add(1));
+                            self.cur_line = line;
+                            self.send_line = None;
+                            self.last_ret_cell = None;
+                            pc = *end;
+                            continue;
+                        }
+                    }
+                }
                 Op::Const(v) => vs.push(v.clone()),
                 Op::Foreach {
                     arr,
@@ -2639,8 +2658,7 @@ impl<'a> Interp<'a> {
                     ..
                 } => {
                     let n = *argc as usize;
-                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
-                    argv.extend(vs.drain(vs.len() - n..));
+                    let start = vs.len() - n;
                     // Direct hits bypass invoke_fn — arg values become
                     // the frame's cells inside vm_run_direct. send_line
                     // still pins this call site: call_site() reads it
@@ -2656,16 +2674,15 @@ impl<'a> Interp<'a> {
                         && matches!(target, CachedFn::Builtin)
                     {
                         self.send_line = Some(*site);
-                        if let Some(value) = self.vm_scalar_builtin(lname, &argv) {
-                            argv.clear();
-                            if self.vm_val_pool.len() < 64 {
-                                self.vm_val_pool.push(argv);
-                            }
+                        if let Some(value) = self.vm_scalar_builtin(lname, &vs[start..]) {
+                            vs.truncate(start);
                             vs.push(value);
                             pc += 1;
                             continue;
                         }
                     }
+                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+                    argv.extend(vs.drain(start..));
                     if comp.top_level {
                         // Callees may unset/rebind globals or run GC. Slot
                         // handles must not pin old bindings during the call.
@@ -3234,20 +3251,43 @@ impl<'a> Interp<'a> {
 
     /// Cells for args taking the canonical bind path — scalar cells come
     /// from the recycle pool like the value-ABI teardown fills it.
+    pub(in crate::interp) fn vm_scalar_arg(&mut self, value: Value) -> Cell {
+        if matches!(
+            value,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+        ) {
+            if let Some(c) = self.vm_scalar_cell_pool.pop() {
+                *c.borrow_mut() = value;
+                return c;
+            }
+        }
+        cell(value)
+    }
+
+    // ponytail: retain at most256 scalar cells; raise this existing pool cap
+    // only if allocation profiles show larger live argument sets churn it.
+    pub(in crate::interp) fn vm_recycle_scalar_cells(&mut self, cells: impl Iterator<Item = Cell>) {
+        for c in cells {
+            // Same existing VM pool: owners, references, weak anchors and
+            // trace/capture snapshots keep their identities outside it.
+            if self.vm_scalar_cell_pool.len() < 256
+                && Rc::strong_count(&c) == 1
+                && Rc::weak_count(&c) == 0
+                && matches!(
+                    &*c.borrow(),
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                )
+            {
+                *c.borrow_mut() = Value::Null;
+                self.vm_scalar_cell_pool.push(c);
+            }
+        }
+    }
+
+    /// Cells for args taking the canonical bind path, using the same scalar pool.
     fn vm_arg_cells(&mut self, argv: &mut Vec<Value>) -> Vec<Cell> {
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
-        cells.extend(argv.drain(..).map(|value| {
-            if matches!(
-                value,
-                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
-            ) {
-                if let Some(c) = self.vm_scalar_cell_pool.pop() {
-                    *c.borrow_mut() = value;
-                    return c;
-                }
-            }
-            cell(value)
-        }));
+        cells.extend(argv.drain(..).map(|value| self.vm_scalar_arg(value)));
         cells
     }
 
@@ -3741,10 +3781,15 @@ impl<'a> Interp<'a> {
                 .last()
                 .is_some_and(|top| top.size.saturating_sub(top.used) >= span)
         {
-            if let Some(value) = builtins::call_scalar(lname, argv) {
-                let mut args = super::CallArgs::empty();
-                self.vm_call_reserve(&mut args, argv.len() as u64);
-                self.vm_frame_free(&args.vm_sites);
+            if let Some(value) = builtins::call_scalar(self, lname, argv) {
+                // Exact typed kernels cannot observe this already-proven fit.
+                // Reuse float-leaf repayment; result string charges stay canonical.
+                let want = super::VM_FRAME_SLOTS + argv.len() as u64;
+                let top = self.vm_stack.last_mut()?;
+                let key = Rc::as_ptr(&top.tok) as usize;
+                top.used += span;
+                Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
+                self.scalar_builtin_oom(lname, argv, true);
                 return Some(value);
             }
         }
@@ -3926,6 +3971,135 @@ var_dump($count, $b[2], $c[0]);
             };
             assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
         }
+        let mut append = Interp::new("packed-append.php");
+        let stmts = crate::parser::parse_source(
+            r#"<?php
+$a=[];for($i=0;$i<8;$i++)$a[]=$i*2;
+$b=$a;$b[]=99;
+$c=$a;$r=&$c[2];$r=7;
+$d=[];$d[]=1;$d['x']=2;$d[]=3;
+echo json_encode([$a,$b,$c,$d]),"\n";
+"#,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            append.exec_block(&stmts),
+            super::super::Flow::Normal
+        ));
+        assert_eq!(append.out, b"[[0,2,4,6,8,10,12,14],[0,2,4,6,8,10,12,14,99],[0,2,7,6,8,10,12,14],{\"0\":1,\"x\":2,\"1\":3}]\n");
+        for (name, inline) in [("a", true), ("b", true), ("c", false), ("d", false)] {
+            let super::Value::Array(a) = append.globals.vars[name].borrow().clone() else {
+                panic!("array");
+            };
+            assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
+            if inline {
+                let key = super::Rc::as_ptr(&a) as usize;
+                let table = a.borrow();
+                assert_eq!(
+                    append.mem_tracked.get(&key).map(|charge| charge.table_req),
+                    Some(Interp::ht_req(table.entries.len(), table.packed)),
+                    "dense append and CoW tables must retain canonical memory tracking: {name}"
+                );
+            }
+        }
+        let mut regions = Interp::new("bool-regions.php");
+        let result = regions.run_source(
+            r#"<?php
+function typed_region() {
+ $a=array_fill(0, 12, true);
+ for ($i=2; $i<12; $i++) { for ($j=$i*2; $j<12; $j+=$i) $a[$j]=false; }
+ $count=0; for ($i=2; $i<12; $i++) if ($a[$i]) $count++;
+ return $count;
+}
+function shared_region() {
+ $a=array_fill(0, 4, true); $copy=$a;
+ for ($i=0; $i<4; $i++) $a[$i]=false;
+ return json_encode([$a,$copy]);
+}
+function overflow_region() {
+ $a=array_fill(0,1,true); $v=PHP_INT_MAX;
+ for ($i=0; $i<1; $i++) { $a[$i]=false; $v++; }
+ return json_encode([$a,is_float($v)]);
+}
+function bounded_region() {
+ $a=array_fill(0,1048577,true); $count=0;
+ for($i=0;$i<1;$i++) if($a[$i]) $count++;
+ return $count;
+}
+function bounds_region() {
+ $a=array_fill(0,1,true);
+ for($i=0;$i<2;$i++) $a[$i]=false;
+ return json_encode($a);
+}
+function infinite_region() { $a=array_fill(0,1,true); for(;;) $a[0]=false; }
+echo typed_region(),"\n",shared_region(),"\n",overflow_region(),"\n",bounded_region(),"\n",bounds_region(),"\n";
+"#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", regions.err_buf);
+        assert_eq!(regions.err_buf, "");
+        assert_eq!(
+            regions.out,
+            b"5\n[[false,false,false,false],[true,true,true,true]]\n[[false],true]\n1\n[false,false]\n"
+        );
+        let decl = regions.functions["typed_region"].clone();
+        let compiled = regions.vm_compiled(&decl).unwrap();
+        assert!(compiled.ops.iter().any(|op| matches!(op,
+            super::Op::BoolLoop { executions, .. } if executions.get() > 0)));
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        assert!(compiled.ops.iter().any(|op| matches!(op,
+            super::Op::BoolLoop { native, .. }
+                if native.get().and_then(Option::as_ref).is_some_and(|p| p.executions.get() > 0))));
+        for name in [
+            "shared_region",
+            "overflow_region",
+            "bounded_region",
+            "bounds_region",
+        ] {
+            let decl = regions.functions[name].clone();
+            let compiled = regions.vm_compiled(&decl).unwrap();
+            assert!(
+                compiled.ops.iter().all(|op| !matches!(op,
+                super::Op::BoolLoop { executions, .. } if executions.get() > 0)),
+                "{name}"
+            );
+        }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            for name in ["overflow_region", "bounds_region"] {
+                let decl = regions.functions[name].clone();
+                let compiled = regions.vm_compiled(&decl).unwrap();
+                assert!(compiled.ops.iter().any(|op| matches!(op,
+                    super::Op::BoolLoop { native, .. } if native.get().and_then(Option::as_ref).is_some())), "{name}");
+            }
+            let decl = regions.functions["infinite_region"].clone();
+            let compiled = regions.vm_compiled(&decl).unwrap();
+            let (marker, end) = compiled
+                .ops
+                .iter()
+                .enumerate()
+                .find_map(|(pc, op)| match op {
+                    super::Op::BoolLoop { end, .. } if *end > pc => Some((pc, *end)),
+                    _ => None,
+                })
+                .unwrap();
+            let program =
+                super::native::Program::region(&regions, &compiled, marker + 1, end).unwrap();
+            let mut raw = vec![[0i64; 2]; compiled.nslots];
+            let mut private = vec![true];
+            let mut line = 0;
+            assert!(!program.run_region(&mut raw, &mut private, &mut line));
+            assert_eq!(private, [false]);
+            drop(program);
+            drop(compiled);
+            assert!(regions.native_regions_bytes.get() > 0);
+            regions.compiled_fns.clear();
+            // The earlier typed_region handle deliberately still owns one map.
+            assert!(regions.native_regions_bytes.get() > 0);
+        }
+        drop(compiled);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        assert_eq!(regions.native_regions_bytes.get(), 0);
     }
 
     #[test]
@@ -4408,6 +4582,35 @@ try { rem_zero(9,0); } catch (DivisionByZeroError $e) { echo $e->getMessage(), "
 
     #[test]
     fn canonical_frames_reuse_boxes_and_release_php_owners() {
+        let mut ledger = Interp::new("weak-ledger.php");
+        let owner = super::Rc::new(7u64);
+        let key = super::Rc::as_ptr(&owner) as usize;
+        ledger.mem_track(&owner, 112);
+        assert_eq!(super::Rc::strong_count(&owner), 1);
+        assert_eq!(ledger.mem_tracked[&key].probe.strong_count(), 1);
+        assert!(ledger.mem_tracked[&key]
+            .probe
+            .upgrade()
+            .unwrap()
+            .is::<u64>());
+        let alias = owner.clone();
+        assert_eq!(ledger.mem_tracked[&key].probe.strong_count(), 2);
+        drop(alias);
+        ledger.mem_realloc(&owner, 512);
+        assert_eq!(ledger.mem_tracked[&key].table_req, 512);
+        let charged = ledger.mem_tracked[&key].inner;
+        ledger.mem_credit(&owner, 112);
+        assert!(ledger.mem_tracked[&key].inner < charged);
+        drop(owner);
+        assert_eq!(ledger.mem_tracked[&key].probe.strong_count(), 0);
+        ledger.mem_sweep();
+        assert!(!ledger.mem_tracked.contains_key(&key));
+        let owner = super::Rc::new(std::cell::RefCell::new(super::Value::Int(3)));
+        let key = super::Rc::as_ptr(&owner) as usize;
+        ledger.mem_track(&owner, 64);
+        assert_eq!(super::Rc::strong_count(&owner), 1);
+        ledger.mem_retire(&owner);
+        assert!(!ledger.mem_tracked.contains_key(&key));
         let mut it = Interp::new("pool.php");
         let result = it.run_source(
             r#"<?php
@@ -4560,6 +4763,10 @@ class ValueCtorArgs {
  function __construct(public float $x, public string $s="d") { echo json_encode(func_get_args()), "\n"; }
 }
 class ValueCtorRef { function __construct(&$x) { $x++; } }
+class ValueCtorRefChild extends ValueCtorRef {}
+try { new ValueCtorRefChild(3); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+try { new class(3) { function __construct(&$x) {} }; } catch (Error $e) { echo $e->getMessage(), "\n"; }
+
 $a = new ValueCtor(3, 4); $weak = WeakReference::create($a);
 echo json_encode($a->values()), "\n";
 $b = new ValueCtorChild; echo json_encode($b->values()), "\n";
@@ -4567,18 +4774,45 @@ new ValueCtorArgs(4); new ValueCtorArgs(5, "ok");
 $x=1; new ValueCtorRef($x); echo $x, "\n";
 try { new ValueCtor("bad", 2); } catch (TypeError $e) { echo get_class($e), "\n"; }
 unset($a); var_dump($weak->get());
+class ReceiverDtor { function __destruct() { echo "D\n"; } }
+$a = new ReceiverDtor; $b = $a; unset($a); echo "S\n"; unset($b);
 "#,
         );
         assert_eq!(result.exit_code, 0, "{}", constructors.err_buf);
         assert_eq!(constructors.err_buf, "");
         assert_eq!(
             constructors.out,
-            b"[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\n"
+            b"ValueCtorRef::__construct(): Argument #1 ($x) could not be passed by reference\nclass@anonymous(): Argument #1 ($x) could not be passed by reference\n[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\nS\nD\n"
         );
         let super::Value::Object(object) = constructors.instantiate("valuector", &[]).unwrap()
         else {
             panic!("object")
         };
+        let super::Value::Object(other) = constructors.instantiate("valuector", &[]).unwrap()
+        else {
+            panic!("object");
+        };
+        assert_eq!(
+            std::mem::size_of_val(&object.borrow().slots[0]),
+            std::mem::size_of::<usize>(),
+            "ordinary declared-property slots stay one pointer"
+        );
+        assert!(super::Rc::ptr_eq(
+            &object.borrow().prop_order,
+            &other.borrow().prop_order
+        ));
+        {
+            let mut first = object.borrow_mut();
+            super::Rc::make_mut(&mut first.prop_order).push("extra".into());
+            first.prop_insert("extra", super::cell(super::Value::Int(1)));
+        }
+        assert!(!super::Rc::ptr_eq(
+            &object.borrow().prop_order,
+            &other.borrow().prop_order
+        ));
+        assert!(object.borrow().prop_has("extra"));
+        assert!(!other.borrow().prop_order.iter().any(|key| key == "extra"));
+        assert!(!other.borrow().prop_has("extra"));
         let target = constructors
             .vm_method_target(object, "__construct", &std::cell::RefCell::new(None), 1)
             .expect("empty promoted constructor retains direct target");
@@ -4597,9 +4831,67 @@ unset($a); var_dump($weak->get());
             super::cell(super::Value::Int(3)),
             super::cell(super::Value::Float(4.0)),
         ]);
+        let argument_ids: Vec<_> = args.cells.iter().map(super::Rc::as_ptr).collect();
         fresh.vm_call_reserve(&mut args, 2);
         let before: Vec<_> = fresh.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let object = fresh.new_instance("FreshFloat", args).unwrap();
+        assert_eq!(fresh.vm_scalar_cell_pool.len(), 2);
+        assert!(fresh
+            .vm_scalar_cell_pool
+            .iter()
+            .all(|c| argument_ids.contains(&super::Rc::as_ptr(c))));
+        let reused = fresh.vm_scalar_arg(super::Value::Int(11));
+        assert!(argument_ids.contains(&super::Rc::as_ptr(&reused)));
+        assert!(matches!(*reused.borrow(), super::Value::Int(11)));
+        let weak = super::Rc::downgrade(&reused);
+        fresh.vm_recycle_scalar_cells(std::iter::once(reused));
+        assert!(
+            weak.upgrade().is_none(),
+            "weak-address observers must prevent recycling"
+        );
+        let shared = fresh.vm_scalar_arg(super::Value::Int(12));
+        let retained = shared.clone();
+        fresh.vm_recycle_scalar_cells(std::iter::once(shared));
+        assert_eq!(super::Rc::strong_count(&retained), 1);
+        assert!(matches!(*retained.borrow(), super::Value::Int(12)));
+
+        let super::Value::Object(inline) = &object else {
+            panic!("object")
+        };
+        let index = inline.borrow().decl_slot("y").unwrap();
+        assert!(matches!(
+            inline.borrow().slots[index]
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .clone(),
+            super::Value::Float(4.0)
+        ));
+        let alias = inline.borrow().prop_get("y").unwrap();
+        let canonical = inline.borrow().prop_get("y").unwrap();
+        assert!(super::Rc::ptr_eq(&alias, &canonical));
+        *alias.borrow_mut() = super::Value::Float(8.0);
+        assert!(
+            matches!(
+                inline.borrow().slots[index]
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .clone(),
+                super::Value::Float(8.0)
+            ),
+            "direct read must use the canonical cell after alias mutation"
+        );
+        let super::Value::Object(copy) = fresh.clone_object(inline).unwrap() else {
+            panic!("clone")
+        };
+        let copied = copy.borrow().prop_get("y").unwrap();
+        assert!(!super::Rc::ptr_eq(&copied, &alias));
+        *copied.borrow_mut() = super::Value::Float(9.0);
+        assert!(matches!(*alias.borrow(), super::Value::Float(8.0)));
+        assert!(copy.borrow_mut().prop_take("y").is_some());
+        assert!(!copy.borrow().prop_has("y"));
+
         assert!(
             fresh.vm_frame_pool.is_empty(),
             "fresh float promotions bypass canonical frames"
@@ -4711,6 +5003,23 @@ unset($e); unset($h); var_dump($wh->get());
 
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
+        let mut stacked = Interp::new("stacked-scalar.php");
+        let stmts = crate::parser::parse_source(
+            r#"<?php $out=0;for($i=0;$i<4;$i++) {$out+=sqrt(sqrt(81));$text=substr(strtolower("ABCD"),1,2);}echo $out,":",$text;"#,
+            false,
+        ).unwrap();
+        assert!(matches!(
+            stacked.vm_top_exec(&stmts),
+            Some(super::super::Flow::Normal)
+        ));
+        assert_eq!(stacked.out, b"12:bc");
+        assert_eq!(stacked.err_buf, "");
+        assert_eq!(
+            stacked.vm_val_pool.len(),
+            1,
+            "only the value-stack vector, no scalar argument-vector lease"
+        );
+        assert!(stacked.vm_val_pool[0].is_empty());
         {
             let mut limits = Interp::new("limit.php");
             limits.ini.insert("memory_limit".into(), "128M".into());
@@ -4720,7 +5029,88 @@ unset($e); unset($h); var_dump($wh->get());
             assert!(limits.mem_exceeded);
         }
         let mut it = Interp::new("arena.php");
+        it.mem_sweep();
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
+        let scalar_charges = it.mem_tracked.len();
+        let source = super::Value::str("abcd");
+        for args in [
+            vec![source.clone(), super::Value::Int(0)],
+            vec![source.clone(), super::Value::Int(-4)],
+            vec![
+                source.clone(),
+                super::Value::Int(-8),
+                super::Value::Int(100),
+            ],
+        ] {
+            let value = it.vm_scalar_builtin("substr", &args).unwrap();
+            let (super::Value::Str(original), super::Value::Str(result)) = (&source, value) else {
+                panic!("strings")
+            };
+            assert!(
+                super::Rc::ptr_eq(&original.rc, &result.rc),
+                "whole range retains source identity"
+            );
+            assert_eq!(
+                it.mem_tracked.len(),
+                scalar_charges,
+                "no new full-range charge"
+            );
+        }
+        for _ in 0..20 {
+            assert!(matches!(
+                it.vm_scalar_builtin("sqrt", &[super::Value::Int(9)]),
+                Some(super::Value::Float(3.0))
+            ));
+            let value = it
+                .vm_scalar_builtin(
+                    "substr",
+                    &[source.clone(), super::Value::Int(1), super::Value::Int(2)],
+                )
+                .unwrap();
+            assert!(matches!(value, super::Value::Str(ref s) if &s[..] == b"bc"));
+            let super::Value::Str(ref result) = value else {
+                unreachable!()
+            };
+            assert!(
+                it.mem_tracked
+                    .contains_key(&(super::Rc::as_ptr(&result.rc) as usize)),
+                "substring result must be charged while still live"
+            );
+            assert_eq!(
+                it.mem_tracked.len(),
+                scalar_charges + 1,
+                "one result allocation, no temporary call site"
+            );
+            drop(value);
+            it.mem_sweep();
+        }
+        assert_eq!(
+            it.mem_tracked.len(),
+            scalar_charges,
+            "fit scalar calls need no temporary site charge"
+        );
+        assert_eq!(
+            it.vm_stack
+                .iter()
+                .map(|s| (s.size, s.used))
+                .collect::<Vec<_>>(),
+            initial
+        );
+        assert!(it
+            .vm_scalar_builtin("sqrt", &[super::Value::str("9")])
+            .is_none());
+        let last = it.vm_stack.last_mut().unwrap();
+        let old_used = last.used;
+        last.used = last.size;
+        assert!(it
+            .vm_scalar_builtin("sqrt", &[super::Value::Int(9)])
+            .is_none());
+        assert_eq!(
+            it.vm_stack.last().unwrap().used,
+            it.vm_stack.last().unwrap().size
+        );
+        it.vm_stack.last_mut().unwrap().used = old_used;
+
         let frame = it.frame_new("direct");
         it.stack.push(frame);
         let charges = it.mem_tracked.len();
@@ -4754,5 +5144,18 @@ unset($e); unset($h); var_dump($wh->get());
         );
         assert!(it.mem_tracked.values().all(|charge| charge.vm.is_none()));
         assert!(it.vm_frame_pool.iter().all(|frame| frame.vm_span.is_none()));
+        let mut overlap = Interp::new("substr-overlap.php");
+        let result = overlap.run_source(r#"<?php ini_set('memory_limit','4M'); $s=str_repeat('a',1500000); for($i=0;$i<3;$i++) {$t=substr($s,0,1300000);echo strlen($t),"\n";}"#);
+        assert_eq!(result.exit_code, 255, "{}", overlap.err_buf);
+        let output = String::from_utf8_lossy(&overlap.out);
+        assert_eq!(output.lines().next(), Some("1300000"));
+        assert!(
+            output.contains("tried to allocate 1302528 bytes"),
+            "{output}"
+        );
+        assert!(
+            output.contains(": substr("),
+            "missing builtin OOM frame: {output}"
+        );
     }
 }

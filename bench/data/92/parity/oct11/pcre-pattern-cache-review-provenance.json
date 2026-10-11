@@ -1,0 +1,71 @@
+{
+  "source": "0217e12b545f31bf38b94aae3cb45a3b3ad6d3b7",
+  "runtime": "0217e12b545f31bf38b94aae3cb45a3b3ad6d3b7",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "pcre-pattern-cache",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8195
+      },
+      "artifact": "pcre-pattern-cache-review-recheck-pcre-pattern-cache-gc77345-isolated.json"
+    },
+    {
+      "binary": "pcre-pattern-cache-review",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8595
+      },
+      "artifact": "pcre-pattern-cache-review-recheck-pcre-pattern-cache-review-gc77345-isolated.json"
+    }
+  ],
+  "physical_allocations": [],
+  "binary_sha256": "2ccbf3dcb3ebb3dea0394e05fb8350b614d552f632b6e19fe71dd9e3f162a9df",
+  "scope": "Review correction to#333: reset_request clears request-derived pattern keys and compiled native code in warm workers, not only Interp destruction.",
+  "fallbacks": "Same bounded256 cache/canonical misses and per-invocation limits/UTF/error state. ponytail comment now names byte-budgeted LRU upgrade when measured real working sets exceed the ceiling."
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "name": "php",
+    "exit": 0,
+    "stdout": "1500000\n1500000\n1500000\n1500000\n1500000\n1500000\n1234\n",
+    "stderr": ""
+  },
+  {
+    "name": "oldparent",
+    "exit": 255,
+    "stdout": "\nFatal error: Allowed memory size of 4194304 bytes exhausted (tried to allocate 1503232 bytes) in /workspace/parity92/oct11/substr-full-range-review.php on line 4\nStack trace:\n#0 /workspace/parity92/oct11/substr-full-range-review.php(4): substr('aaaaaaaaaaaaaaa...', 0)\n#1 {main}\n",
+    "stderr": ""
+  },
+  {
+    "name": "candidate",
+    "exit": 0,
+    "stdout": "1500000\n1500000\n1500000\n1500000\n1500000\n1500000\n1234\n",
+    "stderr": ""
+  }
+]
