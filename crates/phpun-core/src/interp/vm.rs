@@ -4742,6 +4742,11 @@ unset($a); var_dump($weak->get());
         else {
             panic!("object");
         };
+        assert_eq!(
+            std::mem::size_of_val(&object.borrow().slots[0]),
+            std::mem::size_of::<usize>(),
+            "ordinary declared-property slots stay one pointer"
+        );
         assert!(super::Rc::ptr_eq(
             &object.borrow().prop_order,
             &other.borrow().prop_order
