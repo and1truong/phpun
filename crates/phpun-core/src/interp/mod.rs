@@ -515,6 +515,7 @@ pub struct Interp<'a> {
     pub(crate) json_enc_stack: Vec<usize>,
     /// Set by the preg_* builtins for preg_last_error().
     pub last_preg_error: i64,
+    pub(crate) pcre_jit_stack: Option<crate::pcre::JitStack>,
     pub(crate) pcre_patterns: HashMap<Vec<u8>, Rc<crate::builtins::pcre::PhpRe>>,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
     /// pointer) proven fully valid UTF-8 — /u preg calls skip
@@ -1859,6 +1860,7 @@ impl<'a> Interp<'a> {
             json_enc_stack: Vec::new(),
             last_preg_error: 0,
             pcre_patterns: HashMap::new(),
+            pcre_jit_stack: None,
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
@@ -2018,6 +2020,7 @@ impl<'a> Interp<'a> {
             deadline: None,
             deadline_secs: 0,
             ini: HashMap::from([
+                ("pcre.jit".into(), "1".into()),
                 ("error_reporting".to_string(), "30719".to_string()),
                 // Zend's compiled-in default (hardcoded in main/php.ini).
                 ("memory_limit".to_string(), "128M".to_string()),
