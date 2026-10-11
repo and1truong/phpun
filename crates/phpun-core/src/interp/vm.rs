@@ -3783,7 +3783,7 @@ impl<'a> Interp<'a> {
                 .last()
                 .is_some_and(|top| top.size.saturating_sub(top.used) >= span)
         {
-            if let Some(value) = builtins::call_scalar(lname, argv) {
+            if let Some(value) = builtins::call_scalar(self, lname, argv) {
                 // Exact typed kernels cannot observe this already-proven fit.
                 // Reuse float-leaf repayment; result string charges stay canonical.
                 let want = super::VM_FRAME_SLOTS + argv.len() as u64;
@@ -4990,6 +4990,13 @@ unset($e); unset($h); var_dump($wh->get());
                 )
                 .unwrap();
             assert!(matches!(value, super::Value::Str(ref s) if &s[..] == b"bc"));
+            let super::Value::Str(ref result) = value else { unreachable!() };
+            assert!(it.mem_tracked.contains_key(&(super::Rc::as_ptr(&result.rc) as usize)),
+                "substring result must be charged while still live");
+            assert_eq!(it.mem_tracked.len(), scalar_charges + 1,
+                "one result allocation, no temporary call site");
+            drop(value);
+            it.mem_sweep();
         }
         assert_eq!(
             it.mem_tracked.len(),
@@ -5051,5 +5058,11 @@ unset($e); unset($h); var_dump($wh->get());
         );
         assert!(it.mem_tracked.values().all(|charge| charge.vm.is_none()));
         assert!(it.vm_frame_pool.iter().all(|frame| frame.vm_span.is_none()));
+        let mut overlap = Interp::new("substr-overlap.php");
+        let result = overlap.run_source(r#"<?php ini_set('memory_limit','4M'); $s=str_repeat('a',1500000); for($i=0;$i<3;$i++) {$t=substr($s,0,1300000);echo strlen($t),"\n";}"#);
+        assert_eq!(result.exit_code, 255, "{}", overlap.err_buf);
+        let output = String::from_utf8_lossy(&overlap.out);
+        assert_eq!(output.lines().next(), Some("1300000"));
+        assert!(output.contains("tried to allocate 1302528 bytes"), "{output}");
     }
 }

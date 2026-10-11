@@ -162,13 +162,13 @@ const FAMILIES: &[Dispatch] = &[
 
 /// Exact primitive kernels: no coercion, PHP callback, warning or type/arity
 /// failure. Callers retain the canonical arena and deferred-error protocol.
-pub(crate) fn call_scalar(name: &str, args: &[Value]) -> Option<Value> {
+pub(crate) fn call_scalar(it: &mut Interp, name: &str, args: &[Value]) -> Option<Value> {
     Some(match (name, args) {
         ("sqrt", [Value::Float(n)]) => math::sqrt_value(*n),
         ("sqrt", [Value::Int(n)]) => math::sqrt_value(*n as f64),
-        ("substr", [Value::Str(s), Value::Int(start)]) => string::substr_value(s, *start, None),
+        ("substr", [Value::Str(s), Value::Int(start)]) => string::substr_value(it, s, *start, None),
         ("substr", [Value::Str(s), Value::Int(start), Value::Int(len)]) => {
-            string::substr_value(s, *start, Some(*len))
+            string::substr_value(it, s, *start, Some(*len))
         }
         ("str_replace" | "str_ireplace", [Value::Str(f), Value::Str(r), Value::Str(s)]) => {
             string::replace_value(f, r, s, name == "str_ireplace")

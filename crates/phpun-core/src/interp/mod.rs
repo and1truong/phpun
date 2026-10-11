@@ -7871,7 +7871,7 @@ impl<'a> Interp<'a> {
             for (value, cell) in values.iter_mut().zip(&args.cells) {
                 *value = cell.borrow().clone();
             }
-            if let Some(value) = builtins::call_scalar(name, &values[..args.cells.len()]) {
+            if let Some(value) = builtins::call_scalar(self, name, &values[..args.cells.len()]) {
                 return Ok(Some(value));
             }
         }
