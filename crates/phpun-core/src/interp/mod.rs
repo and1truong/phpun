@@ -375,8 +375,8 @@ pub struct Interp<'a> {
     #[allow(clippy::vec_box)]
     stack: Vec<Box<Frame>>,
     pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
-    /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
-    /// the stored Rc keeps the decl alive so the pointer can't recycle.
+    /// VM bodies keyed by declaration Rc pointer; the stored Rc keeps the
+    /// declaration alive, including native cache keys, so pointers cannot recycle.
     compiled_fns: crate::value::FxMap<usize, vm::CompileCacheEntry>,
     /// One function declaration per method identity, shared by every dispatch path.
     /// Retain the method metadata so its address cannot recycle into another entry.

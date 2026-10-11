@@ -1,0 +1,200 @@
+   Compiling phpun-core v0.0.0 (/workspace/phpun-native-asan-check/crates/phpun-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.55s
+     Running unittests src/lib.rs (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727)
+
+running 1 test
+=================================================================
+==100468==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7d11279e6c20 at pc 0x56551d77d28c bp 0x7ba124e9af10 sp 0x7ba124e9a6d0
+READ of size 4096 at 0x7d11279e6c20 thread T2
+    #0 0x56551d77d28b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x9cf28b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #1 0x56551d835ce2  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa87ce2) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #2 0x56551d83b3c8  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa8d3c8) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #3 0x56551e42dfa9  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x167ffa9) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #4 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #5 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #6 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #7 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #8 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #9 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #10 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #11 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #12 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #13 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #14 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #15 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #16 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #17 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #18 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #19 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #20 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #21 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #22 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #23 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #24 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #25 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #26 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #27 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #28 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #29 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #30 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #31 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #32 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #33 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #34 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #35 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #36 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #37 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #38 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #39 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #40 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #41 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #42 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #43 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #44 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #45 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #46 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #47 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #48 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #49 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #50 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #51 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #52 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #53 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #54 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #55 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #56 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #57 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #58 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #59 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #60 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #61 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #62 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #63 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #64 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #65 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #66 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #67 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #68 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #69 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #70 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #71 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #72 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #73 0x56551e01a543  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126c543) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #74 0x56551e0151f1  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x12671f1) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #75 0x56551e011f61  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1263f61) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #76 0x56551e1a0612  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x13f2612) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #77 0x56551e13dd4c  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x138fd4c) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #78 0x56551d7aede2  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa00de2) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #79 0x56551dcfa9bc  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xf4c9bc) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #80 0x56551e658d34  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x18aad34) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #81 0x56551e6decaf  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1930caf) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #82 0x56551da77ac3  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xcc9ac3) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #83 0x56551e65918c  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x18ab18c) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #84 0x56551e658652  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x18aa652) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #85 0x56551d86ab30  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xabcb30) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #86 0x56551ee899e8  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20db9e8) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #87 0x56551d77ce86  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x9cee86) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #88 0x7fa1287bdb7a  (/lib/x86_64-linux-gnu/libc.so.6+0x92b7a) (BuildId: c495b62edadd6c356265942ec1282d98058a7b41)
+    #89 0x7fa12883b7f7  (/lib/x86_64-linux-gnu/libc.so.6+0x1107f7) (BuildId: c495b62edadd6c356265942ec1282d98058a7b41)
+
+0x7d11279e6c20 is located 0 bytes after 672-byte region [0x7d11279e6980,0x7d11279e6c20)
+allocated by thread T2 here:
+    #0 0x56551d77ff51  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x9d1f51) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #1 0x56551ee92666  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20e4666) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #2 0x56551ee92724  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20e4724) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #3 0x56551ee917ff  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20e37ff) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #4 0x56551ea50067  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1ca2067) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #5 0x56551ea525b2  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1ca45b2) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #6 0x56551ea496f4  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1c9b6f4) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #7 0x56551d8303c9  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa823c9) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #8 0x56551d830761  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa82761) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #9 0x56551d833f77  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa85f77) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #10 0x56551d836167  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa88167) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #11 0x56551d83b3c8  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa8d3c8) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #12 0x56551e42dfa9  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x167ffa9) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #13 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #14 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #15 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #16 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #17 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #18 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #19 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #20 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #21 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #22 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #23 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #24 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #25 0x56551e00ce98  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x125ee98) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #26 0x56551e02d73b  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127f73b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #27 0x56551e42e189  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1680189) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #28 0x56551e028be7  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x127abe7) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #29 0x56551e018d19  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x126ad19) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+
+Thread T2 created by T1 here:
+    #0 0x56551d7628d1  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x9b48d1) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #1 0x56551ee68820  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20ba820) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #2 0x56551e657ec8  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x18a9ec8) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #3 0x56551e3a2d28  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x15f4d28) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #4 0x56551e3a2f43  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x15f4f43) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #5 0x56551db0f5c1  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xd615c1) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #6 0x56551d7ae6d8  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xa006d8) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #7 0x56551d8aed57  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xb00d57) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #8 0x56551eb79a1a  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1dcba1a) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #9 0x56551eb87084  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1dd9084) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #10 0x56551eb81a43  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1dd3a43) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #11 0x56551eb8a1e1  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1ddc1e1) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #12 0x56551ee899e8  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20db9e8) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #13 0x56551d77ce86  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x9cee86) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+
+Thread T1 created by T0 here:
+    #0 0x56551d7628d1  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x9b48d1) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #1 0x56551ee68820  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20ba820) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #2 0x56551eb8cf0e  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1ddef0e) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #3 0x56551eba08db  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1df28db) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #4 0x56551eb8bd0c  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x1dddd0c) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #5 0x56551e3cd665  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x161f665) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #6 0x56551d89db8d  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xaefb8d) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #7 0x56551dcfa980  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xf4c980) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #8 0x56551dcf16b3  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xf436b3) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #9 0x56551ee7fe78  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x20d1e78) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #10 0x56551dcf161f  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0xf4361f) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #11 0x56551e3cd820  (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x161f820) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84)
+    #12 0x7fa128754ca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: c495b62edadd6c356265942ec1282d98058a7b41)
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow (/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727+0x9cf28b) (BuildId: 7e10d084682a7de667ef215f1689a0c1535ddf84) 
+Shadow bytes around the buggy address:
+  0x7d11279e6980: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7d11279e6a00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7d11279e6a80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7d11279e6b00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7d11279e6b80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x7d11279e6c00: 00 00 00 00[fa]fa fa fa fa fa fa fa fa fa fa fa
+  0x7d11279e6c80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7d11279e6d00: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7d11279e6d80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7d11279e6e00: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x7d11279e6e80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==100468==ABORTING
+error: test failed, to rerun pass `-p phpun-core --lib`
+
+Caused by:
+  process didn't exit successfully: `/workspace/phpun-asan-target/x86_64-unknown-linux-gnu/debug/deps/phpun_core-cbe01d557b408727 native_integer_graph_executes_and_replays_guard_failures --nocapture` (exit status: 1)
