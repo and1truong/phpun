@@ -32,7 +32,7 @@ impl<'a> Interp<'a> {
         // require_once()) and carries no arg until the path resolves:
         // an open still in progress renders bare `include()` even with
         // frames above it (the error-handler trace of a failed open).
-        self.trace_push(TraceFrame {
+        self.call_trace.push(TraceFrame {
             args_frame: None,
             function: match kind {
                 IncludeKind::Include => "include",
@@ -432,7 +432,7 @@ impl<'a> Interp<'a> {
                 // Zend traces through eval'd code carry a `FILE(N):
                 // eval()` frame at the call site (rendered bare — the
                 // eval'd source is not an arg in backtraces).
-                self.trace_push(TraceFrame {
+                self.call_trace.push(TraceFrame {
                     args_frame: None,
                     function: "eval".to_string().into(),
                     class: None,
@@ -559,7 +559,7 @@ impl<'a> Interp<'a> {
                     // `FILE(N) : eval()'d code`, carrying the
                     // compile-context backtrace with the eval frame
                     // itself dropped like the exec-time gates below.
-                    self.trace_push(TraceFrame {
+                    self.call_trace.push(TraceFrame {
                         args_frame: None,
                         function: "eval".to_string().into(),
                         class: None,

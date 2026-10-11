@@ -1230,7 +1230,7 @@ impl<'a> Interp<'a> {
 
     /// Call any callable-ish Value: Callable, string name, [obj,'m'], obj
     /// with __invoke.
-    pub fn call_value(&mut self, v: &Value, mut args: CallArgs) -> Result<Value, PhpError> {
+    pub fn call_value(&mut self, v: &Value, args: CallArgs) -> Result<Value, PhpError> {
         match v {
             Value::Callable(c) => {
                 match &c.kind {
@@ -1306,7 +1306,7 @@ impl<'a> Interp<'a> {
                         {
                             if let Some(comp) = self.vm_compiled(&decl) {
                                 if !comp.needs_bind {
-                                    return self.vm_run(&decl, &comp, &mut args);
+                                    return self.vm_run(&decl, &comp, args);
                                 }
                             }
                         }
@@ -2742,7 +2742,7 @@ impl<'a> Interp<'a> {
         decl: &FunctionDecl,
         args: &CallArgs,
         defer_args: bool,
-    ) -> Box<TraceFrame> {
+    ) -> TraceFrame {
         crate::interp::util::alloc_hit(3);
         // The callee's argline markers overwrite `send_line`; after
         // the call returns the enclosing op's own line is the pending
@@ -4615,7 +4615,7 @@ impl<'a> Interp<'a> {
                     // `[internal function]` site and the callback args.
                     self.call_trace
                         .last()
-                        .map(|frame| crate::value::trace_frame_str(frame))
+                        .map(crate::value::trace_frame_str)
                         .unwrap_or_default()
                 } else {
                     format!(
@@ -5281,7 +5281,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn invoke_fn_run(
         &mut self,
         decl: &Rc<FunctionDecl>,
-        mut args: CallArgs,
+        args: CallArgs,
         this_obj: Option<Rc<RefCell<PhpObject>>>,
         scope_class: Option<Rc<PhpClass>>,
         decl_class: Option<Rc<PhpClass>>,
@@ -5329,7 +5329,7 @@ impl<'a> Interp<'a> {
         if args.named.is_empty() {
             if let Some(c) = self.vm_compiled(decl) {
                 if !c.needs_bind {
-                    return self.vm_run(decl, &c, &mut args);
+                    return self.vm_run(decl, &c, args);
                 }
             }
         }
