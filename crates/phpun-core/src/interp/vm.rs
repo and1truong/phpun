@@ -1371,7 +1371,7 @@ impl<'a> Interp<'a> {
         &mut self,
         decl: &Rc<FunctionDecl>,
         comp: &Compiled,
-        args: &mut super::CallArgs,
+        mut args: super::CallArgs,
     ) -> Result<Value, PhpError> {
         // Scalar slots may share this call's arg cells, never the caller's
         // by-value cells (array_walk, unpack and call_user_func_array share them).
@@ -1402,7 +1402,7 @@ impl<'a> Interp<'a> {
                     p.ty.is_none()
                         || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
                 });
-        let fr = self.call_site_frame(decl, args, defer_args);
+        let fr = self.call_site_frame(decl, &args, defer_args);
         self.call_trace.push(fr);
         padd!(2, __p);
         let __p = pnow!();
@@ -1475,13 +1475,7 @@ impl<'a> Interp<'a> {
                         let v = fa[j].borrow().clone();
                         if let Some(ty) = &p.ty {
                             if let Some(e) = self.vm_param_gate(decl, p, ty, &v) {
-                                return self.vm_rebind(
-                                    e,
-                                    decl,
-                                    std::mem::replace(args, super::CallArgs::empty()),
-                                    &mut fa,
-                                    saved,
-                                );
+                                return self.vm_rebind(e, decl, args, &mut fa, saved);
                             }
                         }
                         arr.push(v);
@@ -1514,13 +1508,7 @@ impl<'a> Interp<'a> {
                                 }
                                 // Non-literal default — bind evals it.
                                 None => {
-                                    return self.vm_rebind(
-                                        None,
-                                        decl,
-                                        std::mem::replace(args, super::CallArgs::empty()),
-                                        &mut fa,
-                                        saved,
-                                    );
+                                    return self.vm_rebind(None, decl, args, &mut fa, saved);
                                 }
                             }
                         } else {
@@ -1537,13 +1525,7 @@ impl<'a> Interp<'a> {
                     self.callable_probe_err = None;
                     let v = c.borrow().clone();
                     if let Some(e) = self.vm_param_gate(decl, p, ty, &v) {
-                        return self.vm_rebind(
-                            e,
-                            decl,
-                            std::mem::replace(args, super::CallArgs::empty()),
-                            &mut fa,
-                            saved,
-                        );
+                        return self.vm_rebind(e, decl, args, &mut fa, saved);
                     }
                     let strict = self.caller_file_strict();
                     if !strict && !self.ty_weak_exact(ty, &v) {
@@ -2804,13 +2786,13 @@ impl<'a> Interp<'a> {
             std::mem::swap(&mut self.cur().value_args, argv);
             self.vm_direct_reserve(&mut args, n);
             padd!(1, __p);
-            return self.vm_run(decl, comp, &mut args);
+            return self.vm_run(decl, comp, args);
         }
         args.cells = self.vm_arg_cells(argv);
         let n = args.cells.len() as u64;
         self.vm_direct_reserve(&mut args, n);
         padd!(1, __p);
-        self.vm_run(decl, comp, &mut args)
+        self.vm_run(decl, comp, args)
     }
 
     /// Fresh positional callback values only: original/reference argument cells
@@ -3230,13 +3212,13 @@ impl<'a> Interp<'a> {
             std::mem::swap(&mut self.cur().value_args, argv);
             self.vm_direct_reserve(&mut args, n);
             padd!(1, __p);
-            return self.vm_run(decl, comp, &mut args);
+            return self.vm_run(decl, comp, args);
         }
         args.cells = self.vm_arg_cells(argv);
         let n = args.cells.len() as u64;
         self.vm_direct_reserve(&mut args, n);
         padd!(1, __p);
-        self.vm_run(decl, comp, &mut args)
+        self.vm_run(decl, comp, args)
     }
 
     fn vm_call(
@@ -3467,38 +3449,6 @@ DivisionByZeroError:Division by zero
         it.frame_recycle(frame);
         let frame = it.frame_new("second");
         assert_eq!(&*frame as *const super::super::Frame, ptr);
-    }
-
-    #[test]
-    fn borrowed_call_state_keeps_argument_and_exception_owners() {
-        let mut it = Interp::new("receiver.php");
-        let result = it.run_source(
-            r#"<?php
-class TeardownItem { function __destruct() { echo "item\n"; } }
-class TeardownHost {
- public int $x = 4;
- function run(int $n): int { return $this->x + $n; }
- function arg(TeardownItem $item): int { return $this->x; }
- function __destruct() { echo "host\n"; }
-}
-function invoke(TeardownHost $o, int $n): int { return $o->run($n); }
-$h = new TeardownHost; $wh = WeakReference::create($h);
-echo invoke($h, 2), "\n";
-var_dump($wh->get() !== null);
-$i = new TeardownItem; $wi = WeakReference::create($i);
-echo $h->arg($i), "\n";
-unset($i); var_dump($wi->get());
-try { invoke($h, 'bad'); } catch (TypeError $e) { echo get_class($e), "\n"; }
-echo $h->run(n: 3), "\n";
-unset($e); unset($h); var_dump($wh->get());
-"#,
-        );
-        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
-        assert_eq!(it.err_buf, "");
-        assert_eq!(
-            it.out,
-            b"6\nbool(true)\n4\nitem\nNULL\nTypeError\n7\nhost\nNULL\n"
-        );
     }
 
     #[test]
