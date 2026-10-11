@@ -8228,6 +8228,9 @@ impl<'a> Interp<'a> {
         args: &CallArgs,
         params: &[(&'static str, builtins::BDef)],
     ) -> (Vec<Cell>, Vec<(String, Cell)>) {
+        if args.named.is_empty() {
+            return (args.to_vec(), Vec::new());
+        }
         use builtins::BDef;
         let n_fixed = params
             .iter()
