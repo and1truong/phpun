@@ -1,0 +1,2 @@
+[ perf record: Woken up 88 times to write data ]
+[ perf record: Captured and wrote 21.775 MB /workspace/parity92/oct11/libc-search-strings.data (2704 samples) ]
