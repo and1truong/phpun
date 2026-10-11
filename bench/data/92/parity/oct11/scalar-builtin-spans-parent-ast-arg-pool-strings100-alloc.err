@@ -1,0 +1,7 @@
+allocs: 2098282 bytes: 113739563
+  cell: 12719
+  vm_site: 404500
+  mem_track: 404705
+  call_args: 12000
+  to_string: 408561
+  array_new: 144

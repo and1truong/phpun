@@ -1,0 +1,122 @@
+{
+  "source": "0f1245b2e5be7206fe38077c121b80e32d96e82a",
+  "runtime": "0f1245b2e5be7206fe38077c121b80e32d96e82a",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 600,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 5,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "timeout",
+      "after": "fail"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "strings100",
+      "before": {
+        "requests": 2098282,
+        "bytes": 113739563
+      },
+      "after": {
+        "requests": 1298282,
+        "bytes": 94539595
+      }
+    },
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 833122,
+        "bytes": 51673466
+      },
+      "after": {
+        "requests": 833120,
+        "bytes": 51673450
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26545074
+      },
+      "after": {
+        "requests": 616041,
+        "bytes": 26545106
+      }
+    }
+  ],
+  "binary_sha256": "dd26c597ba3086ee0ede9590ececde1d4eef6226e072f88b26bfbb581cccabc2",
+  "scope": "Exact typed pure scalar kernels already prove span fits active arena page and exclude profiler/coverage/errors/OOM. Reuse existing float-leaf top.used increment +shared vm_stack_apply repayment instead of temporary CallArgs/VmSite/zerocharge ledger registration. Kernel/result string construction/charges unchanged, no token/cache/layout/dependency/unsafe introduced.",
+  "fallbacks": "Wrongtype,unsupported builtin,insufficient page capacity,observer/error/OOM paths retain original canonical dispatch. ONE existing arena check proves repeated sqrt/substr leave exact span/charge counts unchanged and type/page fallback. Existing parse/alias/reference/unwind checks retained.",
+  "serialized_generator_rechecks": [
+    {
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+          "name": "$generator->send() returns the yielded value",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 8844
+        }
+      ]
+    },
+    {
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+          "name": "$generator->send() returns the yielded value",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 9451
+        }
+      ]
+    }
+  ],
+  "prior_native_gaps": [
+    "sqrt(null)deprecation missing,parent==candidate",
+    "4MB live substr nativeOOM miss,parent==candidate,#352"
+  ]
+}

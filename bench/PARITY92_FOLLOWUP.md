@@ -3049,6 +3049,42 @@ Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/ast-arg-pool-*.
+
+## #350: perf(vm): repay known-fit scalar builtin spans without temporary site tokens (2026-10-11)
+
+Exact typed pure scalar kernels already prove span fits active arena page and exclude profiler/coverage/errors/OOM. Reuse existing float-leaf top.used increment +shared vm_stack_apply repayment instead of temporary CallArgs/VmSite/zerocharge ledger registration. Kernel/result string construction/charges unchanged, no token/cache/layout/dependency/unsafe introduced.
+
+Wrongtype,unsupported builtin,insufficient page capacity,observer/error/OOM paths retain original canonical dispatch. ONE existing arena check proves repeated sqrt/substr leave exact span/charge counts unchanged and type/page fallback. Existing parse/alias/reference/unwind checks retained.
+
+Runtime 0f1245b2e5be7206fe38077c121b80e32d96e82a; timing source 0f1245b2e5be7206fe38077c121b80e32d96e82a; report/integration source 0f1245b2e5be7206fe38077c121b80e32d96e82a.
+
+31alternating profiler-off nativePHP8.5.11-n byte-gated pairs,negative-cohort followup31,and separate freshwhole7rotatingPHP/main/parent/candidate;profiler output is separate and not speed evidence.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 52.709 | 45.835 | 0.8696 |
+| bench/20-strings.php 100 | 238.461 | 204.233 | 0.8565 |
+| bench/40-objects.php | 92.251 | 95.080 | 1.0307 |
+| bench/60-json.php | 428.519 | 426.961 | 0.9964 |
+| bench/11-sieve.php | 9.807 | 9.644 | 0.9834 |
+
+31pairs strings52.709→45.835ms(−13.0%),long238.461→204.233(−14.4%);objects+3.1%,JSON−.4%,sieve−1.7%. Whole7 main3.8321→candidate2.7663×PHP,parent−1.0%;strings−16.0%/3.124×PHP,long−15.0%/3.976×PHP;objects−3.6%/12.565×PHP,long+.2%flat/17.574×PHP. Whole negativesfib+9.6%,startup+4.9%,regex+6.5%,JSON+4.6% retained. Followup31fib+1.5%,regex+1.3%,JSON+2.3%,objects−1.0%;small unrelated negatives remain,not averaged withwhole. Physicalstrings1002098282→1298282requests(−800000),113739563→94539595bytes(−19199968),vm_site404500→4500;objects−2requests/−16Bnotattributed,arrayssamerequests/+32B. Retained repeatable target win,not parity/CPUattribution. Initial added sqrt(null)probe failedPHP gate;parent==candidate lacknative deprecation,raworiginal/results kept;correctedprobe excludesonlythatpre-existingcase. Separate4MB live substr probe nativefatal255/parent+candidateexit0 unchanged,also profiledcanonicalparentexit0;tracked#352,notfixedbythisoptimization.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings100: requests 2098282→1298282; bytes 113739563→94539595.
+- objects5: requests 833122→833120; bytes 51673466→51673450.
+- arrays: requests 616041→616041; bytes 26545074→26545106.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing arena check+25script/19workload/VMprofile/correctedprobe PASS;initialfailedprobe and separate pre-existing native mismatch probes retained explicitly.
+All3406onlysend_returns_current timeout→fail;same10s serializedparent8844/candidate9451ms bothFAIL confirms pre-existing unresolved generator case.599earlierfail cases unchanged;fullcandidate2732pass600fail25skip38unsupported6crash5timeout retained. Normalizedisolated maps identical,not compatibility improvement.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 600, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 5, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/scalar-builtin-spans-*.
 ## #347 / PR349 review: withdraw widened declared slots (2026-10-11)
 
 P2 review correctly identifies 8→24 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31−3.6%/confirm−3.7%,long−1.6%/confirm−.6%,wholedefaultflat/long+2.8% andphysical−50002requests/−1200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.
