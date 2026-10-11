@@ -2263,3 +2263,45 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/promoted-decl-borrow-*.
+
+## #315: perf(objects): borrow effective promoted property metadata on current main (2026-10-11)
+
+Use existing decl_prop_site in shared promoted_prop_write to borrow effective PropDecl without cloning metadata. Identical scope/private/inheritance lookup and guards; no new cache/layout/helper/unsafe/dependency. Both AST and VM constructor paths. Fresh integration includes currentmain999c517 JSON316 and ctor317; historical pre316 dataset retained separately above.
+
+Effective hook/readonly/visibility/private declaring-class/slot fallback unchanged. ONE existing promoted-store unit extends inherited effective set hook/private collision, complete native output checked. Known main JSON live-reference regression is unchanged here and tracked/fixed next in #319.
+
+Runtime f18b3b4c53551d4f9ecc0abf82feadab64fa025c; timing source f18b3b4c53551d4f9ecc0abf82feadab64fa025c; report/integration source f18b3b4c53551d4f9ecc0abf82feadab64fa025c.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 157.701 | 155.052 | 0.9832 |
+| bench/40-objects.php 20 5000 | 640.850 | 607.994 | 0.9487 |
+| bench/20-strings.php | 57.781 | 60.565 | 1.0482 |
+| bench/20-strings.php 100 | 269.991 | 269.016 | 0.9964 |
+| bench/11-sieve.php | 67.411 | 68.204 | 1.0118 |
+| bench/30-arrays.php | 88.789 | 86.030 | 0.9689 |
+| bench/60-json.php | 589.872 | 561.979 | 0.9527 |
+| bench/10-fib.php | 8.312 | 8.412 | 1.0120 |
+| bench/50-regex.php | 42.879 | 42.708 | 0.9960 |
+| bench/70-db.php | 115.156 | 115.250 | 1.0008 |
+| bench/app/cli.php 100 20 | 35.889 | 36.222 | 1.0093 |
+| examples/composer/run.php | 9.953 | 10.519 | 1.0569 |
+
+Currentmain999 fresh7objects157.701→155.052ms(−1.7%),long640.850→607.994(−5.1%);31objects146.877→142.595(−2.9%),long624.569→604.752(−3.2%). Physicalobjects1633154→1483154(−150000).7strings+4.8%,long−.4%,JSON−4.7%(not attributed),fib+1.2%,Composer+5.7% retained;31strings+2.2%,Composer+2.3%. No whole/parity claim. FullrawGC77345pass→timeout retained;serializedparent/candidate PASS8804/8728ms.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1633154→1483154; bytes 68355725→66855769.
+- arrays: requests 636049→636049; bytes 26704217→26704261.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing promoted-store runtime unit plus complete native extra child-hook/private probe. Serialized GC rechecks retained.
+All3406 raw status maps:onlyGC77345pass→timeout (candidate2729pass601fail). Serialized10s parent8804/candidate8728ms BOTH PASS; full raw timeout retained. No other status change. Existing main JSON reference regression tracked#319, not covered by PHPT; standalone native reproducer published.
+Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/promoted-decl-borrow-main-*.

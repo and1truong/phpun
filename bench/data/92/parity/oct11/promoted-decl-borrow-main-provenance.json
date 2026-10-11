@@ -1,0 +1,61 @@
+{
+  "source": "f18b3b4c53551d4f9ecc0abf82feadab64fa025c",
+  "runtime": "f18b3b4c53551d4f9ecc0abf82feadab64fa025c",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1633154,
+        "bytes": 68355725
+      },
+      "after": {
+        "requests": 1483154,
+        "bytes": 66855769
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636049,
+        "bytes": 26704217
+      },
+      "after": {
+        "requests": 636049,
+        "bytes": 26704261
+      }
+    }
+  ],
+  "binary_sha256": "c1d6ab500921176a8b6d1cf63bcda79dd88de8ce9d469b2371cb86b6ec3515cb",
+  "scope": "Use existing decl_prop_site in shared promoted_prop_write to borrow effective PropDecl without cloning metadata. Identical scope/private/inheritance lookup and guards; no new cache/layout/helper/unsafe/dependency. Both AST and VM constructor paths. Fresh integration includes currentmain999c517 JSON316 and ctor317; historical pre316 dataset retained separately above.",
+  "fallbacks": "Effective hook/readonly/visibility/private declaring-class/slot fallback unchanged. ONE existing promoted-store unit extends inherited effective set hook/private collision, complete native output checked. Known main JSON live-reference regression is unchanged here and tracked/fixed next in #319."
+}
