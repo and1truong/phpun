@@ -1792,3 +1792,9 @@ Root NewCall and direct MethodCall release caller slot handles before dispatch a
 Runtime a25f25377261affa86d850b67e7929f39543f86c; binarySHA256 faac63b35b157fc6f26ed69bb7f080cd3967fcdc1a393a784d9b48373ed00d03. Workspace/fmt/clippy/clean release/25script+19workload+VM-profile and four extra probes pass. All3406PHPT compared:2729pass601fail, only range_bug71132 crash→timeout (known resource result), no new fail/pass/skip. Prior CI rust/phpt succeeded at539a156; this new head requires its own CI. Prior cache-only/per-stage timings do not time this global synchronization restoration. Fresh paired/whole-suite measurements will use this exact reviewed binary.
 
 #295 independently duplicates the by-ref ctor correction and adds handle backlog stamping; its separate epoch fix is not included here. No external-host figures mixed into this report. Raw reviewed artifacts in bench/data/92/parity/oct11/memory-limit-review-*.
+
+## #294 closed-parent integration onto main0ddef51 (2026-10-11)
+
+GitHub merged #294 into branch74 after #291 was closed; adc3090/18d70dc were not main ancestors. Ordinary main0ddef51 merge32e8353 retains #295 handle-epoch fix and resolves overlapping ctor-reference guard through the shared existing canonical fallback. Remaining main delta is parsed-limit reuse, root globals synchronization, and existing runnable checks. No external branch rewrite/force or self-merge.
+
+Exact runtime 32e8353c2c22905cff3dad49ecce4211ae0c20c4 / binarySHA256 8361bdb46bf6701ea7fb9e114a749f410a6902813ad20d3d877ac083e2adbae3. Fresh workspace/fmt/clippy/core release clean/rebuild/25script+19workload+VM-profile pass.3406individualPHPT retains2729pass601fail; only knownrange71132 timeout→crash versus reviewed parent. No new fail/pass/skip. Prior per-step figures are historical binary/source pairs, not timings of this integrated source; current-main whole comparison is pending. Raw main integration stored under memory-limit-main-*.
