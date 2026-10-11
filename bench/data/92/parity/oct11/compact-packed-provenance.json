@@ -1,0 +1,50 @@
+{
+  "source": "c8966dfff804a01ae0ec7181bd05aaebdc322de6",
+  "runtime": "ee63f18aee2425669d55653fa0bbfcf6b7283ab4",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 8,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "sieve10",
+      "before": {
+        "requests": 1032477,
+        "bytes": 78034527
+      },
+      "after": {
+        "requests": 32477,
+        "bytes": 22034515
+      }
+    }
+  ],
+  "binary_sha256": "0feb20789ce1b0b97028950ac31e2612431884ebc03c996aa53d1923e8d88786",
+  "scope": "Store zero-based scalar array_fill values in actual Vec<Value> with implicit integer keys. Scalar reads/writes and CoW avoid per-element Rc/RefCell. Memory count/type/OOM preflight, Zend table charges and mixed/reference/cursor semantics remain unchanged. Compact enum keeps boxed Vec directly; only packed rows allocate lazy promotion state.",
+  "fallbacks": "Canonical Vec access or exporting an element Cell materializes the complete ordered Cell table once. Nonzero-key or object/array/resource fills remain boxed; sparse/mixed/reference operations normalize. Globals/typed-owner/readonly/handler guards and canonical GC paths remain. Shared purple-array buffering precedes the scalar last-owner shortcut. Deliberate ceiling: producer limited to scalar zero-based fill; iteration generally promotes, mixed inline storage remains open in #187."
+}
