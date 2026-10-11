@@ -4976,7 +4976,11 @@ unset($e); unset($h); var_dump($wh->get());
             std::mem::size_of::<crate::value::PhpStr>(),
             std::mem::size_of::<usize>()
         );
-        assert_eq!(std::mem::size_of::<crate::value::PhpBytes>(), 32, "bound shared string payload cost (old Vec24)");
+        assert_eq!(
+            std::mem::size_of::<crate::value::PhpBytes>(),
+            32,
+            "bound shared string payload cost (old Vec24)"
+        );
         let mut small = crate::value::PhpStr::from_slice(b"a\0b");
         assert!(matches!(&*small.rc, crate::value::PhpBytes::Inline { .. }));
         let alias = small.clone();
@@ -5003,6 +5007,15 @@ unset($e); unset($h); var_dump($wh->get());
             &*crate::value::PhpStr::from_slice(&[0; 24]).rc,
             crate::value::PhpBytes::Heap(_)
         ));
+        let mut cut = Interp::new("cut.php");
+        let args = super::super::CallArgs::positional(vec![
+            super::cell(super::Value::bytes(b"a\xc3\xa9z".to_vec())),
+            super::cell(super::Value::Int(0)),
+            super::cell(super::Value::Int(2)),
+        ]);
+        assert!(
+            matches!(cut.call_builtin("mb_strcut", &args, true).unwrap(), Some(super::Value::Str(s)) if &s[..] == b"a")
+        );
         let mut stacked = Interp::new("stacked-scalar.php");
         let stmts = crate::parser::parse_source(
             r#"<?php $out=0;for($i=0;$i<4;$i++) {$out+=sqrt(sqrt(81));$text=substr(strtolower("ABCD"),1,2);}echo $out,":",$text;"#,
