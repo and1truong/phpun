@@ -1889,3 +1889,43 @@ External CI not asserted green. No suite parity claim or multiplication of step 
 Raw/source/hashes in bench/data/92/parity/oct11/empty-method-dispatch-*.
 
 Final #296 decision: revert6691796 through ordinary commit; runtime crates/Cargo diff with #299 is empty (checked). The empty-method-dispatch ELF is the REJECTED prototype, not final PR runtime. Physical/core/native comparisons and inclusive profiles remain separate. Final uses exact compact-packed source/binary0feb207 and verified parent map, including its existing failing/unsupported/resource statuses; no new test/rebuild required for a metadata-only identical runtime. Perf goal #92 continues in #298.
+
+## #298: perf(vm): avoid root bridges for guarded scalar builtin kernels (2026-10-11)
+
+Reuse the existing exact scalar builtin kernel/reservation helper before the top-level slot/global materialize-refresh bridge, only for resolved builtin targets with no exposed $GLOBALS array. Successful kernels retain the original VM frame reserve/free and memory charge. This removes repeated root table synchronization for pure builtin operations; no benchmark-specific behavior.
+
+Existing profilers, diagnostics, OOM/current-page capacity, type/arity/domain guards remain. Misses, reference/callback/user calls and exposed globals use the original canonical path. Direct constructors/methods retain #297 P1 synchronization. ONE existing callback unit covers root/global rebind, fallback and unchanged VM stack occupancy; no new dependencies/frameworks.
+
+Runtime f4313bd93f4cff704ee2707640d4fb83cdcfd38e; timing source f4313bd93f4cff704ee2707640d4fb83cdcfd38e; report/integration source 013641533789e37be78953062592f3006a923109.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 66.352 | 56.088 | 0.8453 |
+| bench/20-strings.php 100 | 284.057 | 236.721 | 0.8334 |
+| bench/profile/strings.php slice 20000 | 68.857 | 70.828 | 1.0286 |
+| bench/profile/strings.php replace 20000 | 678.788 | 700.100 | 1.0314 |
+| bench/40-objects.php | 157.443 | 155.977 | 0.9907 |
+| bench/11-sieve.php | 63.080 | 65.628 | 1.0404 |
+| bench/30-arrays.php | 79.745 | 79.806 | 1.0008 |
+| bench/60-json.php | 542.739 | 534.280 | 0.9844 |
+| bench/10-fib.php | 8.472 | 8.545 | 1.0086 |
+| bench/app/cli.php 100 20 | 33.659 | 33.085 | 0.9830 |
+| examples/composer/run.php | 8.562 | 7.950 | 0.9285 |
+
+7pairs strings66.352→56.088ms (−15.5%),long284.057→236.721 (−16.7%). Initial sieve+4.0%,slice+2.9%,replace+3.1%;31followup sieve+.4%,slice+1.7%,replace+1.0% retained. Separate7rotating PHP/currentmain3f52972/parent/candidate: ninebench geomean4.03873→4.04012×PHP, effectively flat (+.034%main); duplicate parent ELF produces −1.32%, an order/noise difference, not a second baseline gain. Longstrings−12.6%vs main/−14.0%parent; objectsdefault+3.3%main/long+.15%,JSON+1.1%,DB−.4%,app+.7%. No suite parity or overall speedup claim. Exactmain and parent crates/Cargo are identical to compact-packed binary0feb207, reused after empty runtime diff; candidate explicitly rebuilt from f4313bd. Physical strings100 requests identical2902882; +16bytes from argv path length, no allocator reduction claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings100: requests 2902882→2902882; bytes 120174740→120174756.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing callback unit extended once; additional native binary strings/type errors/provided-ref count/global-rebind probe passes. Current-main whole measurement uses verified code-identical compact ELF, not an obsolete main snapshot.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/pure-root-builtins-*.

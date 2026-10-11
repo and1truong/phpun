@@ -1,0 +1,50 @@
+{
+  "source": "013641533789e37be78953062592f3006a923109",
+  "runtime": "f4313bd93f4cff704ee2707640d4fb83cdcfd38e",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "strings100",
+      "before": {
+        "requests": 2902882,
+        "bytes": 120174740
+      },
+      "after": {
+        "requests": 2902882,
+        "bytes": 120174756
+      }
+    }
+  ],
+  "binary_sha256": "d193a8f5293a859e25ac9e0c698e474ae2077c3cea1c5903c5fab1709840bc87",
+  "scope": "Reuse the existing exact scalar builtin kernel/reservation helper before the top-level slot/global materialize-refresh bridge, only for resolved builtin targets with no exposed $GLOBALS array. Successful kernels retain the original VM frame reserve/free and memory charge. This removes repeated root table synchronization for pure builtin operations; no benchmark-specific behavior.",
+  "fallbacks": "Existing profilers, diagnostics, OOM/current-page capacity, type/arity/domain guards remain. Misses, reference/callback/user calls and exposed globals use the original canonical path. Direct constructors/methods retain #297 P1 synchronization. ONE existing callback unit covers root/global rebind, fallback and unchanged VM stack occupancy; no new dependencies/frameworks."
+}
