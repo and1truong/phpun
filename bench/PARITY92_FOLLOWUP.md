@@ -1237,3 +1237,50 @@ String/Vec allocations from shared type checks, then fresh whole-suite compariso
 Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass.
 All3406individualPHPTstatuses identical to byte-search parent:2727pass603fail
 25skip38unsupported6crash7timeout. External CI not asserted green.
+
+## #256: borrow static builtin type metadata (2026-10-11)
+
+Private strict_sig_view borrows existing literal name/type pairs in hot shared
+ZPP checks. Keep public strict_sig returning owned String pairs for existing
+reflection/API consumers. Same names/types/order/coercion/errors, no cache or
+dependency. Runtime556d7e6,15add/9delete. Existing type/reflection checks reused.
+
+Seven rotating profiler-off native PHP/main/parent/candidate coldCLI runs;
+every exit/stdout/stderr byte-gated. NativePHP8.5.11 -n,OPcache module loaded
+but CLI disabled,JIT disabled. Main3ea4df5 runtime matches frozenbe0e810
+(no crates/Cargo delta). Candidate release explicitly cleaned/rebuilt; an
+initial stale-parent artifact was detected before any measurement. Rawsource/
+hashes and command published, tracked runtime clean except vendor symlink.
+
+| Workload | PHP/main/parent/candidate ms | Candidate/PHP | Candidate/parent |
+|---|---:|---:|---:|
+| bench/00-startup.php | 3.495/5.844/5.936/5.788 | 1.656 | 0.975 |
+| bench/10-fib.php | 10.394/7.931/8.272/7.768 | 0.747 | 0.939 |
+| bench/11-sieve.php | 6.807/210.651/74.693/77.275 | 11.352 | 1.035 |
+| bench/20-strings.php | 13.288/158.219/136.570/126.540 | 9.523 | 0.927 |
+| bench/30-arrays.php | 16.129/169.037/92.813/89.025 | 5.520 | 0.959 |
+| bench/40-objects.php | 7.581/233.069/218.588/212.823 | 28.073 | 0.974 |
+| bench/50-regex.php | 7.217/39.974/40.992/39.479 | 5.470 | 0.963 |
+| bench/60-json.php | 146.872/510.426/507.993/515.654 | 3.511 | 1.015 |
+| bench/70-db.php | 28.018/112.178/115.116/113.392 | 4.047 | 0.985 |
+| bench/20-strings.php 100 | 48.321/780.858/656.777/612.489 | 12.675 | 0.933 |
+| bench/40-objects.php 20 5000 | 19.230/919.650/884.422/858.588 | 44.649 | 0.971 |
+| bench/app/cli.php 100 20 | 4.983/34.323/34.631/33.879 | 6.799 | 0.978 |
+| examples/composer/run.php | 4.075/8.131/7.943/7.838 | 1.923 | 0.987 |
+
+Original-ninebench main/candidate geomean **6.0988×/4.8943×PHP**,
+candidate/main0.8025,candidate/parent0.9741.
+This host/config differs from user's2.71×host; no cross-host ratio aggregation
+or product of earlier pair gains. **Still far from suite parity**: objects28.07×,
+sieve11.35×,strings9.52×;fib0.747×PHP only. Retain sieve+3.5%/json+1.5% vs
+parent and other negatives; no causal nontarget attribution. Stringsdefault
+−7.3%,long−6.7% vs immediate parent. Strings physicalrequests2,144,443
+→1,578,563 (−565,880/~26.4%),bytes65,157,144→50,991,224 (−21.7%). Object
+requests unchanged10,963,259/10,963,260; no targeted object allocation claim.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass.
+3406PHPT2727pass603fail25skip38unsupported6crash7timeout; only2knownrange
+crash/timeout swaps,no newfail/pass/skip. ExternalCI not assertedgreen.
+Next #258 reuses existing primitive callback valueABI for one-value arraymap/
+filter; #260 borrows complete positional builtin binding Cells and avoids
+temporary trace-name Strings. FullLazyTrace #237 and packedstorage #187 open.
