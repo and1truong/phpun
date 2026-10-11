@@ -3568,7 +3568,12 @@ impl<'a> Interp<'a> {
                 break;
             }
         }
-        if best.is_none() {
+        let drops = crate::value::HANDLE_DROPS.load(std::sync::atomic::Ordering::Relaxed);
+        if best.is_none() && drops != self.handle_scan_drops {
+            // A dead slot can only appear after an owner drop — the
+            // epoch hasn't moved since the last scan, so skip the
+            // tail walk entirely (all-alive churn path).
+            self.handle_scan_drops = drops;
             let n = self.obj_handles.len();
             for i in (0..n).rev().take(256) {
                 if !self.obj_handles[i].alive() {

@@ -899,6 +899,8 @@ pub struct Interp<'a> {
     /// Freed handle slots in death order (Zend's LIFO free list) —
     /// `mark_obj_died` pushes, `push_handle` pops the freshest.
     dead_slots: Vec<usize>,
+    /// Last HANDLE_DROPS epoch the tail scan ran at — see push_handle.
+    handle_scan_drops: u64,
     /// Weak registry of arrays that gained a reference (`=&`) element
     /// — only those can join a cycle, so the GC pass scans just them
     /// (Zend roots every refcounted array, this is the cheap subset
@@ -1946,6 +1948,7 @@ impl<'a> Interp<'a> {
             obj_born: Vec::new(),
             obj_died: Vec::new(),
             dead_slots: Vec::new(),
+            handle_scan_drops: 0,
             arr_handles: Vec::new(),
             gc_pending: 0,
             gc_collecting: false,

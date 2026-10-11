@@ -2441,9 +2441,17 @@ impl PhpObject {
     }
 }
 
+/// Death epoch for handle-slot recycling: any `Obj`/`Callable` owner
+/// whose Weak could go dead bumps this — `push_handle`'s tail scan
+/// skips itself entirely while the epoch is unchanged (a dead slot
+/// can only appear after a drop).
+pub(crate) static HANDLE_DROPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl Drop for PhpObject {
     fn drop(&mut self) {
         OBJ_LIVE.fetch_sub(OBJ_SHELL_BYTES, std::sync::atomic::Ordering::Relaxed);
+        HANDLE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         gc_root_note(-1);
     }
 }
@@ -2987,6 +2995,12 @@ pub struct PhpCallable {
     /// `static function`/static-method callables can never bind $this
     /// (closure_041/043, disallows_*).
     pub is_static: bool,
+}
+
+impl Drop for PhpCallable {
+    fn drop(&mut self) {
+        HANDLE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]
