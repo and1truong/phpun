@@ -1,0 +1,81 @@
+{
+  "source": "207dd613572a5c5fde1dafb7720bd84539c46542",
+  "runtime": "207dd613572a5c5fde1dafb7720bd84539c46542",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1633154,
+        "bytes": 68355753
+      },
+      "after": {
+        "requests": 1633150,
+        "bytes": 68355621
+      }
+    },
+    {
+      "label": "scalarleaf",
+      "before": {
+        "requests": 32479,
+        "bytes": 6010970
+      },
+      "after": {
+        "requests": 32477,
+        "bytes": 6010902
+      }
+    }
+  ],
+  "binary_sha256": "e2b40a062291aa54a359fd44458f1b1df4f6afa389d25b72c11801a8b31f1a9d",
+  "scope": "Report-only: reject and ordinarily revert #307 scalar-only last-owner object snapshot guard. Actual objects allocator requests fell by only four; no useful ordinary object speed improvement. Preserve candidate source, frozen binary hash, negative measurements and gates.",
+  "fallbacks": "Final runtime restores the existing GC dying/property traversal, including resource/destructor/callback paths. No production scalar guard retained."
+}
