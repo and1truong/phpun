@@ -423,7 +423,7 @@ $count=99;
 try { str_replace('x','y',new BadText(),$count); } catch(Throwable $e) { echo $e->getMessage()," ",$count,"\n"; }
 echo bin2hex(substr("a\0b\xff",1,null)), ' ', bin2hex(substr("a\0b\xff",1)), ' ', bin2hex(substr("a\0b\xff",1,0)), "\n";
 foreach (['mb_substr', 'mb_strcut'] as $fn) {
-    echo $fn('aé中z', 1, null), ' ', $fn('aé中z', 1), ' ', $fn('aé中z', 1, 0), "\n";
+    echo $fn('aé中z', 1, null), ' ', $fn('aé中z', 1), ' ', $fn('aé中z', 1, 0), "|\n";
 }
 echo bin2hex(substr_replace("a\0b\xff", 'X', 1, null)), ' ', bin2hex(substr_replace("a\0b\xff", 'X', 1)), ' ', bin2hex(substr_replace("a\0b\xff", 'X', 1, 0)), "\n";
 "#,
@@ -457,8 +457,8 @@ string(3) "fox"
 int(1)
 cast-error 99
 0062ff 0062ff 
-é中z é中z 
-é中z é中z 
+é中z é中z |
+é中z é中z |
 6158 6158 61580062ff
 "#
     );
