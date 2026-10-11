@@ -1,0 +1,31 @@
+{
+  "binary_sha256": "d12dad8987b7a9cd5ca43ce6f909016216eee96e3759f4fe5d065236617786cf",
+  "source": "9adfbc84aaeed38acaadef1573e4bea5930bc081",
+  "parent": "fresh-promoted-float-review",
+  "summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ]
+}

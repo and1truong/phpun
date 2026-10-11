@@ -2609,3 +2609,39 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/ctor-label-borrow-*.
+
+## #328: docs(perf): retain rejected decoded-map storage measurements (2026-10-11)
+
+Rejected #328 prototype: bounded keyed decoded JSON maps shared the existing inline Value table and canonical Cell promotion. Ordinary reverts cd9ea63/303428a restore runtime exactly to main4e6b847; this PR contains evidence only.
+
+Prototype checked duplicate/numeric keys, order, by-ref/CoW, foreach/unset/sort/splice, >48 keys, and readonly fallbacks. No runtime optimization retained.
+
+Runtime edadeddb270ef574a18183756b00d4a443eb16e1; timing source edadeddb270ef574a18183756b00d4a443eb16e1; report/integration source 303428acc38a68f9fd4d08a6732b9ffe15e874b5.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/60-json.php | 512.720 | 509.760 | 0.9942 |
+| bench/40-objects.php | 101.722 | 101.942 | 1.0022 |
+| bench/30-arrays.php | 79.138 | 81.041 | 1.0240 |
+| bench/20-strings.php | 57.193 | 56.108 | 0.9810 |
+| examples/composer/run.php | 9.109 | 8.675 | 0.9524 |
+
+REJECTED. Final 31 paired runs: JSON527.877→532.771ms (+0.9%); arrays81.758→82.024 (+0.3%); Composer8.702→8.445 (−3.0%, not attributed). Despite saving540000JSON allocation requests, no target speed benefit. Initial no-reservation prototype seven-pair JSON−1.7% and Composer+6.6% also retained separately; do not combine these runs. No parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- json: requests 4360111→3820111; bytes 296859820→292540524.
+- objects5: requests 1058127→1058127; bytes 57271410→57271394.
+- arrays: requests 636049→636049; bytes 26703069→26703053.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing dimension/storage runnable check extended; native duplicate/ref/CoW/readonly/>48 probe passed. Both rejected prototypes and final reservation results retained.
+All3406fullPHPT: only known two range crash/timeout swaps and GC77345pass→timeout; retained full raw. Serialized10s parent/candidate GC77345bothPASS, raw separately retained. No new semantic failures.
+Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/keyed-json-values-final-*.
