@@ -1,0 +1,110 @@
+{
+  "source": "9c1776487e32996faa4608beca8170120d76eec0",
+  "runtime": "fd9fc2740e3706d08c38ffaa4c8e3a0c69209091",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "fail",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 833119,
+        "bytes": 51670402
+      },
+      "after": {
+        "requests": 808119,
+        "bytes": 51545370
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616040,
+        "bytes": 26541770
+      },
+      "after": {
+        "requests": 616040,
+        "bytes": 26541738
+      }
+    }
+  ],
+  "binary_sha256": "1828385d663b0d911ae94b8dbf8befab1dc78a8c60cdf0dcb4b02badc8da346b",
+  "scope": "Rejected AST new experiment reused pre-argument class/constructor Rc metadata through shared construction helper; generic callers retained post-constant-init ctor lookup. ONE existing receiver fixture covered classalias/named/inherited constructor,argument order and missingclass-before-sideeffect. Ordinaryrevert9c17764 restores PR354 runtime/source exactly (git diff6f6dbceHEAD--crates/Cargo empty).",
+  "fallbacks": "Report-only PR; experimentsourcefd9fc27/integration25b866d/ELF1828385 retained for reproducibility. Final runtime0f1245b/PR354 unchanged; no new cache/helper retained.",
+  "final_runtime": "0f1245b2e5be7206fe38077c121b80e32d96e82a",
+  "revert": "9c17764",
+  "decision": "rejected",
+  "serialized_generator_rechecks": [
+    {
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+          "name": "$generator->send() returns the yielded value",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 9933
+        }
+      ]
+    },
+    {
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+          "name": "$generator->send() returns the yielded value",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 9807
+        }
+      ]
+    }
+  ]
+}

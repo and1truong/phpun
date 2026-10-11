@@ -3085,6 +3085,41 @@ Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 600, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/scalar-builtin-spans-*.
+
+## #353: docs(perf): reject resolved-new metadata reuse after app and corpus regressions (2026-10-11)
+
+Rejected AST new experiment reused pre-argument class/constructor Rc metadata through shared construction helper; generic callers retained post-constant-init ctor lookup. ONE existing receiver fixture covered classalias/named/inherited constructor,argument order and missingclass-before-sideeffect. Ordinaryrevert9c17764 restores PR354 runtime/source exactly (git diff6f6dbceHEAD--crates/Cargo empty).
+
+Report-only PR; experimentsourcefd9fc27/integration25b866d/ELF1828385 retained for reproducibility. Final runtime0f1245b/PR354 unchanged; no new cache/helper retained.
+
+Runtime fd9fc2740e3706d08c38ffaa4c8e3a0c69209091; timing source 25b866d443a87408f1362ed8054b8ef08802166c; report/integration source 9c1776487e32996faa4608beca8170120d76eec0.
+
+31alternating profiler-off nativePHP8.5.11-n byte-gated pairs,negativecohortconfirm31,and separate freshwhole7rotatingPHP/main/parent/candidate;no perfclaim for finalrevert.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 98.135 | 98.482 | 1.0035 |
+| bench/40-objects.php 20 5000 | 372.323 | 368.436 | 0.9896 |
+| bench/20-strings.php 100 | 200.832 | 202.282 | 1.0072 |
+| bench/60-json.php | 416.320 | 415.524 | 0.9981 |
+| bench/30-arrays.php | 78.782 | 77.944 | 0.9894 |
+
+31pairs objects98.135→98.482ms(+.4%flat),long372.323→368.436(−1.0%),strings100+.7%,JSON−.2%,arrays−1.1%. Whole7 main3.8278→candidate2.7338×PHP,butcandidate/parentgeo+3.3%regression;longobjects+9.8%,app+4.8%,Composer+4.5% negatives. Confirm31longobjects363.092→355.212(−2.2%,contradictswhole),app34.183→36.240(+6.0%confirmed),Composer8.394→8.639(+2.9%). Physicalobjects−25000requests/−125032bytes;arrayssamerequests/−32B. Rejected: primarydefaultflat and confirmed real-app/whole regressions outweigh tiny lowercase-string allocation saving. No cross-cohort averaging/parity/speedup claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 833119→808119; bytes 51670402→51545370.
+- arrays: requests 616040→616040; bytes 26541770→26541738.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Experimentworkspace/fmt/clippy/native25+19/profile/alias/order/missingclassprobe PASS;finalrevert exactlyparent runtime.
+All3406onlypre-existinggenerator send fail→timeout;serializedsame10s parent9933/candidate9807ms bothFAIL.599earlierfails unchanged;fullcandidate2732pass599fail25skip38unsupported6crash6timeout. Finalreverted source equalsalready-gated parent.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/resolved-new-*.
 ## #347 / PR349 review: withdraw widened declared slots (2026-10-11)
 
 P2 review correctly identifies 8→24 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31−3.6%/confirm−3.7%,long−1.6%/confirm−.6%,wholedefaultflat/long+2.8% andphysical−50002requests/−1200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.
