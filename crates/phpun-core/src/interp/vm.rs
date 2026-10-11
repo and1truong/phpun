@@ -3451,19 +3451,41 @@ DivisionByZeroError:Division by zero
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         {
             for _ in 0..70 {
-                assert!(matches!(it.call_value_pair(&callable,
-                    [super::Value::Int(2),super::Value::Int(1)],false).unwrap(),super::Value::Int(3)));
+                assert!(matches!(
+                    it.call_value_pair(
+                        &callable,
+                        [super::Value::Int(2), super::Value::Int(1)],
+                        false
+                    )
+                    .unwrap(),
+                    super::Value::Int(3)
+                ));
             }
-            let super::CallableKind::Closure(decl) = &c.kind else {panic!("closure");};
+            let super::CallableKind::Closure(decl) = &c.kind else {
+                panic!("closure");
+            };
             match &it.compiled_fns[&(Rc::as_ptr(decl) as usize)].3 {
-                super::native::State::Ready(p)=>assert!(p.executions.get()>0,"callback did not enter native before VM frame"),
-                _=>panic!("callback graph was not native"),
+                super::native::State::Ready(p) => assert!(
+                    p.executions.get() > 0,
+                    "callback did not enter native before VM frame"
+                ),
+                _ => panic!("callback graph was not native"),
             }
-            let error=it.call_value_pair(&callable,[super::Value::Int(i64::MAX),super::Value::Int(1)],false).unwrap_err();
-            assert!(error.message.contains("Return value must be of type int"),"{}",error.message);
+            let error = it
+                .call_value_pair(
+                    &callable,
+                    [super::Value::Int(i64::MAX), super::Value::Int(1)],
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                error.message.contains("Return value must be of type int"),
+                "{}",
+                error.message
+            );
             assert!(it.call_trace.is_empty());
-            assert_eq!(it.vm_stack.len(),1);
-            assert_eq!(it.vm_stack[0].used,32+super::super::VM_FRAME_SLOTS*16);
+            assert_eq!(it.vm_stack.len(), 1);
+            assert_eq!(it.vm_stack[0].used, 32 + super::super::VM_FRAME_SLOTS * 16);
         }
         drop(callable);
         assert!(

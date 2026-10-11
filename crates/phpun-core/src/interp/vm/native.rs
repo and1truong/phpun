@@ -48,6 +48,7 @@ fn eligible(d: &FunctionDecl, c: &Compiled) -> bool {
         && d.ns.is_empty()
         && d.decl_in.is_none()
         && d.params.len() <= 16
+        && c.nslots >= d.params.len()
         && c.nslots <= 256
         && c.ops.len() <= 1024
         && integer_type(&d.ret)
@@ -255,8 +256,10 @@ impl Emitter {
             "<=>" => {
                 // Signed integer comparison, including MIN/MAX; SETcc leaves
                 // flags intact until both booleans have been captured.
-                self.emit(&[0x48,0x39,0xd0,0x0f,0x9f,0xc0,0x0f,0x9c,0xc2,
-                    0x48,0x0f,0xb6,0xc0,0x48,0x0f,0xb6,0xd2,0x48,0x29,0xd0]);
+                self.emit(&[
+                    0x48, 0x39, 0xd0, 0x0f, 0x9f, 0xc0, 0x0f, 0x9c, 0xc2, 0x48, 0x0f, 0xb6, 0xc0,
+                    0x48, 0x0f, 0xb6, 0xd2, 0x48, 0x29, 0xd0,
+                ]);
                 return;
             }
             _ => {
@@ -526,8 +529,13 @@ impl Program {
 }
 
 fn cached(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>, closure: bool) -> Option<Rc<Program>> {
-    if it.deadline.is_some() || super::Interp::callprof_on() || super::coverage_on()
-        || it.compiled_fns.len() > 4096 { return None; }
+    if it.deadline.is_some()
+        || super::Interp::callprof_on()
+        || super::coverage_on()
+        || it.compiled_fns.len() > 4096
+    {
+        return None;
+    }
     let key = Rc::as_ptr(decl) as usize;
     let program = {
         let state = &mut it.compiled_fns.get_mut(&key)?.3;
@@ -536,7 +544,9 @@ fn cached(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>, closure: bool) -> Option
             State::Ready(p) => Some(p.clone()),
             State::Cold(n) => {
                 *n = n.saturating_add(1);
-                if *n < 64 { return None; }
+                if *n < 64 {
+                    return None;
+                }
                 None
             }
         }
@@ -546,62 +556,111 @@ fn cached(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>, closure: bool) -> Option
         None => match Program::build(it, decl, closure) {
             Some(p) => {
                 let p = Rc::new(p);
-                it.compiled_fns.get_mut(&key)?.3 = State::Ready(p.clone()); p
+                it.compiled_fns.get_mut(&key)?.3 = State::Ready(p.clone());
+                p
             }
-            None => { it.compiled_fns.get_mut(&key)?.3 = State::Disabled; return None; }
-        }
+            None => {
+                it.compiled_fns.get_mut(&key)?.3 = State::Disabled;
+                return None;
+            }
+        },
     };
-    if !program.dependencies.iter().all(|(name,d)| it.functions.get(name.as_ref()).is_some_and(|current| Rc::ptr_eq(current,d))) {
-        it.compiled_fns.get_mut(&key)?.3 = State::Disabled; return None;
+    if !program.dependencies.iter().all(|(name, d)| {
+        it.functions
+            .get(name.as_ref())
+            .is_some_and(|current| Rc::ptr_eq(current, d))
+    }) {
+        it.compiled_fns.get_mut(&key)?.3 = State::Disabled;
+        return None;
     }
     Some(program)
 }
 
-fn run(it: &mut Interp<'_>,decl: &Rc<FunctionDecl>,program: &Program,arguments: &[i64]) -> Option<Value> {
+fn run(
+    it: &mut Interp<'_>,
+    decl: &Rc<FunctionDecl>,
+    program: &Program,
+    arguments: &[i64],
+) -> Option<Value> {
+    if decl.params.len() > arguments.len() {
+        return None;
+    }
     let top = it.vm_stack.last_mut()?;
     let used = top.used;
-    let mut context = Context { used: &mut top.used, size: top.size, depth:0, calls:0 };
+    let mut context = Context {
+        used: &mut top.used,
+        size: top.size,
+        depth: 0,
+        calls: 0,
+    };
     let mut out = 0;
     // SAFETY: emitter implements this SysV ABI, checks every slot/stack target,
     // and accepts only integer ops. The mapping and current arena segment live
     // through the call. Native code cannot call Rust/PHP or grow this segment.
-    let entry: unsafe extern "C" fn(*mut Context,*const i64,*mut i64)->u8 = unsafe { std::mem::transmute(program.code) };
-    let success = unsafe { entry(&mut context,arguments.as_ptr(),&mut out) };
-    assert_eq!(context.depth,0,"native activation leak");
-    assert_eq!(top.used,used,"native arena span leak");
-    if success==1 { program.executions.set(program.executions.get()+1); Some(Value::Int(out)) }
-    else { it.compiled_fns.get_mut(&(Rc::as_ptr(decl) as usize))?.3 = State::Disabled; None }
+    let entry: unsafe extern "C" fn(*mut Context, *const i64, *mut i64) -> u8 =
+        unsafe { std::mem::transmute(program.code) };
+    let success = unsafe { entry(&mut context, arguments.as_ptr(), &mut out) };
+    assert_eq!(context.depth, 0, "native activation leak");
+    assert_eq!(top.used, used, "native arena span leak");
+    if success == 1 {
+        program.executions.set(program.executions.get() + 1);
+        Some(Value::Int(out))
+    } else {
+        it.compiled_fns.get_mut(&(Rc::as_ptr(decl) as usize))?.3 = State::Disabled;
+        None
+    }
 }
 
 #[inline(never)]
-pub(super) fn execute(it: &mut Interp<'_>,decl: &Rc<FunctionDecl>,slots: &[Slot]) -> Option<Value> {
-    if it.cur().this_obj.is_some() || it.cur().closure_rc.is_some() { return None; }
-    let mut arguments = [0i64;16];
-    if decl.params.len()>arguments.len() { return None; }
-    for (i,slot) in slots.iter().take(decl.params.len()).enumerate() {
-        let value = match slot {
-            Slot::Arg(i)=>it.cur().value_args[*i as usize].clone(),
-            Slot::V(v)=>v.clone(), Slot::C(c)=>c.borrow().clone(), Slot::Uninit=>return None,
-        };
-        let Value::Int(n)=value else { return None; }; arguments[i]=n;
+pub(super) fn execute(
+    it: &mut Interp<'_>,
+    decl: &Rc<FunctionDecl>,
+    slots: &[Slot],
+) -> Option<Value> {
+    if it.cur().this_obj.is_some() || it.cur().closure_rc.is_some() {
+        return None;
     }
-    let program = cached(it,decl,false)?;
-    run(it,decl,&program,&arguments)
+    let mut arguments = [0i64; 16];
+    if decl.params.len() > arguments.len() {
+        return None;
+    }
+    for (i, slot) in slots.iter().take(decl.params.len()).enumerate() {
+        let value = match slot {
+            Slot::Arg(i) => it.cur().value_args[*i as usize].clone(),
+            Slot::V(v) => v.clone(),
+            Slot::C(c) => c.borrow().clone(),
+            Slot::Uninit => return None,
+        };
+        let Value::Int(n) = value else {
+            return None;
+        };
+        arguments[i] = n;
+    }
+    let program = cached(it, decl, false)?;
+    run(it, decl, &program, &arguments)
 }
 
 /// Caller reuses vm_callback_values_target's complete context/argument proof.
 /// The graph adds purity and int-only guards, so no PHP effect precedes replay.
-pub(super) fn callback(it: &mut Interp<'_>,decl: &Rc<FunctionDecl>,values: &[Value;2]) -> Option<Value> {
-    let [Value::Int(a),Value::Int(b)] = values else { return None; };
-    let program = cached(it,decl,true)?;
-    let span = (super::super::VM_FRAME_SLOTS+2)*16;
+pub(super) fn callback(
+    it: &mut Interp<'_>,
+    decl: &Rc<FunctionDecl>,
+    values: &[Value; 2],
+) -> Option<Value> {
+    let [Value::Int(a), Value::Int(b)] = values else {
+        return None;
+    };
+    let program = cached(it, decl, true)?;
+    let span = (super::super::VM_FRAME_SLOTS + 2) * 16;
     let top = it.vm_stack.last_mut()?;
-    if top.size.saturating_sub(top.used) < span { return None; }
+    if top.size.saturating_sub(top.used) < span {
+        return None;
+    }
     let used = top.used;
     top.used += span;
-    let result = run(it,decl,&program,&[*a,*b]);
+    let result = run(it, decl, &program, &[*a, *b]);
     let top = it.vm_stack.last_mut().unwrap();
-    assert_eq!(top.used,used+span,"native callback root span leak");
+    assert_eq!(top.used, used + span, "native callback root span leak");
     top.used = used;
     if result.is_some() {
         // Same scalar return side channels as the shared VM teardown. Pure
