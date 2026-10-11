@@ -931,8 +931,8 @@ or uninstrumented JIT instructions. Raw logs/exits/clean commands retained.
 
 Fresh be0e810 release workspace8core22runtime19format,fm/clippy pass;25script
 plus19workload byte/exit/error PHP-n gates,VM-profile and3406PHPT rerun retain
-2727pass603fail25skip38unsupported6crash7timeout. Known range resource
-crash/timeout changes are in the raw map, no new semantic failure claim.
+2727pass603fail25skip38unsupported6crash7timeout. All3406 individual statuses match the parent receiver map; earlier known
+range resource crash/timeout transitions remain in historical raw maps.
 
 Seven rotating PHP/parent/fixed medians, profiler-off isolated:
 
