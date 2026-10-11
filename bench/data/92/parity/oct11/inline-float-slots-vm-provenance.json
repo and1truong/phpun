@@ -1,0 +1,123 @@
+{
+  "source": "4d10d6079b952a8ddf9d14b5e5e1a77e3e72518f",
+  "runtime": "4d10d6079b952a8ddf9d14b5e5e1a77e3e72518f",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 933121,
+        "bytes": 54872652
+      },
+      "after": {
+        "requests": 883119,
+        "bytes": 53672648
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26544258
+      },
+      "after": {
+        "requests": 616041,
+        "bytes": 26544302
+      }
+    }
+  ],
+  "binary_sha256": "b65f26e2c67e8996df04a7da7ea02c96754bc81cd430cdc2a1faaf63b29865de",
+  "scope": "Declared ObjectSlot stores proven fresh float promotions inline with std OnceCell<Cell>. Both AST fresh-constructor bypass and shared compiled promoted_prop_write(uninitialized Float only) route to same representation. Canonical property/ref/typed/readonly/hook/serialization access materializes one stable Cell; cached VM ThisProp/float-leaf reads consume inline f64 or current materialized value. Existing PHP memory/object/GC-root charges unchanged; no unsafe/dependency/new pool.",
+  "fallbacks": "Non-float/existing/uninitialized/default/hooked/readonly cells retain their original canonical producer/checks. GC dying/graph and generator-field scans omit only unmaterialized floats, which cannot contain graph edges/callbacks/aliases; materialized slots retain full cell scans. Clone/unset use canonical cell identity. ONE existing receiver unit proves AST+VM activation, GC/gen no boxing, canonical identity/alias updates, clone/unset isolation and existing fallback matrix.",
+  "serialized_gc77345_rechecks": [
+    {
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+          "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 8543
+        }
+      ]
+    },
+    {
+      "summary": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 100.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+          "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+          "status": "pass",
+          "reason": "",
+          "duration_ms": 9072
+        }
+      ]
+    }
+  ],
+  "initial_ast_build": {
+    "source": "b6f8698",
+    "binary_sha256": "780cf2e11e1ffa11463d511a30b45de5db0980a3cd97213ff93c14be0958609a",
+    "timing": "not measured; shared compiled producer found during source trace, fixed before timings"
+  }
+}

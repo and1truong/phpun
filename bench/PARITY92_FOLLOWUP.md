@@ -2978,3 +2978,38 @@ Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/scalar-object-gc-*.
+
+## #347: perf(objects): keep fresh promoted floats inline until canonical cell access (2026-10-11)
+
+Declared ObjectSlot stores proven fresh float promotions inline with std OnceCell<Cell>. Both AST fresh-constructor bypass and shared compiled promoted_prop_write(uninitialized Float only) route to same representation. Canonical property/ref/typed/readonly/hook/serialization access materializes one stable Cell; cached VM ThisProp/float-leaf reads consume inline f64 or current materialized value. Existing PHP memory/object/GC-root charges unchanged; no unsafe/dependency/new pool.
+
+Non-float/existing/uninitialized/default/hooked/readonly cells retain their original canonical producer/checks. GC dying/graph and generator-field scans omit only unmaterialized floats, which cannot contain graph edges/callbacks/aliases; materialized slots retain full cell scans. Clone/unset use canonical cell identity. ONE existing receiver unit proves AST+VM activation, GC/gen no boxing, canonical identity/alias updates, clone/unset isolation and existing fallback matrix.
+
+Runtime 4d10d6079b952a8ddf9d14b5e5e1a77e3e72518f; timing source 4d10d6079b952a8ddf9d14b5e5e1a77e3e72518f; report/integration source 4d10d6079b952a8ddf9d14b5e5e1a77e3e72518f.
+
+31alternating profiler-off nativePHP8.5.11-n byte-gated pairs,independent31object confirmation,and separate freshwhole7rotatingPHP/main/parent/candidate;rawcohorts not averaged.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 101.918 | 98.218 | 0.9637 |
+| bench/40-objects.php 20 5000 | 384.147 | 377.986 | 0.9840 |
+| bench/60-json.php | 412.491 | 415.632 | 1.0076 |
+| bench/20-strings.php 100 | 233.397 | 233.188 | 0.9991 |
+| bench/30-arrays.php | 82.496 | 80.731 | 0.9786 |
+
+31pairs objects101.918→98.218ms(−3.6%),long384.147→377.986(−1.6%);JSON+.8%,strings100−.1%flat,arrays−2.1%not attributed. Independent confirming31objects96.172→92.653(−3.7%),long389.994→387.618(−.6%flat). Whole7 main3.9409→candidate2.7763×PHP,parent−1.6%;defaultobjects−.15%flat/12.178×PHP,long+2.8%negative/20.122×PHP,regex+4.1%,app+.7%negative,Composer−7.3%not attributed. Physicalobjects933121→883119requests(−50002),54872652→53672648bytes(−1200004); arraysrequestsunchanged/+44bytes. Retained storage groundwork with repeated small default-object timing win and lower physical allocations; long/corpus object gain not demonstrated. Not parity; no multiplying separate cohorts.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 933121→883119; bytes 54872652→53672648.
+- arrays: requests 616041→616041; bytes 26544258→26544302.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing receiver check+25script/19workload/VMprofile/newtyped/readonly/reference/clone/serialization/reflection/GC probe PASS.
+All3406individualPHPT onlyknownrange timeout→crash +GC77345timeout→pass;599knownfails unchanged. Same10s serializedparent8543/candidate9072ms bothPASS;fullstatus changes kept separately. Candidate2732pass599fail25skip38unsupported6crash6timeout;not full compatibility.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/inline-float-slots-vm-*.
