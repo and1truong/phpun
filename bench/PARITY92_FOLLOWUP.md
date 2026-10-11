@@ -1798,3 +1798,51 @@ Runtime a25f25377261affa86d850b67e7929f39543f86c; binarySHA256 faac63b35b157fc6f
 GitHub merged #294 into branch74 after #291 was closed; adc3090/18d70dc were not main ancestors. Ordinary main0ddef51 merge32e8353 retains #295 handle-epoch fix and resolves overlapping ctor-reference guard through the shared existing canonical fallback. Remaining main delta is parsed-limit reuse, root globals synchronization, and existing runnable checks. No external branch rewrite/force or self-merge.
 
 Exact runtime 32e8353c2c22905cff3dad49ecce4211ae0c20c4 / binarySHA256 8361bdb46bf6701ea7fb9e114a749f410a6902813ad20d3d877ac083e2adbae3. Fresh workspace/fmt/clippy/core release clean/rebuild/25script+19workload+VM-profile pass.3406individualPHPT retains2729pass601fail; only knownrange71132 timeout→crash versus reviewed parent. No new fail/pass/skip. Prior per-step figures are historical binary/source pairs, not timings of this integrated source; current-main whole comparison is pending. Raw main integration stored under memory-limit-main-*.
+
+## #293: perf(storage): keep dense scalar fills inline with lazy Cell promotion (2026-10-11)
+
+Store zero-based scalar array_fill values in actual Vec<Value> with implicit integer keys. Scalar reads/writes and CoW avoid per-element Rc/RefCell. Memory count/type/OOM preflight, Zend table charges and mixed/reference/cursor semantics remain unchanged. Compact enum keeps boxed Vec directly; only packed rows allocate lazy promotion state.
+
+Canonical Vec access or exporting an element Cell materializes the complete ordered Cell table once. Nonzero-key or object/array/resource fills remain boxed; sparse/mixed/reference operations normalize. Globals/typed-owner/readonly/handler guards and canonical GC paths remain. Shared purple-array buffering precedes the scalar last-owner shortcut. Deliberate ceiling: producer limited to scalar zero-based fill; iteration generally promotes, mixed inline storage remains open in #187.
+
+Runtime ee63f18aee2425669d55653fa0bbfcf6b7283ab4; timing source ee63f18aee2425669d55653fa0bbfcf6b7283ab4; report/integration source c8966dfff804a01ae0ec7181bd05aaebdc322de6.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/11-sieve.php | 84.583 | 65.177 | 0.7706 |
+| bench/11-sieve.php 10 100000 | 652.839 | 564.471 | 0.8646 |
+| bench/30-arrays.php | 76.922 | 77.519 | 1.0078 |
+| bench/60-json.php | 537.869 | 527.491 | 0.9807 |
+| bench/40-objects.php | 161.546 | 156.235 | 0.9671 |
+| bench/20-strings.php | 64.448 | 63.903 | 0.9915 |
+| bench/10-fib.php | 8.739 | 9.277 | 1.0616 |
+| bench/app/cli.php 100 20 | 33.854 | 32.734 | 0.9669 |
+| examples/composer/run.php | 8.713 | 8.058 | 0.9249 |
+
+7pairs defaultSieve84.583→65.177ms(−22.9%),10reps652.839→564.471(−13.5%);arraysflat+.8%,JSON−1.9%,objects−3.3%,stringsflat−.8%,app−3.3%. Initialfib+6.2%;31followupfib+3.7%,JSON+2.6% retained. Separate7rotating PHP/main0ddef/parent/final:9bench geomean4.2658→4.0376×PHP (−5.35% vs main,−3.65% vs parent),still not parity;objects18.99×PHP/long33.23×,app6.89×. Wide-state prototype had31arrays+4.3%,JSON+2.7%,strings+2.1%; compact enum replaces that state. All raw/source/hashes retained, no mixing user/Devin host ratios.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- sieve10: requests 1032477→32477; bytes 78034527→22034515.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing scalar-dimension unit asserts packed writes/CoW and reference normalization; existing lifetime/readonly/canonical fixtures reused. Additional native packed mutator/view probe recorded separately.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Parent summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 8, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/compact-packed-*.
+
+### Packed storage versions and current-main whole comparison
+
+Wide-state prototype main31058ed:31pairs arrays+4.3%,strings+2.1%,JSON+2.7%,objects-long+0.1%,app+0.8%. Compact enum ee63f18 keeps boxed Vec directly; promotion state only on packed rows. Three earlier binary/source/maps and all negative rows remain separate. No performance claim transferred across review sync/epoch integrations.
+
+Final compactSHA256 0feb20789ce1b0b97028950ac31e2612431884ebc03c996aa53d1923e8d88786; extra readonly/reference/foreach/shift/unshift/sort/ArrayIterator supported probe byte-pass. Full shift/unshift/splice probe has a PRE-EXISTING extra element on real main, integrated parent, wide and compact alike; preserve source/native/main/candidate outputs in packed-views-comparison.json, do not claim its PHP gate passes.
+
+Fresh clean real main0ddef51 binarya8d427b:3406map equal integrated reference, native ctor-ref pass but two globals-reference probes fail on main and pass in #297. PHP8.5.11-n hash32fa863; OPcache loaded CLI0/JITdisable, no mbstring extension.
+
+Seven rotating PHP/main0ddef/parent/final byte-gated profiler-off runs:9bench main4.265840→final4.037589×PHP, final/main0.946493,final/parent0.963475. FinalPHP ratios startup1.556,fib0.799,sieve8.212,strings4.712,arrays4.476,objects18.991,regex5.607,JSON3.494,DB3.558. Longstrings6.034,longobjects33.234,app6.889,Composer1.757.31followupfib8.502→8.820(+3.7%);JSON516.901→530.245(+2.6%) retained. This host/main0ddef/candidate snapshot is not user2.71× or a later moving main. Full raw compact-packed-four-timings.json; no multiplication of stage gains/parity claim.
