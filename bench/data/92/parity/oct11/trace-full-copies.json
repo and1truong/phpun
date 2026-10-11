@@ -1,0 +1,5251 @@
+{
+  "runtime": "fa968a7",
+  "binary": "/workspace/parity92/oct11/trace-shells",
+  "sha256": "d44ce1aee4bfac2ec6610edc9a605df6a987cbc2285a6930a2a54a7d1ba2d06f",
+  "argv": [
+    "bench/10-fib.php",
+    "26"
+  ],
+  "gate": "oracle exit/stdout/stderr exact after collector records removed",
+  "coverage": "out-of-line memcpy/memmove only; inline/hidden/realloc movement unobserved; cold startup/parse included",
+  "overflow": {
+    "calls": 0,
+    "bytes": 0
+  },
+  "observed_copy_bytes": 11102261,
+  "observed_copy_calls": 57301,
+  "callers": [
+    {
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone",
+      "calls": 7822,
+      "bytes": 1387725,
+      "percent_observed_bytes": 12.499480961580709
+    },
+    {
+      "caller": "<alloc::raw_vec::RawVecInner>::finish_grow",
+      "calls": 879,
+      "bytes": 770939,
+      "percent_observed_bytes": 6.943981951063842
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::postfix",
+      "calls": 2508,
+      "bytes": 581856,
+      "percent_observed_bytes": 5.240878412063993
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::unary",
+      "calls": 1908,
+      "bytes": 442656,
+      "percent_observed_bytes": 3.987079748890789
+    },
+    {
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone",
+      "calls": 1570,
+      "bytes": 414692,
+      "percent_observed_bytes": 3.7352031266424017
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::args",
+      "calls": 1310,
+      "bytes": 407345,
+      "percent_observed_bytes": 3.669027417027937
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::markline",
+      "calls": 1536,
+      "bytes": 356352,
+      "percent_observed_bytes": 3.2097245777234025
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::body",
+      "calls": 1230,
+      "bytes": 331280,
+      "percent_observed_bytes": 2.9838967035633552
+    },
+    {
+      "caller": "<phpun_core::ast::FunctionDecl as core::clone::Clone>::clone",
+      "calls": 1044,
+      "bytes": 325728,
+      "percent_observed_bytes": 2.933888871825298
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::comparison",
+      "calls": 1250,
+      "bytes": 290000,
+      "percent_observed_bytes": 2.6120805482775085
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::additive",
+      "calls": 1248,
+      "bytes": 289536,
+      "percent_observed_bytes": 2.6079012194002646
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::term",
+      "calls": 1166,
+      "bytes": 270512,
+      "percent_observed_bytes": 2.43654873543326
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::power",
+      "calls": 1160,
+      "bytes": 269120,
+      "percent_observed_bytes": 2.424010748801528
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::bit_and",
+      "calls": 1150,
+      "bytes": 266800,
+      "percent_observed_bytes": 2.403114104415308
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::concat",
+      "calls": 1136,
+      "bytes": 263552,
+      "percent_observed_bytes": 2.3738588022746
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::shift",
+      "calls": 1134,
+      "bytes": 263088,
+      "percent_observed_bytes": 2.3696794733973556
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::equality",
+      "calls": 1132,
+      "bytes": 262624,
+      "percent_observed_bytes": 2.365500144520112
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::bit_or",
+      "calls": 1118,
+      "bytes": 259376,
+      "percent_observed_bytes": 2.3362448423794038
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::bit_xor",
+      "calls": 1118,
+      "bytes": 259376,
+      "percent_observed_bytes": 2.3362448423794038
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::ternary",
+      "calls": 1111,
+      "bytes": 257752,
+      "percent_observed_bytes": 2.3216171913090498
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::logical_and",
+      "calls": 1089,
+      "bytes": 252648,
+      "percent_observed_bytes": 2.2756445736593656
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::logical_or",
+      "calls": 1041,
+      "bytes": 241512,
+      "percent_observed_bytes": 2.175340680605509
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::assign",
+      "calls": 1012,
+      "bytes": 234784,
+      "percent_observed_bytes": 2.114740411885471
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::stmt",
+      "calls": 892,
+      "bytes": 221216,
+      "percent_observed_bytes": 1.992531070923301
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::logical_or_low",
+      "calls": 832,
+      "bytes": 193024,
+      "percent_observed_bytes": 1.7386008129335098
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::logical_xor_low",
+      "calls": 832,
+      "bytes": 193024,
+      "percent_observed_bytes": 1.7386008129335098
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::logical_and_low",
+      "calls": 832,
+      "bytes": 193024,
+      "percent_observed_bytes": 1.7386008129335098
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed",
+      "calls": 546,
+      "bytes": 127547,
+      "percent_observed_bytes": 1.1488380610039703
+    },
+    {
+      "caller": "<phpun_core::ast::Param as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>",
+      "calls": 617,
+      "bytes": 99634,
+      "percent_observed_bytes": 0.8974208046451079
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::resolve_scope_tys",
+      "calls": 456,
+      "bytes": 98250,
+      "percent_observed_bytes": 0.884954875407811
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::class_decl",
+      "calls": 364,
+      "bytes": 93496,
+      "percent_observed_bytes": 0.8421347687646688
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::exec_at",
+      "calls": 492,
+      "bytes": 90502,
+      "percent_observed_bytes": 0.8151672888972795
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::list_target",
+      "calls": 354,
+      "bytes": 82128,
+      "percent_observed_bytes": 0.7397412112721904
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::method",
+      "calls": 614,
+      "bytes": 79105,
+      "percent_observed_bytes": 0.7125125233499735
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::primary",
+      "calls": 296,
+      "bytes": 68672,
+      "percent_observed_bytes": 0.618540673832114
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#0}",
+      "calls": 279,
+      "bytes": 66216,
+      "percent_observed_bytes": 0.5964190537404949
+    },
+    {
+      "caller": "<alloc::boxed::Box<phpun_core::ast::Expr> as core::clone::Clone>::clone",
+      "calls": 262,
+      "bytes": 60784,
+      "percent_observed_bytes": 0.5474920829189658
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes",
+      "calls": 257,
+      "bytes": 59008,
+      "percent_observed_bytes": 0.5314953413543422
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class",
+      "calls": 395,
+      "bytes": 56483,
+      "percent_observed_bytes": 0.508752226235719
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::param",
+      "calls": 473,
+      "bytes": 52065,
+      "percent_observed_bytes": 0.46895853015885686
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#12}",
+      "calls": 370,
+      "bytes": 48087,
+      "percent_observed_bytes": 0.43312799077593295
+    },
+    {
+      "caller": "<phpun_core::ast::ClassDecl as core::clone::Clone>::clone",
+      "calls": 200,
+      "bytes": 43831,
+      "percent_observed_bytes": 0.3947934569363844
+    },
+    {
+      "caller": "<phpun_core::ast::PropDecl as core::clone::Clone>::clone",
+      "calls": 294,
+      "bytes": 43113,
+      "percent_observed_bytes": 0.38832630578582145
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::params",
+      "calls": 148,
+      "bytes": 40256,
+      "percent_observed_bytes": 0.3625928087981358
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#3}",
+      "calls": 393,
+      "bytes": 38569,
+      "percent_observed_bytes": 0.3473977057466042
+    },
+    {
+      "caller": "<alloc::string::String as core::fmt::Write>::write_str",
+      "calls": 2336,
+      "bytes": 38118,
+      "percent_observed_bytes": 0.34333547013531746
+    },
+    {
+      "caller": "phpun_core::parser::parse_toks",
+      "calls": 120,
+      "bytes": 37120,
+      "percent_observed_bytes": 0.3343463101795211
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::program",
+      "calls": 80,
+      "bytes": 24960,
+      "percent_observed_bytes": 0.22481907063795384
+    },
+    {
+      "caller": "<alloc::vec::Vec<phpun_core::ast::ConstDecl> as core::clone::Clone>::clone",
+      "calls": 65,
+      "bytes": 22360,
+      "percent_observed_bytes": 0.2014004174465003
+    },
+    {
+      "caller": "<alloc::vec::Vec<(phpun_core::ast::Expr, alloc::vec::Vec<phpun_core::ast::Stmt>)>>::remove",
+      "calls": 138,
+      "bytes": 21344,
+      "percent_observed_bytes": 0.19224912835322464
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_class",
+      "calls": 85,
+      "bytes": 21152,
+      "percent_observed_bytes": 0.19051975088677883
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::switch_stmt",
+      "calls": 82,
+      "bytes": 20264,
+      "percent_observed_bytes": 0.182521380104467
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::array_items",
+      "calls": 60,
+      "bytes": 17168,
+      "percent_observed_bytes": 0.1546351684580285
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::new",
+      "calls": 546,
+      "bytes": 16950,
+      "percent_observed_bytes": 0.15267160445966818
+    },
+    {
+      "caller": "<phpun_core::ast::ConstDecl as core::clone::Clone>::clone",
+      "calls": 130,
+      "bytes": 15725,
+      "percent_observed_bytes": 0.1416378159367718
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::const_expr",
+      "calls": 57,
+      "bytes": 13224,
+      "percent_observed_bytes": 0.11911087300145438
+    },
+    {
+      "caller": "phpun_core::lexer::ident",
+      "calls": 2457,
+      "bytes": 12830,
+      "percent_observed_bytes": 0.11556204632551874
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::vm_run_direct",
+      "calls": 25,
+      "bytes": 9600,
+      "percent_observed_bytes": 0.08646887332228993
+    },
+    {
+      "caller": "<phpun_core::lexer::Token as core::clone::Clone>::clone",
+      "calls": 1980,
+      "bytes": 8831,
+      "percent_observed_bytes": 0.07954235628220234
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#1}",
+      "calls": 93,
+      "bytes": 6783,
+      "percent_observed_bytes": 0.061095663306780484
+    },
+    {
+      "caller": "std::env::vars_os",
+      "calls": 248,
+      "bytes": 5926,
+      "percent_observed_bytes": 0.053376514927905225
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#4}",
+      "calls": 24,
+      "bytes": 5376,
+      "percent_observed_bytes": 0.04842256906048237
+    },
+    {
+      "caller": "<alloc::string::String as core::clone::Clone>::clone",
+      "calls": 859,
+      "bytes": 5058,
+      "percent_observed_bytes": 0.04555828763168151
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::fold_var_arg",
+      "calls": 21,
+      "bytes": 4872,
+      "percent_observed_bytes": 0.04388295321106214
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::new_class_expr",
+      "calls": 21,
+      "bytes": 4872,
+      "percent_observed_bytes": 0.04388295321106214
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#9}",
+      "calls": 28,
+      "bytes": 3568,
+      "percent_observed_bytes": 0.03213759791811776
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::unmark_argline",
+      "calls": 14,
+      "bytes": 3248,
+      "percent_observed_bytes": 0.029255302140708095
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::unset_arg",
+      "calls": 14,
+      "bytes": 3248,
+      "percent_observed_bytes": 0.029255302140708095
+    },
+    {
+      "caller": "<alloc::vec::Vec<phpun_core::ast::Expr>>::push_mut",
+      "calls": 14,
+      "bytes": 3248,
+      "percent_observed_bytes": 0.029255302140708095
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#5}",
+      "calls": 16,
+      "bytes": 2742,
+      "percent_observed_bytes": 0.024697671942679064
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::take_type",
+      "calls": 170,
+      "bytes": 2366,
+      "percent_observed_bytes": 0.021310974404222707
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::incdec_operand",
+      "calls": 10,
+      "bytes": 2320,
+      "percent_observed_bytes": 0.02089664438622007
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::foreach_stmt",
+      "calls": 10,
+      "bytes": 2320,
+      "percent_observed_bytes": 0.02089664438622007
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::method_decl",
+      "calls": 288,
+      "bytes": 2152,
+      "percent_observed_bytes": 0.019383439103079995
+    },
+    {
+      "caller": "<alloc::vec::Vec<alloc::string::String> as core::clone::Clone>::clone",
+      "calls": 300,
+      "bytes": 1696,
+      "percent_observed_bytes": 0.015276167620271222
+    },
+    {
+      "caller": "alloc::str::join_generic_copy::<str, u8, alloc::string::String>",
+      "calls": 232,
+      "bytes": 1604,
+      "percent_observed_bytes": 0.014447507584265943
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::name_path",
+      "calls": 140,
+      "bytes": 1232,
+      "percent_observed_bytes": 0.011096838743027209
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::eval_decl_const",
+      "calls": 18,
+      "bytes": 1170,
+      "percent_observed_bytes": 0.010538393936154087
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs",
+      "calls": 16,
+      "bytes": 1148,
+      "percent_observed_bytes": 0.010340236101457172
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::ref_variable",
+      "calls": 4,
+      "bytes": 928,
+      "percent_observed_bytes": 0.008358657754488028
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::eval",
+      "calls": 8,
+      "bytes": 912,
+      "percent_observed_bytes": 0.008214542965617544
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::check_interface_sigs",
+      "calls": 73,
+      "bytes": 799,
+      "percent_observed_bytes": 0.007196732269219756
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::ns_resolve",
+      "calls": 99,
+      "bytes": 767,
+      "percent_observed_bytes": 0.0069085026914787896
+    },
+    {
+      "caller": "alloc::str::join_generic_copy::<str, u8, &str>",
+      "calls": 50,
+      "bytes": 609,
+      "percent_observed_bytes": 0.005485369151382768
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::check_override_sigs",
+      "calls": 39,
+      "bytes": 532,
+      "percent_observed_bytes": 0.004791816729943567
+    },
+    {
+      "caller": "<alloc::vec::Vec<phpun_core::ast::Expr> as core::clone::Clone>::clone",
+      "calls": 2,
+      "bytes": 464,
+      "percent_observed_bytes": 0.004179328877244014
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::expr_list",
+      "calls": 2,
+      "bytes": 464,
+      "percent_observed_bytes": 0.004179328877244014
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::implements_iface",
+      "calls": 44,
+      "bytes": 445,
+      "percent_observed_bytes": 0.004008192565460315
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::flow_unit",
+      "calls": 3,
+      "bytes": 419,
+      "percent_observed_bytes": 0.0037740060335457798
+    },
+    {
+      "caller": "<std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String> as core::iter::traits::collect::FromIterator<(alloc::string::String, alloc::string::String)>>::from_iter::<[(alloc::string::String, alloc::string::String); 4]>",
+      "calls": 2,
+      "bytes": 400,
+      "percent_observed_bytes": 0.0036028697217620805
+    },
+    {
+      "caller": "<alloc::vec::Vec<phpun_core::lexer::StringPart> as core::clone::Clone>::clone",
+      "calls": 20,
+      "bytes": 398,
+      "percent_observed_bytes": 0.0035848553731532705
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::frame_new::<alloc::rc::Rc<str>>",
+      "calls": 1,
+      "bytes": 384,
+      "percent_observed_bytes": 0.0034587549328915974
+    },
+    {
+      "caller": "<core::iter::adapters::GenericShunt<core::iter::adapters::map::Map<core::str::iter::Split<char>, <phpun_core::parser::Parser>::take_type::{closure#3}::{closure#0}>, core::result::Result<core::convert::Infallible, phpun_core::error::PhpError>> as core::iter::traits::iterator::Iterator>::next",
+      "calls": 85,
+      "bytes": 342,
+      "percent_observed_bytes": 0.003080453612106579
+    },
+    {
+      "caller": "<phpun_core::parser::Parser>::ns_qualify",
+      "calls": 18,
+      "bytes": 245,
+      "percent_observed_bytes": 0.0022067577045792744
+    },
+    {
+      "caller": "phpun::run_script",
+      "calls": 6,
+      "bytes": 190,
+      "percent_observed_bytes": 0.0017113631178369882
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::arg_cells",
+      "calls": 1,
+      "bytes": 168,
+      "percent_observed_bytes": 0.001513205283140074
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::invoke_fn",
+      "calls": 1,
+      "bytes": 168,
+      "percent_observed_bytes": 0.001513205283140074
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::trace_push",
+      "calls": 1,
+      "bytes": 160,
+      "percent_observed_bytes": 0.0014411478887048322
+    },
+    {
+      "caller": "<phpun_core::interp::vm::Compiled>::compile",
+      "calls": 2,
+      "bytes": 145,
+      "percent_observed_bytes": 0.0013060402741387543
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#9}",
+      "calls": 11,
+      "bytes": 145,
+      "percent_observed_bytes": 0.0013060402741387543
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::dim_op_outlet::<phpun_core::value::Value>",
+      "calls": 1,
+      "bytes": 144,
+      "percent_observed_bytes": 0.001297033099834349
+    },
+    {
+      "caller": "phpun_core::lexer::interp_scan",
+      "calls": 138,
+      "bytes": 138,
+      "percent_observed_bytes": 0.001242990054007918
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#12}",
+      "calls": 10,
+      "bytes": 136,
+      "percent_observed_bytes": 0.0012249757053991075
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#10}",
+      "calls": 10,
+      "bytes": 136,
+      "percent_observed_bytes": 0.0012249757053991075
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::eval_code",
+      "calls": 2,
+      "bytes": 111,
+      "percent_observed_bytes": 0.0009997963477889774
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#8}",
+      "calls": 7,
+      "bytes": 90,
+      "percent_observed_bytes": 0.0008106456873964681
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#13}",
+      "calls": 18,
+      "bytes": 84,
+      "percent_observed_bytes": 0.000756602641570037
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::set_server_var",
+      "calls": 6,
+      "bytes": 82,
+      "percent_observed_bytes": 0.0007385882929612266
+    },
+    {
+      "caller": "std::sys::fs::unix::readlink",
+      "calls": 2,
+      "bytes": 76,
+      "percent_observed_bytes": 0.0006845452471347953
+    },
+    {
+      "caller": "phpun::main",
+      "calls": 3,
+      "bytes": 56,
+      "percent_observed_bytes": 0.0005044017610466913
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#2}",
+      "calls": 6,
+      "bytes": 55,
+      "percent_observed_bytes": 0.0004953945867422861
+    },
+    {
+      "caller": "std::sys::fs::unix::canonicalize",
+      "calls": 1,
+      "bytes": 46,
+      "percent_observed_bytes": 0.0004143300180026393
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::concat_bytes",
+      "calls": 4,
+      "bytes": 27,
+      "percent_observed_bytes": 0.00024319370621894045
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::trait_sig_error::{closure#6}",
+      "calls": 8,
+      "bytes": 24,
+      "percent_observed_bytes": 0.00021617218330572484
+    },
+    {
+      "caller": "<core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<alloc::string::String>, alloc::vec::Vec<alloc::string::String>, <phpun_core::interp::Interp>::zpp_ty_disp::{closure#0}> as core::iter::traits::iterator::Iterator>::next",
+      "calls": 6,
+      "bytes": 22,
+      "percent_observed_bytes": 0.00019815783469691444
+    },
+    {
+      "caller": "std::fs::read_to_string::inner",
+      "calls": 1,
+      "bytes": 16,
+      "percent_observed_bytes": 0.00014411478887048322
+    },
+    {
+      "caller": "std::sys::fs::canonicalize",
+      "calls": 1,
+      "bytes": 16,
+      "percent_observed_bytes": 0.00014411478887048322
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::vm_run",
+      "calls": 1,
+      "bytes": 8,
+      "percent_observed_bytes": 7.205739443524161e-05
+    },
+    {
+      "caller": "<alloc::rc::Rc<str> as core::convert::From<alloc::string::String>>::from",
+      "calls": 28,
+      "bytes": 6,
+      "percent_observed_bytes": 5.404304582643121e-05
+    },
+    {
+      "caller": "<alloc::rc::Rc<[u8]>>::copy_from_slice",
+      "calls": 2,
+      "bytes": 6,
+      "percent_observed_bytes": 5.404304582643121e-05
+    },
+    {
+      "caller": "<i64 as alloc::string::SpecToString>::spec_to_string",
+      "calls": 1,
+      "bytes": 6,
+      "percent_observed_bytes": 5.404304582643121e-05
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::eval::{closure#2}",
+      "calls": 1,
+      "bytes": 4,
+      "percent_observed_bytes": 3.6028697217620804e-05
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::mem_check",
+      "calls": 1,
+      "bytes": 4,
+      "percent_observed_bytes": 3.6028697217620804e-05
+    },
+    {
+      "caller": "<phpun_core::interp::Interp>::var_cell",
+      "calls": 2,
+      "bytes": 2,
+      "percent_observed_bytes": 1.8014348608810402e-05
+    },
+    {
+      "caller": "<std::io::stdio::StdoutLock as core::io::write::Write>::write_all",
+      "calls": 2,
+      "bytes": 0,
+      "percent_observed_bytes": 0.0
+    }
+  ],
+  "sites": [
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7770114,
+      "calls": 310,
+      "bytes": 20055,
+      "caller": "<alloc::string::String as core::fmt::Write>::write_str"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6197344,
+      "calls": 8,
+      "bytes": 24,
+      "caller": "<phpun_core::interp::Interp>::trait_sig_error::{closure#6}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7180643,
+      "calls": 832,
+      "bytes": 193024,
+      "caller": "<phpun_core::parser::Parser>::logical_or_low"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7246236,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7639622,
+      "calls": 40,
+      "bytes": 12480,
+      "caller": "phpun_core::parser::parse_toks"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4690776,
+      "calls": 1,
+      "bytes": 168,
+      "caller": "<phpun_core::interp::Interp>::arg_cells"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7377955,
+      "calls": 144,
+      "bytes": 1076,
+      "caller": "<phpun_core::parser::Parser>::method_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7443604,
+      "calls": 18,
+      "bytes": 245,
+      "caller": "<phpun_core::parser::Parser>::ns_qualify"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7247109,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7837166,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6002268,
+      "calls": 1,
+      "bytes": 1,
+      "caller": "<phpun_core::interp::Interp>::var_cell"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4232929,
+      "calls": 1,
+      "bytes": 384,
+      "caller": "<phpun_core::interp::Interp>::frame_new::<alloc::rc::Rc<str>>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7247690,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7837600,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7182346,
+      "calls": 832,
+      "bytes": 193024,
+      "caller": "<phpun_core::parser::Parser>::logical_xor_low"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6002753,
+      "calls": 1,
+      "bytes": 1,
+      "caller": "<phpun_core::interp::Interp>::var_cell"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7837816,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7837834,
+      "calls": 1,
+      "bytes": 376,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7837856,
+      "calls": 1,
+      "bytes": 376,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7837971,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6068611,
+      "calls": 16,
+      "bytes": 4096,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6068658,
+      "calls": 16,
+      "bytes": 4352,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 8493515,
+      "calls": 3,
+      "bytes": 224,
+      "caller": "<alloc::raw_vec::RawVecInner>::finish_grow"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7182824,
+      "calls": 512,
+      "bytes": 118784,
+      "caller": "<phpun_core::parser::Parser>::markline"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7182844,
+      "calls": 512,
+      "bytes": 118784,
+      "caller": "<phpun_core::parser::Parser>::markline"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7379491,
+      "calls": 144,
+      "bytes": 1076,
+      "caller": "<phpun_core::parser::Parser>::method_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7182912,
+      "calls": 512,
+      "bytes": 118784,
+      "caller": "<phpun_core::parser::Parser>::markline"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7838716,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7248976,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7838827,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3644650,
+      "calls": 45,
+      "bytes": 328,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7249134,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7249208,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7249235,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7249309,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7577051,
+      "calls": 1,
+      "bytes": 65,
+      "caller": "<phpun_core::interp::Interp>::eval_code"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6070034,
+      "calls": 16,
+      "bytes": 4096,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6070098,
+      "calls": 16,
+      "bytes": 4352,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7642974,
+      "calls": 20,
+      "bytes": 6240,
+      "caller": "<phpun_core::parser::Parser>::program"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7643047,
+      "calls": 20,
+      "bytes": 6240,
+      "caller": "<phpun_core::parser::Parser>::program"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7446517,
+      "calls": 16,
+      "bytes": 4992,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7184426,
+      "calls": 832,
+      "bytes": 193024,
+      "caller": "<phpun_core::parser::Parser>::logical_and_low"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7381035,
+      "calls": 86,
+      "bytes": 350,
+      "caller": "<phpun_core::parser::Parser>::take_type"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6070325,
+      "calls": 16,
+      "bytes": 2944,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7250066,
+      "calls": 991,
+      "bytes": 229912,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4628723,
+      "calls": 1,
+      "bytes": 14,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7840175,
+      "calls": 1,
+      "bytes": 376,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7840197,
+      "calls": 1,
+      "bytes": 376,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7840222,
+      "calls": 1,
+      "bytes": 376,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7250546,
+      "calls": 173,
+      "bytes": 40136,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7316473,
+      "calls": 91,
+      "bytes": 21112,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7447565,
+      "calls": 16,
+      "bytes": 4992,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7644200,
+      "calls": 20,
+      "bytes": 6240,
+      "caller": "<phpun_core::parser::Parser>::program"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7316541,
+      "calls": 91,
+      "bytes": 21112,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7644258,
+      "calls": 20,
+      "bytes": 6240,
+      "caller": "<phpun_core::parser::Parser>::program"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7447725,
+      "calls": 16,
+      "bytes": 2944,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7251158,
+      "calls": 173,
+      "bytes": 40136,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7251192,
+      "calls": 173,
+      "bytes": 40136,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7251221,
+      "calls": 173,
+      "bytes": 40136,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7251258,
+      "calls": 173,
+      "bytes": 40136,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7447991,
+      "calls": 16,
+      "bytes": 2944,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9545176,
+      "calls": 1,
+      "bytes": 16,
+      "caller": "std::fs::read_to_string::inner"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4630098,
+      "calls": 28,
+      "bytes": 400,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7579374,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::eval_code"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4433733,
+      "calls": 111,
+      "bytes": 657,
+      "caller": "<phpun_core::ast::PropDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4433780,
+      "calls": 72,
+      "bytes": 16704,
+      "caller": "<phpun_core::ast::PropDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7186575,
+      "calls": 1012,
+      "bytes": 234784,
+      "caller": "<phpun_core::parser::Parser>::assign"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3975313,
+      "calls": 1,
+      "bytes": 160,
+      "caller": "<phpun_core::interp::Interp>::trace_push"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6138008,
+      "calls": 7,
+      "bytes": 88,
+      "caller": "<phpun_core::interp::Interp>::check_override_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7055514,
+      "calls": 1,
+      "bytes": 144,
+      "caller": "<phpun_core::interp::Interp>::dim_op_outlet::<phpun_core::value::Value>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4434189,
+      "calls": 111,
+      "bytes": 25752,
+      "caller": "<phpun_core::ast::PropDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6138245,
+      "calls": 10,
+      "bytes": 136,
+      "caller": "<phpun_core::interp::Interp>::check_override_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7449076,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7318039,
+      "calls": 5,
+      "bytes": 1160,
+      "caller": "<phpun_core::parser::Parser>::incdec_operand"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7842364,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7449165,
+      "calls": 7,
+      "bytes": 1792,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6138503,
+      "calls": 3,
+      "bytes": 48,
+      "caller": "<phpun_core::interp::Interp>::check_override_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6531887,
+      "calls": 1,
+      "bytes": 1,
+      "caller": "<phpun_core::interp::vm::Compiled>::compile"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7842650,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6138974,
+      "calls": 15,
+      "bytes": 218,
+      "caller": "<phpun_core::interp::Interp>::check_override_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7449807,
+      "calls": 2,
+      "bytes": 512,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7843036,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4435264,
+      "calls": 14,
+      "bytes": 3248,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7843231,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4435362,
+      "calls": 14,
+      "bytes": 104,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6139344,
+      "calls": 4,
+      "bytes": 42,
+      "caller": "<phpun_core::interp::Interp>::check_override_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4435591,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4107981,
+      "calls": 28,
+      "bytes": 6,
+      "caller": "<alloc::rc::Rc<str> as core::convert::From<alloc::string::String>>::from"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7450498,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::switch_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 5877659,
+      "calls": 65,
+      "bytes": 22360,
+      "caller": "<alloc::vec::Vec<phpun_core::ast::ConstDecl> as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4435985,
+      "calls": 182,
+      "bytes": 42224,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 5877893,
+      "calls": 65,
+      "bytes": 645,
+      "caller": "<phpun_core::ast::ConstDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4436143,
+      "calls": 238,
+      "bytes": 55216,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7319820,
+      "calls": 5,
+      "bytes": 1160,
+      "caller": "<phpun_core::parser::Parser>::incdec_operand"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4436254,
+      "calls": 206,
+      "bytes": 47792,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 2863518,
+      "calls": 1,
+      "bytes": 16,
+      "caller": "phpun::run_script"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6533540,
+      "calls": 1,
+      "bytes": 144,
+      "caller": "<phpun_core::interp::vm::Compiled>::compile"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 5878187,
+      "calls": 65,
+      "bytes": 15080,
+      "caller": "<phpun_core::ast::ConstDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4436470,
+      "calls": 1660,
+      "bytes": 385120,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4436572,
+      "calls": 1660,
+      "bytes": 385120,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4436693,
+      "calls": 240,
+      "bytes": 2327,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4436792,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4436922,
+      "calls": 44,
+      "bytes": 10208,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7189728,
+      "calls": 1005,
+      "bytes": 233160,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4437359,
+      "calls": 254,
+      "bytes": 58928,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4437511,
+      "calls": 114,
+      "bytes": 935,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4437644,
+      "calls": 42,
+      "bytes": 9744,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4437807,
+      "calls": 40,
+      "bytes": 9280,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4438045,
+      "calls": 14,
+      "bytes": 3248,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6076517,
+      "calls": 17,
+      "bytes": 242,
+      "caller": "<phpun_core::interp::Interp>::resolve_scope_tys"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4438207,
+      "calls": 12,
+      "bytes": 2784,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7846088,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6076623,
+      "calls": 7,
+      "bytes": 88,
+      "caller": "<phpun_core::interp::Interp>::resolve_scope_tys"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7846278,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7453099,
+      "calls": 10,
+      "bytes": 2320,
+      "caller": "<phpun_core::parser::Parser>::foreach_stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4438512,
+      "calls": 26,
+      "bytes": 6032,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3258872,
+      "calls": 669,
+      "bytes": 11083,
+      "caller": "<alloc::raw_vec::RawVecInner>::finish_grow"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6077003,
+      "calls": 144,
+      "bytes": 28800,
+      "caller": "<phpun_core::interp::Interp>::resolve_scope_tys"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4438629,
+      "calls": 1494,
+      "bytes": 4658,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191201,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4438728,
+      "calls": 10,
+      "bytes": 2320,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191295,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191330,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6077224,
+      "calls": 144,
+      "bytes": 33408,
+      "caller": "<phpun_core::interp::Interp>::resolve_scope_tys"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4438850,
+      "calls": 352,
+      "bytes": 81664,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191420,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6077328,
+      "calls": 144,
+      "bytes": 35712,
+      "caller": "<phpun_core::interp::Interp>::resolve_scope_tys"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4438967,
+      "calls": 352,
+      "bytes": 81664,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7257060,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::ref_variable"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191781,
+      "calls": 13,
+      "bytes": 3016,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191825,
+      "calls": 13,
+      "bytes": 3016,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191860,
+      "calls": 13,
+      "bytes": 3016,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7388501,
+      "calls": 84,
+      "bytes": 2016,
+      "caller": "<phpun_core::parser::Parser>::take_type"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191910,
+      "calls": 13,
+      "bytes": 3016,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4439401,
+      "calls": 538,
+      "bytes": 124816,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191937,
+      "calls": 13,
+      "bytes": 3016,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7191995,
+      "calls": 13,
+      "bytes": 3016,
+      "caller": "<phpun_core::parser::Parser>::ternary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6078279,
+      "calls": 7,
+      "bytes": 88,
+      "caller": "<phpun_core::interp::Interp>::check_interface_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4440130,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6078584,
+      "calls": 3,
+      "bytes": 48,
+      "caller": "<phpun_core::interp::Interp>::check_interface_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4440232,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4440386,
+      "calls": 30,
+      "bytes": 6960,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6078890,
+      "calls": 9,
+      "bytes": 108,
+      "caller": "<phpun_core::interp::Interp>::check_interface_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6079252,
+      "calls": 9,
+      "bytes": 108,
+      "caller": "<phpun_core::interp::Interp>::check_interface_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6079373,
+      "calls": 45,
+      "bytes": 447,
+      "caller": "<phpun_core::interp::Interp>::check_interface_sigs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4441111,
+      "calls": 43,
+      "bytes": 9976,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4441200,
+      "calls": 43,
+      "bytes": 461,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4441371,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7521577,
+      "calls": 85,
+      "bytes": 342,
+      "caller": "<core::iter::adapters::GenericShunt<core::iter::adapters::map::Map<core::str::iter::Split<char>, <phpun_core::parser::Parser>::take_type::{closure#3}::{closure#0}>, core::result::Result<core::convert::Infallible, phpun_core::error::PhpError>> as core::iter::traits::iterator::Iterator>::next"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4441550,
+      "calls": 12,
+      "bytes": 2784,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4441624,
+      "calls": 28,
+      "bytes": 12992,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7194291,
+      "calls": 177,
+      "bytes": 41064,
+      "caller": "<phpun_core::parser::Parser>::list_target"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7194302,
+      "calls": 177,
+      "bytes": 41064,
+      "caller": "<phpun_core::parser::Parser>::list_target"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6146084,
+      "calls": 7,
+      "bytes": 88,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#12}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4245575,
+      "calls": 9,
+      "bytes": 585,
+      "caller": "<phpun_core::interp::Interp>::eval_decl_const"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4442239,
+      "calls": 22,
+      "bytes": 5104,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4245709,
+      "calls": 9,
+      "bytes": 585,
+      "caller": "<phpun_core::interp::Interp>::eval_decl_const"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7326156,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::fold_var_arg"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4442608,
+      "calls": 26,
+      "bytes": 6032,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9292332,
+      "calls": 11,
+      "bytes": 6432,
+      "caller": "<alloc::raw_vec::RawVecInner>::finish_grow"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7326371,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::fold_var_arg"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6146733,
+      "calls": 3,
+      "bytes": 48,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#12}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7326422,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::fold_var_arg"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 2870087,
+      "calls": 1,
+      "bytes": 2,
+      "caller": "phpun::run_script"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7850913,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7261296,
+      "calls": 5,
+      "bytes": 1160,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4443435,
+      "calls": 82,
+      "bytes": 19024,
+      "caller": "<phpun_core::ast::Expr as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 2870619,
+      "calls": 1,
+      "bytes": 16,
+      "caller": "phpun::run_script"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7851391,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7261736,
+      "calls": 5,
+      "bytes": 1160,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4378164,
+      "calls": 6,
+      "bytes": 22,
+      "caller": "<core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<alloc::string::String>, alloc::vec::Vec<alloc::string::String>, <phpun_core::interp::Interp>::zpp_ty_disp::{closure#0}> as core::iter::traits::iterator::Iterator>::next"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 2870831,
+      "calls": 1,
+      "bytes": 2,
+      "caller": "phpun::run_script"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9490230,
+      "calls": 126,
+      "bytes": 2000,
+      "caller": "std::env::vars_os"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7851865,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9490322,
+      "calls": 122,
+      "bytes": 3926,
+      "caller": "std::env::vars_os"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 2871359,
+      "calls": 1,
+      "bytes": 152,
+      "caller": "phpun::run_script"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7065712,
+      "calls": 1,
+      "bytes": 4,
+      "caller": "<phpun_core::interp::Interp>::eval::{closure#2}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7262387,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7262818,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7262891,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7328430,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7262917,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7328483,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7262990,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7328555,
+      "calls": 8,
+      "bytes": 3712,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7329050,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7329091,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7329115,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7329158,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7329177,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7329230,
+      "calls": 6,
+      "bytes": 2784,
+      "caller": "<phpun_core::parser::Parser>::array_items"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7263748,
+      "calls": 119,
+      "bytes": 27608,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7263800,
+      "calls": 128,
+      "bytes": 29696,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7263873,
+      "calls": 128,
+      "bytes": 29696,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3266437,
+      "calls": 2025,
+      "bytes": 18017,
+      "caller": "<alloc::string::String as core::fmt::Write>::write_str"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4447143,
+      "calls": 192,
+      "bytes": 44544,
+      "caller": "<phpun_core::ast::Param as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7265206,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7265284,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4447282,
+      "calls": 192,
+      "bytes": 44544,
+      "caller": "<phpun_core::ast::Param as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7265382,
+      "calls": 104,
+      "bytes": 24128,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4447462,
+      "calls": 192,
+      "bytes": 1034,
+      "caller": "<phpun_core::ast::Param as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4447516,
+      "calls": 41,
+      "bytes": 9512,
+      "caller": "<phpun_core::ast::Param as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7789948,
+      "calls": 1,
+      "bytes": 192,
+      "caller": "<std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String> as core::iter::traits::collect::FromIterator<(alloc::string::String, alloc::string::String)>>::from_iter::<[(alloc::string::String, alloc::string::String); 4]>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7789997,
+      "calls": 1,
+      "bytes": 208,
+      "caller": "<std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String> as core::iter::traits::collect::FromIterator<(alloc::string::String, alloc::string::String)>>::from_iter::<[(alloc::string::String, alloc::string::String); 4]>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3268037,
+      "calls": 859,
+      "bytes": 5058,
+      "caller": "<alloc::string::String as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4448689,
+      "calls": 464,
+      "bytes": 107648,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4448910,
+      "calls": 14,
+      "bytes": 3248,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7266996,
+      "calls": 103,
+      "bytes": 23896,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7267070,
+      "calls": 103,
+      "bytes": 23896,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7267211,
+      "calls": 269,
+      "bytes": 62408,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7267284,
+      "calls": 269,
+      "bytes": 62408,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4449550,
+      "calls": 40,
+      "bytes": 12480,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7857505,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7792335,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7595864,
+      "calls": 9,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4450302,
+      "calls": 28,
+      "bytes": 6496,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7596168,
+      "calls": 2,
+      "bytes": 6,
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7792857,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3074290,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<alloc::string::String as core::fmt::Write>::write_str"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7792968,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4450654,
+      "calls": 8,
+      "bytes": 2496,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7793023,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4450910,
+      "calls": 372,
+      "bytes": 116064,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7793297,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 2878168,
+      "calls": 1,
+      "bytes": 2,
+      "caller": "phpun::run_script"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7793456,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7793593,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7793694,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7793743,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7794110,
+      "calls": 3,
+      "bytes": 600,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4451881,
+      "calls": 18,
+      "bytes": 4608,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7794285,
+      "calls": 2,
+      "bytes": 624,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4451961,
+      "calls": 14,
+      "bytes": 3248,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7270121,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7794475,
+      "calls": 3,
+      "bytes": 696,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4452150,
+      "calls": 64,
+      "bytes": 19968,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7270207,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7794581,
+      "calls": 3,
+      "bytes": 744,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7270303,
+      "calls": 20,
+      "bytes": 4640,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7794637,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7270381,
+      "calls": 20,
+      "bytes": 4640,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4452596,
+      "calls": 206,
+      "bytes": 46144,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4452642,
+      "calls": 20,
+      "bytes": 4480,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7598443,
+      "calls": 1,
+      "bytes": 160,
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7860704,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7598571,
+      "calls": 1,
+      "bytes": 160,
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4452878,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7598788,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4453130,
+      "calls": 12,
+      "bytes": 2784,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7598867,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7598968,
+      "calls": 1,
+      "bytes": 272,
+      "caller": "<phpun_core::interp::Interp>::hoist_funcs"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7402603,
+      "calls": 74,
+      "bytes": 17168,
+      "caller": "<phpun_core::parser::Parser>::params"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7206081,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::unmark_argline"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7206092,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::unmark_argline"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7402813,
+      "calls": 74,
+      "bytes": 23088,
+      "caller": "<phpun_core::parser::Parser>::params"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4453918,
+      "calls": 4,
+      "bytes": 4,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3929790,
+      "calls": 1,
+      "bytes": 144,
+      "caller": "<phpun_core::interp::Interp>::eval"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4454118,
+      "calls": 32,
+      "bytes": 9984,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4454169,
+      "calls": 6,
+      "bytes": 1344,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4454398,
+      "calls": 36,
+      "bytes": 11232,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3668301,
+      "calls": 293,
+      "bytes": 4576,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7272821,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7272852,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4454894,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4454999,
+      "calls": 92,
+      "bytes": 21344,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9435804,
+      "calls": 2,
+      "bytes": 76,
+      "caller": "std::sys::fs::unix::readlink"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7862942,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7928503,
+      "calls": 93,
+      "bytes": 23808,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#0}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7863035,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7928577,
+      "calls": 93,
+      "bytes": 25296,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#0}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4455258,
+      "calls": 60,
+      "bytes": 18720,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7863136,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4651949,
+      "calls": 143,
+      "bytes": 22880,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7928842,
+      "calls": 93,
+      "bytes": 17112,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#0}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4652075,
+      "calls": 143,
+      "bytes": 22880,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4652280,
+      "calls": 143,
+      "bytes": 35464,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4455706,
+      "calls": 48,
+      "bytes": 14976,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4652335,
+      "calls": 16,
+      "bytes": 4096,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4652399,
+      "calls": 16,
+      "bytes": 4352,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4455793,
+      "calls": 20,
+      "bytes": 4640,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7273898,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7273930,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7929353,
+      "calls": 13,
+      "bytes": 155,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#1}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7274043,
+      "calls": 7,
+      "bytes": 1624,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4456016,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::ast::Stmt as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7929561,
+      "calls": 5,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#1}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7405315,
+      "calls": 410,
+      "bytes": 127920,
+      "caller": "<phpun_core::parser::Parser>::body"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7405475,
+      "calls": 410,
+      "bytes": 127920,
+      "caller": "<phpun_core::parser::Parser>::body"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7471052,
+      "calls": 24,
+      "bytes": 5376,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7929811,
+      "calls": 25,
+      "bytes": 191,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#1}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7471091,
+      "calls": 37,
+      "bytes": 8288,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7929924,
+      "calls": 25,
+      "bytes": 191,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#1}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7405643,
+      "calls": 410,
+      "bytes": 75440,
+      "caller": "<phpun_core::parser::Parser>::body"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7471273,
+      "calls": 37,
+      "bytes": 8584,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3670276,
+      "calls": 14,
+      "bytes": 96,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7471523,
+      "calls": 37,
+      "bytes": 13912,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7930508,
+      "calls": 25,
+      "bytes": 6200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#1}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6816426,
+      "calls": 50,
+      "bytes": 609,
+      "caller": "alloc::str::join_generic_copy::<str, u8, &str>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4719554,
+      "calls": 25,
+      "bytes": 9600,
+      "caller": "<phpun_core::interp::Interp>::vm_run_direct"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7275553,
+      "calls": 1182,
+      "bytes": 274224,
+      "caller": "<phpun_core::parser::Parser>::postfix"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4654118,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4654182,
+      "calls": 1,
+      "bytes": 216,
+      "caller": "<phpun_core::interp::Interp>::exec_at"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7406793,
+      "calls": 446,
+      "bytes": 82064,
+      "caller": "<phpun_core::parser::Parser>::stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7865708,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7865730,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7865752,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 2885037,
+      "calls": 3,
+      "bytes": 56,
+      "caller": "phpun::main"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7865774,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7865796,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7865818,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7865843,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7734779,
+      "calls": 3,
+      "bytes": 34,
+      "caller": "<phpun_core::interp::Interp>::set_server_var"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7931412,
+      "calls": 3,
+      "bytes": 23,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#2}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4458011,
+      "calls": 1044,
+      "bytes": 325728,
+      "caller": "<phpun_core::ast::FunctionDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7734901,
+      "calls": 3,
+      "bytes": 48,
+      "caller": "<phpun_core::interp::Interp>::set_server_var"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7931535,
+      "calls": 3,
+      "bytes": 32,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#2}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7931862,
+      "calls": 148,
+      "bytes": 1259,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#3}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7932121,
+      "calls": 97,
+      "bytes": 606,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#3}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3672353,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7866852,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7866877,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7867147,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4459340,
+      "calls": 262,
+      "bytes": 60784,
+      "caller": "<alloc::boxed::Box<phpun_core::ast::Expr> as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7932804,
+      "calls": 148,
+      "bytes": 36704,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#3}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3935109,
+      "calls": 5,
+      "bytes": 760,
+      "caller": "<phpun_core::interp::Interp>::eval"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7474131,
+      "calls": 17,
+      "bytes": 3944,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7474289,
+      "calls": 17,
+      "bytes": 3944,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7867549,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7474467,
+      "calls": 17,
+      "bytes": 5848,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7867768,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7867794,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7409065,
+      "calls": 446,
+      "bytes": 139152,
+      "caller": "<phpun_core::parser::Parser>::stmt"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7933404,
+      "calls": 4,
+      "bytes": 800,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#5}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4394692,
+      "calls": 2,
+      "bytes": 6,
+      "caller": "<alloc::rc::Rc<[u8]>>::copy_from_slice"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7933640,
+      "calls": 4,
+      "bytes": 22,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#5}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7933802,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#5}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4460426,
+      "calls": 20,
+      "bytes": 398,
+      "caller": "<alloc::vec::Vec<phpun_core::lexer::StringPart> as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7933899,
+      "calls": 4,
+      "bytes": 992,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#5}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3674188,
+      "calls": 1,
+      "bytes": 384,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7868618,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7868808,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7934621,
+      "calls": 12,
+      "bytes": 2400,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#4}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7934734,
+      "calls": 12,
+      "bytes": 2976,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#4}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7935140,
+      "calls": 34,
+      "bytes": 6800,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6559211,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<alloc::vec::Vec<phpun_core::ast::Expr> as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7935514,
+      "calls": 34,
+      "bytes": 10608,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7935536,
+      "calls": 34,
+      "bytes": 10608,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7935561,
+      "calls": 34,
+      "bytes": 10608,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7935762,
+      "calls": 34,
+      "bytes": 583,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7935917,
+      "calls": 32,
+      "bytes": 359,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7804899,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7804922,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7804945,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7804968,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7804991,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7805014,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7805037,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7805060,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7805083,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7805106,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7936179,
+      "calls": 34,
+      "bytes": 7888,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7805132,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3676374,
+      "calls": 1,
+      "bytes": 136,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3676397,
+      "calls": 1,
+      "bytes": 136,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7936280,
+      "calls": 34,
+      "bytes": 8432,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3676890,
+      "calls": 1,
+      "bytes": 144,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7936822,
+      "calls": 125,
+      "bytes": 597,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::throwable_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7479083,
+      "calls": 144,
+      "bytes": 35712,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7348023,
+      "calls": 140,
+      "bytes": 1232,
+      "caller": "<phpun_core::parser::Parser>::name_path"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7414006,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7611017,
+      "calls": 1,
+      "bytes": 3,
+      "caller": "<phpun_core::interp::Interp>::flow_unit"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7611109,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::flow_unit"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7611201,
+      "calls": 1,
+      "bytes": 216,
+      "caller": "<phpun_core::interp::Interp>::flow_unit"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7939019,
+      "calls": 109,
+      "bytes": 693,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::param"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7939040,
+      "calls": 109,
+      "bytes": 25288,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::param"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7939219,
+      "calls": 146,
+      "bytes": 796,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::param"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7939319,
+      "calls": 109,
+      "bytes": 25288,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::param"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3679586,
+      "calls": 63,
+      "bytes": 1000,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7874068,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7939678,
+      "calls": 14,
+      "bytes": 96,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#9}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3679860,
+      "calls": 1,
+      "bytes": 38,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7481023,
+      "calls": 17,
+      "bytes": 3264,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7874258,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3679966,
+      "calls": 1,
+      "bytes": 25,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7481210,
+      "calls": 17,
+      "bytes": 4624,
+      "caller": "<phpun_core::parser::Parser>::class_decl"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4269964,
+      "calls": 1,
+      "bytes": 8,
+      "caller": "<phpun_core::interp::Interp>::vm_run"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3680263,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7940166,
+      "calls": 14,
+      "bytes": 3472,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#9}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7350352,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::new_class_expr"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3680510,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7940509,
+      "calls": 185,
+      "bytes": 2207,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#12}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3680744,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7809699,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7941012,
+      "calls": 185,
+      "bytes": 45880,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#12}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7285828,
+      "calls": 4,
+      "bytes": 68,
+      "caller": "<phpun_core::parser::Parser>::ns_resolve"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7285906,
+      "calls": 95,
+      "bytes": 699,
+      "caller": "<phpun_core::parser::Parser>::ns_resolve"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7941297,
+      "calls": 18,
+      "bytes": 84,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::{closure#13}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7351774,
+      "calls": 16,
+      "bytes": 3712,
+      "caller": "<phpun_core::parser::Parser>::new_class_expr"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7941867,
+      "calls": 307,
+      "bytes": 2969,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::method"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3682098,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7221108,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::logical_or"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7810957,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7221207,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::logical_or"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7221231,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::logical_or"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811135,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7221319,
+      "calls": 4,
+      "bytes": 928,
+      "caller": "<phpun_core::parser::Parser>::logical_or"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811159,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811183,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811207,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811231,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811255,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3682494,
+      "calls": 1,
+      "bytes": 152,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7221430,
+      "calls": 1025,
+      "bytes": 237800,
+      "caller": "<phpun_core::parser::Parser>::logical_or"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811279,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811303,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811327,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7942405,
+      "calls": 307,
+      "bytes": 76136,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes::method"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811351,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7418142,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811375,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811399,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7418189,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811423,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7811449,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7549591,
+      "calls": 2457,
+      "bytes": 12830,
+      "caller": "phpun_core::lexer::ident"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3682985,
+      "calls": 1,
+      "bytes": 152,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7287567,
+      "calls": 8,
+      "bytes": 41,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7353498,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::parser::Parser>::new_class_expr"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3683635,
+      "calls": 63,
+      "bytes": 1000,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7550415,
+      "calls": 137,
+      "bytes": 137,
+      "caller": "phpun_core::lexer::interp_scan"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3684221,
+      "calls": 1,
+      "bytes": 152,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3684671,
+      "calls": 6,
+      "bytes": 38,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3685001,
+      "calls": 6,
+      "bytes": 912,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7879607,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3685480,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7290273,
+      "calls": 191,
+      "bytes": 45840,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3686014,
+      "calls": 1,
+      "bytes": 152,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7225140,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::logical_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7225239,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::logical_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7225263,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::logical_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7880644,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7225351,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::logical_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7290913,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7225462,
+      "calls": 1029,
+      "bytes": 238728,
+      "caller": "<phpun_core::parser::Parser>::logical_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7291002,
+      "calls": 1,
+      "bytes": 240,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3686603,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9322750,
+      "calls": 1,
+      "bytes": 46,
+      "caller": "std::sys::fs::unix::canonicalize"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7422221,
+      "calls": 13,
+      "bytes": 3016,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3686769,
+      "calls": 1,
+      "bytes": 5920,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7291358,
+      "calls": 192,
+      "bytes": 44544,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7291384,
+      "calls": 192,
+      "bytes": 44544,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7291494,
+      "calls": 192,
+      "bytes": 44544,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7291511,
+      "calls": 192,
+      "bytes": 44544,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7291587,
+      "calls": 192,
+      "bytes": 44544,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7815911,
+      "calls": 1,
+      "bytes": 344,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7423179,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7423226,
+      "calls": 46,
+      "bytes": 11776,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7227005,
+      "calls": 22,
+      "bytes": 5104,
+      "caller": "<phpun_core::parser::Parser>::equality"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7227101,
+      "calls": 22,
+      "bytes": 5104,
+      "caller": "<phpun_core::parser::Parser>::equality"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7227133,
+      "calls": 22,
+      "bytes": 5104,
+      "caller": "<phpun_core::parser::Parser>::equality"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7227223,
+      "calls": 22,
+      "bytes": 5104,
+      "caller": "<phpun_core::parser::Parser>::equality"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7227360,
+      "calls": 1044,
+      "bytes": 242208,
+      "caller": "<phpun_core::parser::Parser>::equality"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7292930,
+      "calls": 149,
+      "bytes": 138272,
+      "caller": "<phpun_core::parser::Parser>::args"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7883463,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7883556,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7883657,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7883959,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7818431,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7228741,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<phpun_core::parser::Parser>::comparison"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7818616,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7228852,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<phpun_core::parser::Parser>::comparison"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7228883,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<phpun_core::parser::Parser>::comparison"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7884285,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7425550,
+      "calls": 94,
+      "bytes": 21808,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7818784,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7228976,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<phpun_core::parser::Parser>::comparison"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7884379,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7818878,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7229104,
+      "calls": 1066,
+      "bytes": 247312,
+      "caller": "<phpun_core::parser::Parser>::comparison"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7884480,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7557337,
+      "calls": 1,
+      "bytes": 1,
+      "caller": "phpun_core::lexer::interp_scan"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7819541,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6115804,
+      "calls": 31,
+      "bytes": 311,
+      "caller": "<phpun_core::interp::Interp>::implements_iface"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9523688,
+      "calls": 2,
+      "bytes": 0,
+      "caller": "<std::io::stdio::StdoutLock as core::io::write::Write>::write_all"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7492113,
+      "calls": 57,
+      "bytes": 13224,
+      "caller": "<phpun_core::parser::Parser>::const_expr"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7295534,
+      "calls": 863,
+      "bytes": 4903,
+      "caller": "<phpun_core::lexer::Token as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7885391,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7295652,
+      "calls": 1094,
+      "bytes": 3589,
+      "caller": "<phpun_core::lexer::Token as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3756793,
+      "calls": 300,
+      "bytes": 1696,
+      "caller": "<alloc::vec::Vec<alloc::string::String> as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7295744,
+      "calls": 23,
+      "bytes": 339,
+      "caller": "<phpun_core::lexer::Token as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6116355,
+      "calls": 13,
+      "bytes": 134,
+      "caller": "<phpun_core::interp::Interp>::implements_iface"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7230502,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::concat"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7230597,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::concat"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7230629,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::concat"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7230713,
+      "calls": 6,
+      "bytes": 1392,
+      "caller": "<phpun_core::parser::Parser>::concat"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886125,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886149,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886173,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7820661,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886197,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886221,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7230868,
+      "calls": 1112,
+      "bytes": 257984,
+      "caller": "<phpun_core::parser::Parser>::concat"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886245,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886269,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886293,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886317,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886341,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886365,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886389,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3626555,
+      "calls": 33,
+      "bytes": 648,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886408,
+      "calls": 1,
+      "bytes": 3072,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7820905,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7820927,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7821021,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886666,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886751,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886836,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7886921,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887006,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887091,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887176,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7821684,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887261,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887346,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887431,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6117980,
+      "calls": 5,
+      "bytes": 58,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#8}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887516,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7428831,
+      "calls": 218,
+      "bytes": 50576,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887601,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7887668,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 9526182,
+      "calls": 1,
+      "bytes": 16,
+      "caller": "std::sys::fs::canonicalize"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6118311,
+      "calls": 2,
+      "bytes": 32,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#8}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7232500,
+      "calls": 1118,
+      "bytes": 259376,
+      "caller": "<phpun_core::parser::Parser>::bit_or"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3890318,
+      "calls": 232,
+      "bytes": 1604,
+      "caller": "alloc::str::join_generic_copy::<str, u8, alloc::string::String>"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7888085,
+      "calls": 7,
+      "bytes": 38,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7822581,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7888317,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7888717,
+      "calls": 7,
+      "bytes": 38,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7429963,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7888928,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3629446,
+      "calls": 1,
+      "bytes": 38,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7234132,
+      "calls": 1118,
+      "bytes": 259376,
+      "caller": "<phpun_core::parser::Parser>::bit_xor"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3629728,
+      "calls": 1,
+      "bytes": 25,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7824247,
+      "calls": 14,
+      "bytes": 102,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7824362,
+      "calls": 14,
+      "bytes": 213,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3630155,
+      "calls": 1,
+      "bytes": 192,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7431287,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3630508,
+      "calls": 1,
+      "bytes": 192,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3761654,
+      "calls": 1,
+      "bytes": 6,
+      "caller": "<i64 as alloc::string::SpecToString>::spec_to_string"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7497258,
+      "calls": 14,
+      "bytes": 3248,
+      "caller": "<phpun_core::parser::Parser>::unset_arg"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7890532,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7497477,
+      "calls": 14,
+      "bytes": 3248,
+      "caller": "<alloc::vec::Vec<phpun_core::ast::Expr>>::push_mut"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3630861,
+      "calls": 1,
+      "bytes": 192,
+      "caller": "<phpun_core::interp::Interp>::new"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7235442,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::parser::Parser>::bit_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7235541,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::parser::Parser>::bit_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7235565,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::parser::Parser>::bit_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7235653,
+      "calls": 8,
+      "bytes": 1856,
+      "caller": "<phpun_core::parser::Parser>::bit_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7235764,
+      "calls": 1118,
+      "bytes": 259376,
+      "caller": "<phpun_core::parser::Parser>::bit_and"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7891457,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6122022,
+      "calls": 5,
+      "bytes": 58,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#9}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7432935,
+      "calls": 1,
+      "bytes": 3,
+      "caller": "<phpun_core::parser::Parser>::stmt_parsed"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7826192,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6122360,
+      "calls": 2,
+      "bytes": 32,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#9}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892086,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7237093,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::shift"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892513,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7237198,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::shift"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7827038,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892584,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7237230,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::shift"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 4222600,
+      "calls": 1,
+      "bytes": 168,
+      "caller": "<phpun_core::interp::Interp>::invoke_fn"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7237319,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::shift"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892697,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892720,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892743,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892766,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892789,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7237437,
+      "calls": 1126,
+      "bytes": 261232,
+      "caller": "<phpun_core::parser::Parser>::shift"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892815,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7892942,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6123531,
+      "calls": 4,
+      "bytes": 55,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#9}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7893051,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7893209,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7827715,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7827888,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7828129,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7828223,
+      "calls": 1,
+      "bytes": 232,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7369742,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::expr_list"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7238765,
+      "calls": 30,
+      "bytes": 6960,
+      "caller": "<phpun_core::parser::Parser>::additive"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7238870,
+      "calls": 30,
+      "bytes": 6960,
+      "caller": "<phpun_core::parser::Parser>::additive"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7238902,
+      "calls": 30,
+      "bytes": 6960,
+      "caller": "<phpun_core::parser::Parser>::additive"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7238991,
+      "calls": 30,
+      "bytes": 6960,
+      "caller": "<phpun_core::parser::Parser>::additive"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7828868,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7239114,
+      "calls": 1128,
+      "bytes": 261696,
+      "caller": "<phpun_core::parser::Parser>::additive"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6321617,
+      "calls": 2,
+      "bytes": 20,
+      "caller": "<phpun_core::interp::Interp>::concat_bytes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6321662,
+      "calls": 2,
+      "bytes": 7,
+      "caller": "<phpun_core::interp::Interp>::concat_bytes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7304975,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 5863222,
+      "calls": 51,
+      "bytes": 726,
+      "caller": "<phpun_core::ast::ClassDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7305016,
+      "calls": 15,
+      "bytes": 3480,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 5863364,
+      "calls": 21,
+      "bytes": 264,
+      "caller": "<phpun_core::ast::ClassDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7829805,
+      "calls": 14,
+      "bytes": 97,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3897760,
+      "calls": 1,
+      "bytes": 4,
+      "caller": "<phpun_core::interp::Interp>::mem_check"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7240456,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::term"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7240561,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::term"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7895931,
+      "calls": 1,
+      "bytes": 200,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7240593,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::term"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7240682,
+      "calls": 2,
+      "bytes": 464,
+      "caller": "<phpun_core::parser::Parser>::term"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7896068,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3767323,
+      "calls": 196,
+      "bytes": 753200,
+      "caller": "<alloc::raw_vec::RawVecInner>::finish_grow"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7240815,
+      "calls": 1158,
+      "bytes": 268656,
+      "caller": "<phpun_core::parser::Parser>::term"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7896207,
+      "calls": 30,
+      "bytes": 7680,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 5864939,
+      "calls": 111,
+      "bytes": 41736,
+      "caller": "<phpun_core::ast::ClassDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 5865119,
+      "calls": 17,
+      "bytes": 1105,
+      "caller": "<phpun_core::ast::ClassDecl as core::clone::Clone>::clone"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7241697,
+      "calls": 1160,
+      "bytes": 269120,
+      "caller": "<phpun_core::parser::Parser>::power"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7831630,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6062152,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6062199,
+      "calls": 1,
+      "bytes": 272,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6062378,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7832137,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6062669,
+      "calls": 1,
+      "bytes": 256,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6062733,
+      "calls": 1,
+      "bytes": 272,
+      "caller": "<phpun_core::interp::Interp>::register_class"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7897996,
+      "calls": 1,
+      "bytes": 272,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6128546,
+      "calls": 7,
+      "bytes": 88,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#10}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7832746,
+      "calls": 1,
+      "bytes": 248,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7898293,
+      "calls": 1,
+      "bytes": 184,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7308504,
+      "calls": 21,
+      "bytes": 4872,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7308539,
+      "calls": 21,
+      "bytes": 4872,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7439738,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<alloc::vec::Vec<(phpun_core::ast::Expr, alloc::vec::Vec<phpun_core::ast::Stmt>)>>::remove"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7439790,
+      "calls": 46,
+      "bytes": 0,
+      "caller": "<alloc::vec::Vec<(phpun_core::ast::Expr, alloc::vec::Vec<phpun_core::ast::Stmt>)>>::remove"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7439822,
+      "calls": 46,
+      "bytes": 10672,
+      "caller": "<alloc::vec::Vec<(phpun_core::ast::Expr, alloc::vec::Vec<phpun_core::ast::Stmt>)>>::remove"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7308754,
+      "calls": 21,
+      "bytes": 4872,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7308791,
+      "calls": 21,
+      "bytes": 4872,
+      "caller": "<phpun_core::parser::Parser>::primary"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 6130186,
+      "calls": 3,
+      "bytes": 48,
+      "caller": "<phpun_core::interp::Interp>::register_class_inner::{closure#10}"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7834150,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7834172,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7834197,
+      "calls": 1,
+      "bytes": 312,
+      "caller": "<phpun_core::interp::Interp>::register_builtin_classes"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7638706,
+      "calls": 40,
+      "bytes": 12480,
+      "caller": "phpun_core::parser::parse_toks"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7638806,
+      "calls": 40,
+      "bytes": 12160,
+      "caller": "phpun_core::parser::parse_toks"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 3968793,
+      "calls": 2,
+      "bytes": 8,
+      "caller": "<phpun_core::interp::Interp>::eval"
+    },
+    {
+      "dso": "/workspace/parity92/oct11/trace-shells",
+      "pc": 7245817,
+      "calls": 21,
+      "bytes": 4872,
+      "caller": "<phpun_core::parser::Parser>::unary"
+    }
+  ]
+}

@@ -1,0 +1,369 @@
+diff --git a/crates/phpun-core/src/interp/calls.rs b/crates/phpun-core/src/interp/calls.rs
+index 8d5b7be..9022757 100644
+--- a/crates/phpun-core/src/interp/calls.rs
++++ b/crates/phpun-core/src/interp/calls.rs
+@@ -1230,7 +1230,7 @@ impl<'a> Interp<'a> {
+ 
+     /// Call any callable-ish Value: Callable, string name, [obj,'m'], obj
+     /// with __invoke.
+-    pub fn call_value(&mut self, v: &Value, args: CallArgs) -> Result<Value, PhpError> {
++    pub fn call_value(&mut self, v: &Value, mut args: CallArgs) -> Result<Value, PhpError> {
+         match v {
+             Value::Callable(c) => {
+                 match &c.kind {
+@@ -1306,7 +1306,7 @@ impl<'a> Interp<'a> {
+                         {
+                             if let Some(comp) = self.vm_compiled(&decl) {
+                                 if !comp.needs_bind {
+-                                    return self.vm_run(&decl, &comp, args);
++                                    return self.vm_run(&decl, &comp, &mut args);
+                                 }
+                             }
+                         }
+@@ -2742,7 +2742,7 @@ impl<'a> Interp<'a> {
+         decl: &FunctionDecl,
+         args: &CallArgs,
+         defer_args: bool,
+-    ) -> TraceFrame {
++    ) -> Box<TraceFrame> {
+         crate::interp::util::alloc_hit(3);
+         // The callee's argline markers overwrite `send_line`; after
+         // the call returns the enclosing op's own line is the pending
+@@ -4615,7 +4615,7 @@ impl<'a> Interp<'a> {
+                     // `[internal function]` site and the callback args.
+                     self.call_trace
+                         .last()
+-                        .map(crate::value::trace_frame_str)
++                        .map(|frame| crate::value::trace_frame_str(frame))
+                         .unwrap_or_default()
+                 } else {
+                     format!(
+@@ -5281,7 +5281,7 @@ impl<'a> Interp<'a> {
+     pub(in crate::interp) fn invoke_fn_run(
+         &mut self,
+         decl: &Rc<FunctionDecl>,
+-        args: CallArgs,
++        mut args: CallArgs,
+         this_obj: Option<Rc<RefCell<PhpObject>>>,
+         scope_class: Option<Rc<PhpClass>>,
+         decl_class: Option<Rc<PhpClass>>,
+@@ -5329,7 +5329,7 @@ impl<'a> Interp<'a> {
+         if args.named.is_empty() {
+             if let Some(c) = self.vm_compiled(decl) {
+                 if !c.needs_bind {
+-                    return self.vm_run(decl, &c, args);
++                    return self.vm_run(decl, &c, &mut args);
+                 }
+             }
+         }
+diff --git a/crates/phpun-core/src/interp/gen.rs b/crates/phpun-core/src/interp/gen.rs
+index da1c59a..77b18aa 100644
+--- a/crates/phpun-core/src/interp/gen.rs
++++ b/crates/phpun-core/src/interp/gen.rs
+@@ -1160,7 +1160,7 @@ impl<'a> Interp<'a> {
+         });
+         let userland = self.iter_calls == 0 && self.gen_internal_resume == 0 && !caller_is_spl_stub;
+         if userland {
+-            self.call_trace.push(TraceFrame {
++            self.trace_push(TraceFrame {
+                 args_frame: None,
+                 function: name.to_string().into(),
+                 class: Some("Generator".into()),
+diff --git a/crates/phpun-core/src/interp/include.rs b/crates/phpun-core/src/interp/include.rs
+index 5f072ae..9173231 100644
+--- a/crates/phpun-core/src/interp/include.rs
++++ b/crates/phpun-core/src/interp/include.rs
+@@ -32,7 +32,7 @@ impl<'a> Interp<'a> {
+         // require_once()) and carries no arg until the path resolves:
+         // an open still in progress renders bare `include()` even with
+         // frames above it (the error-handler trace of a failed open).
+-        self.call_trace.push(TraceFrame {
++        self.trace_push(TraceFrame {
+             args_frame: None,
+             function: match kind {
+                 IncludeKind::Include => "include",
+@@ -432,7 +432,7 @@ impl<'a> Interp<'a> {
+                 // Zend traces through eval'd code carry a `FILE(N):
+                 // eval()` frame at the call site (rendered bare — the
+                 // eval'd source is not an arg in backtraces).
+-                self.call_trace.push(TraceFrame {
++                self.trace_push(TraceFrame {
+                     args_frame: None,
+                     function: "eval".to_string().into(),
+                     class: None,
+@@ -559,7 +559,7 @@ impl<'a> Interp<'a> {
+                     // `FILE(N) : eval()'d code`, carrying the
+                     // compile-context backtrace with the eval frame
+                     // itself dropped like the exec-time gates below.
+-                    self.call_trace.push(TraceFrame {
++                    self.trace_push(TraceFrame {
+                         args_frame: None,
+                         function: "eval".to_string().into(),
+                         class: None,
+diff --git a/crates/phpun-core/src/interp/members/methods.rs b/crates/phpun-core/src/interp/members/methods.rs
+index e16edde..2cd0a6a 100644
+--- a/crates/phpun-core/src/interp/members/methods.rs
++++ b/crates/phpun-core/src/interp/members/methods.rs
+@@ -32,7 +32,7 @@ impl<'a> Interp<'a> {
+         // Internal calls still get a backtrace frame — zend renders
+         // `ArrayObject->unserialize('O:11:"ArrayObje...')` in uncaught
+         // traces (arg repr truncates at 15 chars via trace_arg).
+-        self.call_trace.push(TraceFrame {
++        self.trace_push(TraceFrame {
+             args_frame: None,
+             file: self.diag_file_shared(),
+             line: self.send_line.unwrap_or(self.cur_line) as u32,
+@@ -719,7 +719,7 @@ impl<'a> Interp<'a> {
+                 } else {
+                     vec![cell(Value::Array(arr.clone())), cell(Value::Int(flag))]
+                 };
+-                self.call_trace.push(crate::value::TraceFrame {
++                self.trace_push(crate::value::TraceFrame {
+                     args_frame: None,
+                     function: lname.clone().into(),
+                     class: None,
+@@ -789,7 +789,7 @@ impl<'a> Interp<'a> {
+                 }
+                 Self::ao_set_sorting(obj, true);
+                 let src = arr.borrow().entries.clone();
+-                self.call_trace.push(crate::value::TraceFrame {
++                self.trace_push(crate::value::TraceFrame {
+                     args_frame: None,
+                     function: lname.clone().into(),
+                     class: None,
+@@ -2430,7 +2430,7 @@ impl<'a> Interp<'a> {
+             if stub {
+                 // Native Reflection calls leave a `Cls->m()` frame in
+                 // uncaught traces (named_params/attributes_named_flags).
+-                self.call_trace.push(TraceFrame {
++                self.trace_push(TraceFrame {
+                     args_frame: None,
+                     file: self.diag_file_shared(),
+                     line: self.send_line.unwrap_or(self.cur_line) as u32,
+@@ -2643,7 +2643,7 @@ impl<'a> Interp<'a> {
+                     .map(|(p, m)| (*p, m.clone()))
+                     .unwrap_or((0, "Unexpected data found.".into()));
+                 let first = s[pos as usize..].chars().next().unwrap_or(' ');
+-                it.call_trace.push(TraceFrame {
++                it.trace_push(TraceFrame {
+                     args_frame: None,
+                     file: it.diag_file_shared(),
+                     line: it.send_line.unwrap_or(it.cur_line) as u32,
+@@ -3130,7 +3130,7 @@ impl<'a> Interp<'a> {
+                     return Ok(Value::Null);
+                 }
+                 None => {
+-                    self.call_trace.push(TraceFrame {
++                    self.trace_push(TraceFrame {
+                         args_frame: None,
+                         file: self.diag_file_shared(),
+                         line: self.send_line.unwrap_or(self.cur_line) as u32,
+@@ -3275,7 +3275,7 @@ impl<'a> Interp<'a> {
+         // `#0 file(L): Exception->__construct('a','b',...)` for a ZPP
+         // arity error. Pop it again only when the bind succeeds; the
+         // bind's errors snapshot call_trace inside fail().
+-        self.call_trace.push(TraceFrame {
++        self.trace_push(TraceFrame {
+             args_frame: None,
+             file: self.diag_file_shared(),
+             line: self.send_line.unwrap_or(self.cur_line) as u32,
+@@ -3526,7 +3526,7 @@ impl<'a> Interp<'a> {
+         // frame's arg list rather than `name: val` pairs.
+         let mut fargs = args.cells.clone();
+         fargs.extend(args.named.iter().map(|(_, c, ..)| c.clone()));
+-        self.call_trace.push(TraceFrame {
++        self.trace_push(TraceFrame {
+             args_frame: None,
+             file: self.diag_file_shared(),
+             line: self.cur_line as u32,
+diff --git a/crates/phpun-core/src/interp/members/statics.rs b/crates/phpun-core/src/interp/members/statics.rs
+index edf3d90..3c62912 100644
+--- a/crates/phpun-core/src/interp/members/statics.rs
++++ b/crates/phpun-core/src/interp/members/statics.rs
+@@ -775,7 +775,7 @@ impl<'a> Interp<'a> {
+                 }
+                 None => {
+                     // static-call frame like dt_malformed's ->
+-                    self.call_trace.push(TraceFrame {
++                    self.trace_push(TraceFrame {
+                         args_frame: None,
+                         file: self.diag_file_shared(),
+                         line: self.send_line.unwrap_or(self.cur_line) as u32,
+diff --git a/crates/phpun-core/src/interp/mod.rs b/crates/phpun-core/src/interp/mod.rs
+index 5e8568f..fbecb01 100644
+--- a/crates/phpun-core/src/interp/mod.rs
++++ b/crates/phpun-core/src/interp/mod.rs
+@@ -395,7 +395,8 @@ pub struct Interp<'a> {
+     vm_frame_pool: Vec<Box<Frame>>,
+     /// Popped trace frames — keeps String/Vec capacity alive so the
+     /// steady-state call path stops allocating (`site`/`post` phases).
+-    trace_pool: Vec<crate::value::TraceFrame>,
++    #[allow(clippy::vec_box)]
++    trace_pool: Vec<Box<crate::value::TraceFrame>>,
+     classes: crate::value::FxMap<String, Rc<PhpClass>>,
+     /// Traits by name — their methods are copied into using classes.
+     pub traits: HashMap<String, Rc<ClassDecl>>,
+@@ -681,7 +682,8 @@ pub struct Interp<'a> {
+     /// Process-wide anonymous-class sequence (`$0`, `$1`, ...).
+     anon_class_seq: u64,
+     /// Live call stack (user + builtin) for getTrace() snapshots.
+-    call_trace: Vec<TraceFrame>,
++    #[allow(clippy::vec_box)]
++    call_trace: Vec<Box<TraceFrame>>,
+     /// Pending fatal error message for exceptions raised as PhpError.
+     res_counter: u64,
+     shutdown_fns: Vec<(Value, Vec<Cell>)>,
+@@ -1410,6 +1412,13 @@ struct GcScan {
+ }
+ 
+ impl<'a> Interp<'a> {
++    /// Builtin/engine frames share the stable shell pool with compiled calls.
++    pub(in crate::interp) fn trace_push(&mut self, frame: TraceFrame) {
++        let mut shell = self.trace_pool.pop().unwrap_or_default();
++        *shell = frame;
++        self.call_trace.push(shell);
++    }
++
+     /// zend pops the trace frame on return; the shell goes back to the
+     /// pool so the next call_site_frame reuses its allocations.
+     pub(in crate::interp) fn trace_pop(&mut self) {
+@@ -7767,7 +7776,7 @@ impl<'a> Interp<'a> {
+                     .collect(),
+             ),
+         };
+-        self.call_trace.push(TraceFrame {
++        self.trace_push(TraceFrame {
+             args_frame: None,
+             function: name.to_string().into(),
+             class: None,
+@@ -8492,7 +8501,7 @@ impl<'a> Interp<'a> {
+             // `#0 %s(%d): [constant expression]()`).
+             let const_frame = self.class_const_ctx > 0;
+             if const_frame {
+-                self.call_trace.push(TraceFrame {
++                self.trace_push(TraceFrame {
+                     args_frame: None,
+                     function: "[constant expression]".to_string().into(),
+                     class: None,
+diff --git a/crates/phpun-core/src/interp/vm.rs b/crates/phpun-core/src/interp/vm.rs
+index 4e30d4b..92254b1 100644
+--- a/crates/phpun-core/src/interp/vm.rs
++++ b/crates/phpun-core/src/interp/vm.rs
+@@ -1371,7 +1371,7 @@ impl<'a> Interp<'a> {
+         &mut self,
+         decl: &Rc<FunctionDecl>,
+         comp: &Compiled,
+-        mut args: super::CallArgs,
++        args: &mut super::CallArgs,
+     ) -> Result<Value, PhpError> {
+         // Scalar slots may share this call's arg cells, never the caller's
+         // by-value cells (array_walk, unpack and call_user_func_array share them).
+@@ -1402,7 +1402,7 @@ impl<'a> Interp<'a> {
+                     p.ty.is_none()
+                         || comp.param_fast[i].is_some_and(|gate| gate(&args.cells[i].borrow()))
+                 });
+-        let fr = self.call_site_frame(decl, &args, defer_args);
++        let fr = self.call_site_frame(decl, args, defer_args);
+         self.call_trace.push(fr);
+         padd!(2, __p);
+         let __p = pnow!();
+@@ -1475,7 +1475,13 @@ impl<'a> Interp<'a> {
+                         let v = fa[j].borrow().clone();
+                         if let Some(ty) = &p.ty {
+                             if let Some(e) = self.vm_param_gate(decl, p, ty, &v) {
+-                                return self.vm_rebind(e, decl, args, &mut fa, saved);
++                                return self.vm_rebind(
++                                    e,
++                                    decl,
++                                    std::mem::replace(args, super::CallArgs::empty()),
++                                    &mut fa,
++                                    saved,
++                                );
+                             }
+                         }
+                         arr.push(v);
+@@ -1508,7 +1514,13 @@ impl<'a> Interp<'a> {
+                                 }
+                                 // Non-literal default — bind evals it.
+                                 None => {
+-                                    return self.vm_rebind(None, decl, args, &mut fa, saved);
++                                    return self.vm_rebind(
++                                        None,
++                                        decl,
++                                        std::mem::replace(args, super::CallArgs::empty()),
++                                        &mut fa,
++                                        saved,
++                                    );
+                                 }
+                             }
+                         } else {
+@@ -1525,7 +1537,13 @@ impl<'a> Interp<'a> {
+                     self.callable_probe_err = None;
+                     let v = c.borrow().clone();
+                     if let Some(e) = self.vm_param_gate(decl, p, ty, &v) {
+-                        return self.vm_rebind(e, decl, args, &mut fa, saved);
++                        return self.vm_rebind(
++                            e,
++                            decl,
++                            std::mem::replace(args, super::CallArgs::empty()),
++                            &mut fa,
++                            saved,
++                        );
+                     }
+                     let strict = self.caller_file_strict();
+                     if !strict && !self.ty_weak_exact(ty, &v) {
+@@ -2786,13 +2804,13 @@ impl<'a> Interp<'a> {
+             std::mem::swap(&mut self.cur().value_args, argv);
+             self.vm_direct_reserve(&mut args, n);
+             padd!(1, __p);
+-            return self.vm_run(decl, comp, args);
++            return self.vm_run(decl, comp, &mut args);
+         }
+         args.cells = self.vm_arg_cells(argv);
+         let n = args.cells.len() as u64;
+         self.vm_direct_reserve(&mut args, n);
+         padd!(1, __p);
+-        self.vm_run(decl, comp, args)
++        self.vm_run(decl, comp, &mut args)
+     }
+ 
+     /// Fresh positional callback values only: original/reference argument cells
+@@ -3212,13 +3230,13 @@ impl<'a> Interp<'a> {
+             std::mem::swap(&mut self.cur().value_args, argv);
+             self.vm_direct_reserve(&mut args, n);
+             padd!(1, __p);
+-            return self.vm_run(decl, comp, args);
++            return self.vm_run(decl, comp, &mut args);
+         }
+         args.cells = self.vm_arg_cells(argv);
+         let n = args.cells.len() as u64;
+         self.vm_direct_reserve(&mut args, n);
+         padd!(1, __p);
+-        self.vm_run(decl, comp, args)
++        self.vm_run(decl, comp, &mut args)
+     }
+ 
+     fn vm_call(
+@@ -3449,6 +3467,22 @@ DivisionByZeroError:Division by zero
+         it.frame_recycle(frame);
+         let frame = it.frame_new("second");
+         assert_eq!(&*frame as *const super::super::Frame, ptr);
++        let trace = it.trace_pool.pop().unwrap();
++        let ptr = &*trace as *const crate::value::TraceFrame;
++        it.trace_pool.push(trace);
++        let arg = std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::Int(4)));
++        let weak = std::rc::Rc::downgrade(&arg);
++        it.trace_push(crate::value::TraceFrame {
++            function: std::rc::Rc::from("engine"),
++            args: vec![arg],
++            ..Default::default()
++        });
++        assert_eq!(&**it.call_trace.last().unwrap() as *const _, ptr);
++        it.trace_pop();
++        assert!(weak.upgrade().is_none(), "trace pool retained an argument");
++        assert!(it.trace_pool.iter().all(|frame| frame.args.is_empty()
++            && frame.named_args.is_empty()
++            && frame.args_frame.is_none()));
+     }
+ 
+     #[test]
