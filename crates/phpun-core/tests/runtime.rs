@@ -634,6 +634,14 @@ class DefaultCtor {
     function __construct(public int $x = self::N) { echo "default $x\n"; }
 }
 new DefaultCtor;
+class NativeCtorProbe extends ArrayIterator {
+    function __construct($a) { parent::__construct($a); echo 'native ', $this->count(), "\n"; }
+}
+new NativeCtorProbe([1,2]);
+class ThrowableCtorProbe extends Exception {
+    function __construct() { parent::__construct('engine'); echo $this->getMessage(), "\n"; }
+}
+new ThrowableCtorProbe;
 "#,
         &[],
     );
@@ -679,6 +687,8 @@ body 4 8
 hook -1 __construct -1
 negative
 default 12
+native 2
+engine
 "#
     );
     assert_eq!(err, "");
