@@ -3195,6 +3195,21 @@ Raw/source/hashes in bench/data/92/parity/oct11/ast-arg-vectors-*.
 
 P2 review correctly identifies 8→24 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31−3.6%/confirm−3.7%,long−1.6%/confirm−.6%,wholedefaultflat/long+2.8% andphysical−50002requests/−1200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.
 
+## Stack review integration after #349 storage withdrawal (2026-10-11)
+
+Build source 7e87997aa1ea80c04c8457111d302aaed0e55adf; ELF eca4dd2a9c2e496976741fe8f42cd9ac75f74ae32c73311a543b4d0af4f9d7cc. Production crates/Cargo identical updatedPR357;this PR remainsreport-only after356revert. Comparisons below are old frozen352(pre-review layout) versus correctedcombinedstack,not updatedPR357 versus its report-only child.
+
+Freshworkspace/fmt/clippy,ONEreceiver/GC/alias/arenachecks,native25+19/profile/probesPASS. Original4MB substr native exit/stdout/stderrbytegatePASS(log_errors0);canonicalprofilers stdout/exit match,separatestderr. Full3406onlyGCtimeout→pass,parentserialized8232msPASS corroborates same status;remainingstatusesidentical. Not fullcompatibility.
+
+|31paired profiler-off case|pre-review ms|combined ms|combined/pre-review|
+|---|---:|---:|---:|
+|bench/40-objects.php|94.174|98.671|1.0477|
+|bench/40-objects.php 20 5000|351.148|372.607|1.0611|
+|bench/20-strings.php 100|214.835|214.328|0.9976|
+|bench/app/cli.php 100 20|32.768|32.957|1.0058|
+|examples/composer/run.php|8.279|8.343|1.0077|
+
+7rotating profiler-off freshwhole geomean {"main_php_ratio": 3.921363216139543, "candidate_php_ratio": 2.722234418625982, "candidate_main_ratio": 0.6942061391869572, "candidate_parent_ratio": 0.9785116771110516}. Objects12.051×PHP/long20.430×,strings3.594×/long4.480×. Wholeobjects+3.4%/long+.8%,app+6.2%/DB+1.4% negatives retained;31app+.6%/Composer+.8%flat. Whole unrelated improvements not attributed to withdrawnstorage. No CPU attribution/cohortmultiplication/parity claim. Physicalobjects833119→883121requests(+50002)/51671479→52871527bytes(+1200048),arraysidentical:cost of restoring compact canonical cells. No phantom speedup from report-onlychild.
 ## PR357 P1 review: full-range source identity (2026-10-11)
 
 P1review: full normalized substr reuses source zend_string. Shared borrowed range preserves source Rc/charge when input is string;canonical bytes conversion stays before integer reads,non-string conversion/new partialresults retain originalcharge/trace. mb_strcut trims borrowed boundary before originalValuebytes producer. ONEexistingarena check proves0/negative/oversizedfullranges preservepointer/nocharge. Release54b28f/ELF58266af: original4MB fullrange native/candidateexit0(stdout/stderrbyteexact),oldparentfalseOOM255;canonicalprofilematchesstdout/exit. Originalpartial4MBOOMremainsnativebyteexactinclframe. Workspace/fmt/clippy/native25+19/profilePASS. Full3406onlygenerator timeout→fail;serializedsame10s parent9265/candidate9068ms bothFAIL;full2732pass600fail25skip38unsupported6crash5timeout retained,notcompatgain. No newtimingclaim;oldcohortsretainoriginalfrozenhashes. Complete priorissue92body archivedverbatim beforeconsolidation,withhash/update_at;latestbodygovernsroadmap.

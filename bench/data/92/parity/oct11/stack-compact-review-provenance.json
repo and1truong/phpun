@@ -1,0 +1,76 @@
+{
+  "build_source": "7e87997aa1ea80c04c8457111d302aaed0e55adf",
+  "binary_sha256": "eca4dd2a9c2e496976741fe8f42cd9ac75f74ae32c73311a543b4d0af4f9d7cc",
+  "production_equals_parent_branch": "codex/92-104-substr-result-charge",
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "phpt_changes_after_parent_gc_isolation": [],
+  "parent_gc_isolation": {
+    "summary": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "xfailed": 0,
+      "xpassed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "borked": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "applicable": 1,
+      "compatibility_pct": 100.0
+    },
+    "results": [
+      {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 8232
+      }
+    ]
+  },
+  "summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "physical_allocations": {
+    "objects5": [
+      {
+        "requests": 833119,
+        "bytes": 51671479
+      },
+      {
+        "requests": 883121,
+        "bytes": 52871527
+      }
+    ],
+    "arrays": [
+      {
+        "requests": 616040,
+        "bytes": 26542970
+      },
+      {
+        "requests": 616040,
+        "bytes": 26542970
+      }
+    ]
+  },
+  "scope": "combined349compact-slot correction,356prototypeabsent,352memoryfixretained",
+  "timing_comparison": "pre-review frozen352c845993 vscombinedeca4dd2;not PR359 vs currentcorrectedPR357,whose production is identical"
+}
