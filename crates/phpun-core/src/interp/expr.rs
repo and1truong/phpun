@@ -6301,7 +6301,13 @@ impl<'a> Interp<'a> {
                 let mut b = c.borrow_mut();
                 self.cow_split(&mut b);
                 if let Value::Array(a) = &*b {
-                    if a.borrow_mut().push_packed_scalar(&v) {
+                    let rc = a.clone();
+                    drop(b);
+                    let mut array = rc.borrow_mut();
+                    if array.push_packed_scalar(&v) {
+                        let req = Self::ht_req(array.entries.len(), array.packed);
+                        drop(array);
+                        self.mem_realloc(&rc, req);
                         return Ok(v);
                     }
                 }

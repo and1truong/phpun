@@ -3993,6 +3993,15 @@ echo json_encode([$a,$b,$c,$d]),"\n";
                 panic!("array");
             };
             assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
+            if inline {
+                let key = super::Rc::as_ptr(&a) as usize;
+                let table = a.borrow();
+                assert_eq!(
+                    append.mem_tracked.get(&key).map(|charge| charge.table_req),
+                    Some(Interp::ht_req(table.entries.len(), table.packed)),
+                    "dense append and CoW tables must retain canonical memory tracking: {name}"
+                );
+            }
         }
         let mut regions = Interp::new("bool-regions.php");
         let result = regions.run_source(
