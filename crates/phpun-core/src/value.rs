@@ -2379,85 +2379,26 @@ pub fn str_charge(len: usize) -> i64 {
     }
 }
 
-/// Shared string bytes; keep PhpStr/Value one-pointer payloads.
-/// ponytail: inline at most23 bytes; larger strings keep Vec storage.
-/// Revisit the cutoff only if real short-string/heap cohorts justify the payload cost.
-#[derive(Debug, Clone)]
-pub enum PhpBytes {
-    Inline { len: u8, bytes: [u8; 23] },
-    Heap(Vec<u8>),
-}
-
-impl PhpBytes {
-    pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
-        if bytes.len() <= 23 {
-            Self::from_slice(&bytes)
-        } else {
-            Self::Heap(bytes)
-        }
-    }
-
-    fn from_slice(bytes: &[u8]) -> Self {
-        if bytes.len() > 23 {
-            return Self::Heap(bytes.to_vec());
-        }
-        let mut inline = [0; 23];
-        inline[..bytes.len()].copy_from_slice(bytes);
-        Self::Inline {
-            len: bytes.len() as u8,
-            bytes: inline,
-        }
-    }
-
-    fn extend_from_slice(&mut self, suffix: &[u8]) {
-        if let Self::Inline { len, bytes } = self {
-            let end = *len as usize + suffix.len();
-            if end <= bytes.len() {
-                bytes[*len as usize..end].copy_from_slice(suffix);
-                *len = end as u8;
-                return;
-            }
-            let mut heap = Vec::with_capacity(end);
-            heap.extend_from_slice(&bytes[..*len as usize]);
-            *self = Self::Heap(heap);
-        }
-        let Self::Heap(bytes) = self else {
-            unreachable!()
-        };
-        bytes.extend_from_slice(suffix);
-    }
-}
-
-impl std::ops::Deref for PhpBytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            Self::Inline { len, bytes } => &bytes[..*len as usize],
-            Self::Heap(bytes) => bytes,
-        }
-    }
-}
-
-/// Refcounted bytes carrying their original PHP memory_limit charge.
+/// PHP string payload: refcounted bytes carrying their memory_limit
+/// charge — a clone shares the charge (zend's CoW) and the last
+/// owner's drop returns it to the arena. `Deref` lands on `[u8]` so
+/// `s.len()`/`s[..]`/iteration sites read unchanged; `.rc` reaches the
+/// shared `Rc<Vec<u8>>` for downgrade/ptr_eq/cache sites.
 #[derive(Debug, Clone)]
 pub struct PhpStr {
-    pub rc: Rc<PhpBytes>,
+    pub rc: Rc<Vec<u8>>,
 }
 
 impl PhpStr {
+    /// Build and charge a new string. Every fresh byte string must go
+    /// through here so STR_LIVE bookkeeping stays symmetric.
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self::from_payload(PhpBytes::from_vec(bytes))
-    }
-
-    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
-        Self::from_payload(PhpBytes::from_slice(bytes))
-    }
-
-    fn from_payload(bytes: PhpBytes) -> Self {
+        // zend's reported request is the zend_string alloc — len + 32
+        // (24B header + 8B emalloc header; oracle: 8000032 for 8MB).
         let req = bytes.len() as i64 + 32;
         mem_charge(&STR_LIVE, str_charge(bytes.len()), req);
         alloc_hit(7);
-        Self { rc: Rc::new(bytes) }
+        PhpStr { rc: Rc::new(bytes) }
     }
 
     /// The caller proves one PHP owner; make_mut detaches weak cache handles.
@@ -2472,11 +2413,13 @@ impl PhpStr {
         );
     }
 
-    /// Restore the charge to bytes whose PhpStr owner died while raw/weak handles lived.
-    pub fn adopt(rc: Rc<PhpBytes>) -> Self {
+    /// Re-attach a charge to shared bytes whose PhpStr owner died
+    /// while a weak/raw clone kept the payload alive (DimPre
+    /// resurrection). Bytes that stay live stay charged.
+    pub fn adopt(rc: Rc<Vec<u8>>) -> Self {
         let req = rc.len() as i64 + 32;
         mem_charge(&STR_LIVE, str_charge(rc.len()), req);
-        Self { rc }
+        PhpStr { rc }
     }
 }
 

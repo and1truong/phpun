@@ -117,7 +117,7 @@ enum UnsetKey {
 enum DimPre {
     Arr(std::rc::Weak<RefCell<PhpArray>>),
     Obj(std::rc::Weak<RefCell<PhpObject>>),
-    Str(std::rc::Weak<crate::value::PhpBytes>),
+    Str(std::rc::Weak<Vec<u8>>),
     Callable(std::rc::Weak<PhpCallable>),
     Res(std::rc::Weak<RefCell<PhpResource>>),
     Scalar(Value),
@@ -6172,7 +6172,7 @@ impl<'a> Interp<'a> {
                     OffWrite::Skipped => return Ok(v),
                     OffWrite::Stored(byte) => {
                         let n = bytes.len() as u64 + 25;
-                        let rc = Rc::new(crate::value::PhpBytes::from_vec(bytes));
+                        let rc = Rc::new(bytes);
                         self.mem_track(&rc, n);
                         let mut b = c.borrow_mut();
                         if let Value::Str(s) = &mut *b {
