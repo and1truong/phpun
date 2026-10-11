@@ -3662,6 +3662,19 @@ DivisionByZeroError:Division by zero
             panic!("string")
         };
         assert!(std::rc::Rc::ptr_eq(&before.rc, &after.rc));
+        let mut args = super::super::CallArgs::empty();
+        args.cells = ["fox", "wolf", "fox\0fox"]
+            .into_iter()
+            .map(|s| std::rc::Rc::new(std::cell::RefCell::new(super::Value::str(s))))
+            .collect();
+        let super::Value::Str(bytes) = it
+            .call_builtin("str_replace", &args, true)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("string")
+        };
+        assert_eq!(bytes.as_ref(), b"wolf\0wolf");
         let mut values = vec![super::Value::Float(4.0)];
         assert!(
             matches!(it.vm_call("sqrt", "sqrt", &mut values, 1, &super::CachedFn::Builtin).unwrap(), super::Value::Float(n) if n == 2.0)
