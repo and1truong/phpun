@@ -2497,3 +2497,41 @@ Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/json-live-reference-review-*.
+
+## #320: perf(vm): verify float method leaves after merged JSON review repair (2026-10-11)
+
+Execute bounded pure float method bodies over existing compiled Ops with a fixed f64 stack, warmed property and sqrt builtin caches. Eligibility uses generic types/ops, never method/benchmark names. Only root callers with pinned receivers and fitting method+builtin arena spans qualify; repay through the existing shared arena path. No code generation, layout change, dependency or public API.
+
+Named/default/ref/non-float/uninitialized/hooked/shadowed methods, cold or user-function caches, last-owner receiver, exposed globals, temporary/error/context/profiler/coverage/deadline/OOM/page-growth cases retain the full root materialize/direct-call/refresh bridge. Existing receiver unit proves warm execution and rejected type/deadline/owner guards; complete native probe covers inheritance/hooks/trace/Int-to-Float widening/errors.
+
+Runtime 77cd3da0ab5643652f3d2e70510b686958aeb034; timing source 77cd3da0ab5643652f3d2e70510b686958aeb034; report/integration source 6f5f75fc505324a3ae352fa2ea8f8e4695c03967.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 140.319 | 115.891 | 0.8259 |
+| bench/40-objects.php 20 5000 | 560.532 | 449.983 | 0.8028 |
+| bench/60-json.php | 520.711 | 519.444 | 0.9976 |
+| bench/20-strings.php | 55.066 | 55.787 | 1.0131 |
+| bench/11-sieve.php | 62.377 | 67.863 | 1.0879 |
+| bench/30-arrays.php | 81.129 | 80.255 | 0.9892 |
+| bench/app/cli.php 100 20 | 32.833 | 34.980 | 1.0654 |
+| examples/composer/run.php | 8.139 | 7.931 | 0.9745 |
+
+Corrected main6c10715/frozen27f7c00/cae5751 baseline vs corrected float77cd3da/d6dc53c.7objects140.319→115.891ms(−17.4%),long560.532→449.983(−19.7%);31objects146.477→120.072(−18.0%),long595.545→478.718(−19.6%). Physicalrequests−124993,arraysunchanged.7sieve+8.8%,app+6.5% retained;31sieve63.181→64.263(+1.7%),app34.261→33.413(−2.5%,not attributed).7JSON−.2%flat,strings+1.3%,arrays−1.1%,Composer−2.6% retained. Native combined method/JSON live+dead-reference gate PASS. All3406onlyGCtimeout→pass;parent strictserialized8593msalreadyPASS,no semantics claim. Earlier cb0d/pre-P2 whole dataset is historical4.10092→3.96668×PHP,not current6c107 ratios; corrected whole-suite audit follows fresh constructor step. No parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1483154→1358161; bytes 66855414→64355538.
+- arrays: requests 636049→636049; bytes 26703849→26703849.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing receiver unit demonstrates warmed kernel activation and fallback without weakening guard states. Complete native probe includes subclass/private-property identity, hooked getter, backtrace and argument errors.
+All3406rawonlyGC77345timeout→pass,2730pass601fail;parent corrected JSON strictserialized8593msalreadyPASS. No new semantic pass/fail claim.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/float-method-leaves-review-*.
