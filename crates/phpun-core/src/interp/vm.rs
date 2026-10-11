@@ -981,7 +981,7 @@ impl Compiler {
             Expr::Assign {
                 target, op, value, ..
             } => {
-                if *op == "=" {
+                if *op == "=" && matches!(Interp::unmark_rhs(target), Expr::Index { .. }) {
                     if let (
                         Expr::Index {
                             e: base,
@@ -2090,7 +2090,10 @@ impl<'a> Interp<'a> {
                     // generation-guarded offsets need a measured storage change.
                     let protected = |c: &Cell| {
                         let ptr = Rc::as_ptr(c) as usize;
-                        self.typed_slots.contains_key(&ptr) || self.slot_owners.contains_key(&ptr)
+                        self.typed_slots.contains_key(&ptr)
+                            || self.slot_owners.contains_key(&ptr)
+                            || self.slot_merged.contains_key(&ptr)
+                            || self.readonly_cells.contains_key(&ptr)
                     };
                     let plain = if (comp.top_level || write.is_some()) && self.globals_arr.is_some()
                         || write.is_some()
