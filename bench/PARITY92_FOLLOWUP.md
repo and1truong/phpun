@@ -1628,3 +1628,34 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/builtin-family-dispatch-*.
+
+## #278: fix(strings): treat explicit null substring length as omitted (2026-10-11)
+
+The shared canonical substr parser accepted ?int but converted explicit null to0. Preserve None for omitted/null length; explicit0 remains Some(0). Integer fast kernel stays unchanged and null still takes canonical builtin binding/frame.
+
+Keep named/weak coercion/type/arity/namespace/ref behavior and the shared byte substring kernel. ONE existing shared string runnable check extended with binary omitted/null/zero distinction.
+
+Runtime 2bc9b379eb8d0fde6b76a873dc791cd666df0bea; measured source 372b930e62565ebebd3cb22183d0461a5f483eb9.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 65.704 | 64.450 | 0.9809 |
+| bench/40-objects.php | 186.094 | 185.428 | 0.9964 |
+| bench/app/cli.php 100 20 | 33.616 | 33.303 | 0.9907 |
+
+Correctness fix, not an optimization claim. Three seven-pair smoke medians retained without attributing speed: strings−1.9%,objects−0.4%,app−0.9%. Full prior failing null-length probe now matches PHP byte-for-byte, including NUL/nonUTF8,Int MIN/MAX offsets/lengths,named/coercion/error/namespace cases.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Full scalar-builtin-calls-null-length-baseline probe now passes PHP byte gate, including nullable length. Binary omitted/null/zero distinction in ONE existing string check. No new fail/pass/skip in3406PHPT;onlyknownrange71132timeout→crash.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/null-substr-length-*.
