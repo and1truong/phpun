@@ -2676,7 +2676,7 @@ Separate physical allocator requests/bytes (not speed runs):
 
 Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
 ONE new runnable cache check covers pointer reuse/modifiers/binary/errors/eviction/dynamic limits;25+19+VMprofile/native five-family/UTF/callback byte gates pass.
-All3406PHPT onlyGC77345pass→timeout;serialized10s parent9017ms/candidate8195msPASS,raw separately retained;601knownfail unchanged.
+All3406PHPT onlyGC77345pass→timeout;serialized10s parent8794ms/candidate8195msPASS,raw separately retained;601knownfail unchanged.
 Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
