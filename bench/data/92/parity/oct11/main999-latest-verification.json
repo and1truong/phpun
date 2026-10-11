@@ -1,0 +1,31 @@
+{
+  "binary_sha256": "73aeab4c640ba510c9637a2454c65cb06a0c9bb50dd1b1cfcdb736a43dae1b34",
+  "source": "999c517f28e288fbef52a0f9e519293922c512d0",
+  "parent": "promoted-ctor-value-abi",
+  "summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ]
+}
