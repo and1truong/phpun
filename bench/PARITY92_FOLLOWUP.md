@@ -3402,3 +3402,57 @@ Timing artifact review: each byte-identical primary timing/followup alias now ha
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
 
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
+
+## #368: reject bounded libc search after three measured iterations (2026-10-11)
+
+Report only. Prototype used Linux libc memmem in the shared bounded byte-search helper, with the existing non-Linux memchr fallback. Empty needle, offset overflow, NUL/binary bytes and pointer bounds were checked in ONE existing byte-search test. No allocation, dependency or representation change.
+
+Three frozen releases: all needles; needles of at least four bytes; the same length guard with forced inlining. Each has fresh release, workspace/fmt/clippy, native 25+19 byte gates, VM-profile, the original partial-result 4MB fatal gate, and all3406 individual PHPT results. The final prototype statuses are IDENTICAL to parent:2731pass599fail25skip38unsupported6crash7timeout. This remains partial compatibility; earlier range/GC scheduling differences are preserved in raw results, not described as fixes.
+
+31 alternating profiler-off PHP8.5.11 -n byte-gated samples, followed by fresh seven rotating PHP/main/parent/candidate samples. Cold CLI parse+execution; OPcache CLI off and JIT disabled. CPU profiling remains unavailable on this host; timings do not prove a CPU cause.
+
+### native-byte-search
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 50.029 | 69.071 | 1.3806 |
+| bench/20-strings.php 100 | 206.651 | 296.955 | 1.4370 |
+| /workspace/parity92/oct11/native-byte-search.php 300 | 52.402 | 25.523 | 0.4871 |
+| bench/profile/strings.php replace 100 | 10.418 | 14.780 | 1.4188 |
+| bench/app/cli.php 100 20 | 33.698 | 34.366 | 1.0198 |
+| bench/60-json.php | 411.936 | 406.561 | 0.9870 |
+
+Whole-seven geomean/raw: `{"main_php_ratio": 3.9855505831154696, "candidate_php_ratio": 2.8948339807318146, "candidate_main_ratio": 0.7263322646049442, "candidate_parent_ratio": 1.0288526933889026}`.
+Frozen source `87f540d42bacca9556879ff01a5ff4fb5af2df1a`; binary SHA256 `c48fe62177446d6195efc219fd5145161500745cbf75340a16e7ce85b0f2187c`.
+
+### native-long-byte-search
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 47.477 | 48.189 | 1.0150 |
+| bench/20-strings.php 100 | 210.336 | 217.716 | 1.0351 |
+| /workspace/parity92/oct11/native-long-byte-search.php 300 | 49.729 | 24.439 | 0.4914 |
+| bench/profile/strings.php replace 100 | 9.730 | 10.262 | 1.0547 |
+| bench/app/cli.php 100 20 | 33.070 | 33.151 | 1.0024 |
+| bench/60-json.php | 405.205 | 406.566 | 1.0034 |
+
+Whole-seven geomean/raw: `{"main_php_ratio": 3.9310601645427803, "candidate_php_ratio": 2.812184462558827, "candidate_main_ratio": 0.7153755844095332, "candidate_parent_ratio": 1.0119672676198137}`.
+Frozen source `7718886c285865401e487e70825aa55f0b155cf1`; binary SHA256 `2d1f52f9f7630d16d269723d56afaaf7e509edae256b55a112c9955b62c12f6e`.
+
+### inline-byte-search
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 46.387 | 47.814 | 1.0308 |
+| bench/20-strings.php 100 | 205.270 | 202.441 | 0.9862 |
+| /workspace/parity92/oct11/inline-byte-search.php 300 | 49.594 | 24.170 | 0.4874 |
+| bench/profile/strings.php replace 100 | 9.829 | 9.675 | 0.9844 |
+| bench/app/cli.php 100 20 | 33.257 | 32.928 | 0.9901 |
+| bench/60-json.php | 406.602 | 412.063 | 1.0134 |
+
+Whole-seven geomean/raw: `{"main_php_ratio": 3.910710172598644, "candidate_php_ratio": 2.7168765755696636, "candidate_main_ratio": 0.6947271609658341, "candidate_parent_ratio": 0.9885562426983904}`.
+Frozen source `c5de3bfa04e41348d75aa27e005e717029a277d7`; binary SHA256 `17c5dfbde2983a7f667e9a6accd846d6798cfc4ec7305753091d8f9d34ca12a7`.
+
+Guarded independent31: ordinary strings +0.9%, long strings +3.9%, repeated replacement +2.2%, adversarial repeated-prefix search −50.9%; long objects −0.4% (flat). Forced-inline31: ordinary strings +3.1%, long −1.4%, replacement −1.6%, adversarial −51.3%; whole ordinary strings +3.9% and long +6.4%. The adversarial win is repeatable but normal workload costs remain. Reject all three rather than trade ordinary performance for one probe.
+
+Ordinary reverts f09ebf2,ea42edf,7d7d246 remove all prototype production changes and tests; all crates are byte-identical to PR #369. Retirement/integration source `4b57cd2318b694b3df0d5f308ccbdc97bb9b67a4`. Frozen prototype results are not retirement timings. No general performance/parity gain is claimed.
