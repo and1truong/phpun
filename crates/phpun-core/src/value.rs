@@ -75,9 +75,10 @@ pub type Cell = Rc<RefCell<Value>>;
 /// Below this bucket count a linear scan beats hashing the key.
 const IDX_MIN: usize = 48;
 
-/// Implicit lists and bounded decoded maps keep values inline. Exporting Cell
-/// handles or a canonical Vec mutator materializes the ordered table once.
-/// ponytail: decoded maps stop at IDX_MIN; other producers keep Cells.
+/// Dense scalar tables keep values inline. Exporting Cell handles or using
+/// a canonical Vec mutator materializes the same ordered Cell table once.
+/// ponytail: only zero-based scalar fills start packed; other producers and
+/// reference/mixed mutators retain Cells until measured storage work extends it.
 #[derive(Debug)]
 pub struct ArrayEntries(ArrayStorage);
 
@@ -346,12 +347,11 @@ impl PhpArray {
     /// storage retains its existing hash index rather than adding a new one.
     pub(crate) fn keyed_map() -> Self {
         let mut a = Self::new();
-        a.entries = ArrayEntries::packed(Vec::with_capacity(8));
+        a.entries = ArrayEntries::packed(Vec::new());
         let ArrayStorage::Packed(p) = &mut a.entries.0 else {
             unreachable!()
         };
-        // Match the minimum PHP table capacity without charging spare native slots.
-        p.keys = Some(Vec::with_capacity(8));
+        p.keys = Some(Vec::new());
         a
     }
 
