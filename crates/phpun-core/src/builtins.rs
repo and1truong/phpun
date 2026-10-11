@@ -170,7 +170,17 @@ pub(crate) fn call_scalar(name: &str, args: &[Value]) -> Option<Value> {
 }
 
 pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
-    for f in FAMILIES {
+    // Same family implementation and deferred-error protocol; known names
+    // need not ask every unrelated extension to decline the call.
+    let families: &[Dispatch] = match name {
+        "strlen" | "substr" | "substr_count" | "str_replace" | "str_ireplace" | "str_repeat"
+        | "strpos" | "stripos" | "strtoupper" | "strtolower" => &[string::dispatch],
+        "sqrt" | "abs" => &[math::dispatch],
+        "json_encode" | "json_decode" => &[json::dispatch],
+        "preg_match" | "preg_match_all" => &[pcre::dispatch],
+        _ => FAMILIES,
+    };
+    for f in families {
         match f(it, name, args) {
             Ok(None) => continue,
             r => {
