@@ -247,7 +247,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             let ob = o.borrow();
             // Enum cases print `enum(E::Case1)` (single line).
             if ob.class.decl.kind == crate::ast::ClassKind::Enum {
-                if let Some(nm) = ob.props.get("name") {
+                if let Some(nm) = ob.prop_get("name") {
                     if let Value::Str(case) = &*nm.borrow() {
                         it.emit(&format!(
                             "{}{}enum({}::{})\n",
@@ -269,7 +269,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 .prop_order
                 .iter()
                 .filter(|n| {
-                    ob.props.contains_key(*n)
+                    ob.prop_has(n)
                         && !(is_dt && (n.starts_with("\0dt\0") || n.starts_with("\0tz\0")))
                 })
                 .count();
@@ -344,7 +344,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 }
                 // Reserved-but-cellless slots are uninitialized typed
                 // props — zend prints `uninitialized(T)` (recursion).
-                if !ob.props.contains_key(n) {
+                if !ob.prop_has(n) {
                     if let Some(pd) = it.decl_for_slot(o, n) {
                         if let Some(tys) = &pd.ty {
                             let ty = if tys.len() == 2 && tys.iter().any(|t| t == "null") {
@@ -374,7 +374,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                     }
                     continue;
                 }
-                if let Some(c) = ob.props.get(n) {
+                if let Some(c) = ob.prop_get(n) {
                     // Int-keyed buckets (SPL `[]=` appends) display
                     // their index unquoted, like array elements.
                     if let Some(i) = crate::value::int_prop_index(n) {
@@ -384,7 +384,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                             &c.borrow(),
                             indent + 1,
                             zval,
-                            it.is_ref_cell(c) && Rc::strong_count(c) > 1,
+                            it.is_ref_cell(&c) && Rc::strong_count(&c) > 2,
                         );
                         continue;
                     }
@@ -417,7 +417,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                         &c.borrow(),
                         indent + 1,
                         zval,
-                        !typed && it.is_ref_cell(c) && Rc::strong_count(c) > 1,
+                        !typed && it.is_ref_cell(&c) && Rc::strong_count(&c) > 2,
                     );
                 }
             }
@@ -676,7 +676,7 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
             s.push_str(&"    ".repeat(indent));
             s.push_str("(\n");
             for n in &ob.prop_order {
-                if let Some(c) = ob.props.get(n) {
+                if let Some(c) = ob.prop_get(n) {
                     // Int-keyed buckets print their bare index;
                     // other props annotate visibility like zend:
                     // `[name:protected]` / `[name:Cls:private]`.
@@ -847,7 +847,7 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
                     if has_ao {
                         continue;
                     }
-                    if let Some(v) = o.borrow().props.get(&slot).map(|c| c.borrow().clone()) {
+                    if let Some(v) = o.borrow().prop_get(&slot).map(|c| c.borrow().clone()) {
                         s.push_str(&format!("{}{} => ", epad, i));
                         if matches!(&v, Value::Array(_) | Value::Object(_)) {
                             s.push('\n');
@@ -860,7 +860,7 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
                 }
                 let v = match &decl {
                     Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
-                    None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                    None => o.borrow().prop_get(&slot).map(|c| c.borrow().clone()),
                 };
                 if let Some(v) = v {
                     s.push_str(&format!("{}'{}' => ", epad, out));
@@ -1038,7 +1038,7 @@ fn ser_value(it: &mut Interp, v: &Value, ctx: &mut SerCtx) -> Result<String, Php
             let pairs: Vec<(String, Cell)> = ob
                 .prop_order
                 .iter()
-                .filter_map(|name| ob.props.get(name).map(|c| (name.clone(), c.clone())))
+                .filter_map(|name| ob.prop_get(name).map(|c| (name.clone(), c)))
                 .collect();
             drop(ob);
             let cls = o.borrow().class.clone();
@@ -1409,7 +1409,7 @@ pub(crate) fn php_unserialize(
                         if !ob.prop_order.contains(&key) {
                             ob.prop_order.push(key.clone());
                         }
-                        ob.props.insert(key, v);
+                        ob.prop_insert(key, v);
                         continue;
                     }
                     return Err(());
@@ -1515,7 +1515,7 @@ pub(crate) fn php_unserialize(
                         if !ob.prop_order.contains(&prev_slot) {
                             ob.prop_order.push(prev_slot.clone());
                         }
-                        ob.props.insert(prev_slot.clone(), m);
+                        ob.prop_insert(prev_slot.clone(), m);
                         continue;
                     }
                 }
@@ -1523,7 +1523,7 @@ pub(crate) fn php_unserialize(
                 if !ob.prop_order.contains(&key) {
                     ob.prop_order.push(key.clone());
                 }
-                ob.props.insert(key, v);
+                ob.prop_insert(key, v);
             }
             *pos += 1; // }
                        // DateTime-family payloads carry the public view; rebuild

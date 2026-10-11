@@ -2151,7 +2151,7 @@ pub(crate) fn tz_offset_at(name: &str, ts: i64) -> i64 {
 pub(crate) fn dt_public_props(
     ob: &crate::value::PhpObject,
 ) -> Option<Vec<(String, crate::value::Value)>> {
-    let g = |k: &str| ob.props.get(k).map(|c| c.borrow().clone());
+    let g = |k: &str| ob.prop_get(k).map(|c| c.borrow().clone());
     let gi = |k: &str, d: i64| match g(k) {
         Some(crate::value::Value::Int(n)) => n,
         _ => d,
@@ -2196,7 +2196,7 @@ pub(crate) fn dt_public_props(
 pub(crate) fn dt_instant(ob: &crate::value::PhpObject) -> Option<(i64, i64)> {
     match ob.class.name().to_lowercase().as_str() {
         "datetime" | "datetimeimmutable" => {
-            let g = |k: &str| match ob.props.get(k).map(|c| c.borrow().clone()) {
+            let g = |k: &str| match ob.prop_get(k).map(|c| c.borrow().clone()) {
                 Some(crate::value::Value::Int(n)) => n,
                 _ => 0,
             };
@@ -2210,7 +2210,7 @@ pub(crate) fn dt_instant(ob: &crate::value::PhpObject) -> Option<(i64, i64)> {
 /// public props — returns true when the class is a dt object.
 pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
     let cn = ob.class.name().to_lowercase();
-    let g = |k: &str, obb: &crate::value::PhpObject| obb.props.get(k).map(|c| c.borrow().clone());
+    let g = |k: &str, obb: &crate::value::PhpObject| obb.prop_get(k).map(|c| c.borrow().clone());
     if cn == "datetime" || cn == "datetimeimmutable" {
         let (mut ts, mut us) = (0i64, 0i64);
         if let Some(crate::value::Value::Str(s)) = g("date", ob) {
@@ -2252,7 +2252,7 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
         };
         ts -= off;
         for k in ["date", "timezone_type", "timezone"] {
-            ob.props.remove(k);
+            ob.prop_take(k);
             ob.prop_order.retain(|x| x != k);
         }
         for (k, v) in [
@@ -2261,14 +2261,14 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
             ("\0dt\0tzty", tzty),
             ("\0dt\0us", us),
         ] {
-            ob.props.insert(
-                k.to_string(),
+            ob.prop_insert(
+                k,
                 std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::Int(v))),
             );
             ob.prop_order.push(k.to_string());
         }
-        ob.props.insert(
-            "\0dt\0tz".to_string(),
+        ob.prop_insert(
+            "\0dt\0tz",
             std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::str(tz))),
         );
         ob.prop_order.push("\0dt\0tz".to_string());
@@ -2304,8 +2304,8 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
             }
         }
         for (k, v) in [("\0di\0months", mo), ("\0di\0days", dy), ("\0di\0secs", sc)] {
-            ob.props.insert(
-                k.to_string(),
+            ob.prop_insert(
+                k,
                 std::rc::Rc::new(std::cell::RefCell::new(crate::value::Value::Int(v))),
             );
         }
@@ -2319,7 +2319,7 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
             _ => 3,
         };
         for k in ["timezone_type", "timezone"] {
-            ob.props.remove(k);
+            ob.prop_take(k);
             ob.prop_order.retain(|x| x != k);
         }
         for (k, v) in [("\0tz\0name", tz), ("\0tz\0ty", ty.to_string())] {
@@ -2328,10 +2328,7 @@ pub(crate) fn dt_unserialize_fixup(ob: &mut crate::value::PhpObject) {
             } else {
                 crate::value::Value::str(v)
             };
-            ob.props.insert(
-                k.to_string(),
-                std::rc::Rc::new(std::cell::RefCell::new(val)),
-            );
+            ob.prop_insert(k, std::rc::Rc::new(std::cell::RefCell::new(val)));
             ob.prop_order.push(k.to_string());
         }
     }

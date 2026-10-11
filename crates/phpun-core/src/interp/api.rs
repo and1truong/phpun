@@ -209,7 +209,7 @@ impl<'a> Interp<'a> {
     }
     /// class-name-string is-a check for is_subclass_of.
     pub fn obj_is_a_str(&mut self, cls_name: &str, name: &str) -> bool {
-        match self.classes.get(&cls_name.to_lowercase()).cloned() {
+        match lkey_get(&self.classes, cls_name).cloned() {
             Some(c) => self.is_a(&c, name),
             None => false,
         }
@@ -242,7 +242,7 @@ impl<'a> Interp<'a> {
                     if p.trim_start_matches('\\').eq_ignore_ascii_case(&tgt_l) {
                         return Ok(true);
                     }
-                    if let Some(ff) = self.interfaces.get(&p.to_lowercase()) {
+                    if let Some(ff) = lkey_get(&self.interfaces, p) {
                         stack.push(ff.clone());
                     }
                 }
@@ -718,7 +718,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         false
     }
@@ -872,7 +872,7 @@ impl<'a> Interp<'a> {
         self.call_value(&Value::str(name), CallArgs::positional(args))
     }
     pub fn prop_set(&mut self, obj: &Rc<RefCell<PhpObject>>, name: &str, v: Value) {
-        obj.borrow_mut().props.insert(name.to_string(), cell(v));
+        obj.borrow_mut().prop_insert(name, cell(v));
     }
     pub fn obj_class_name(&self, o: &Rc<RefCell<PhpObject>>) -> String {
         o.borrow().class.name().to_string()

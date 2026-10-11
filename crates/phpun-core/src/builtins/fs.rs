@@ -2749,8 +2749,7 @@ pub(crate) fn dispatch(
                     // "bucket" property'.
                     let has_bucket = bobj
                         .borrow()
-                        .props
-                        .get("bucket")
+                        .prop_get("bucket")
                         .map(|c| matches!(&*c.borrow(), Value::Resource(_)))
                         .unwrap_or(false);
                     if !has_bucket {
@@ -2766,8 +2765,7 @@ pub(crate) fn dispatch(
                     let bytes = it.to_bytes_of(
                         &bobj
                             .borrow()
-                            .props
-                            .get("data")
+                            .prop_get("data")
                             .map(|c| c.borrow().clone())
                             .unwrap_or(Value::Str(Vec::new().into())),
                     );
@@ -5730,7 +5728,7 @@ fn select_chain(it: &mut Interp, chain: &mut Vec<Value>, class: &str, msg: Strin
     let e = it.exception(class, &msg);
     if let (Value::Object(o), Some(p)) = (&e, chain.last().cloned()) {
         let mut ob = o.borrow_mut();
-        ob.props.insert("previous".into(), cell(p));
+        ob.prop_insert("previous", cell(p));
         if !ob.prop_order.iter().any(|k| k == "previous") {
             ob.prop_order.push("previous".into());
         }
@@ -7061,8 +7059,7 @@ fn user_filter_call(
     // callers pass a NULL zval only for the destructor flush, when the
     // stream resource is already freed; unset again after the call.
     obj.borrow_mut()
-        .props
-        .insert("stream".into(), cell(stream_val.clone()));
+        .prop_insert("stream", cell(stream_val.clone()));
     let prev_nofclose = it.filter_no_fclose;
     it.filter_no_fclose = Some(stream_id);
     // Reads re-entered on this stream fail while filter() runs (zend),
@@ -7084,9 +7081,7 @@ fn user_filter_call(
         cell(Value::Bool(closing)),
     ];
     let call = it.method_invoke(obj.clone(), "filter", CallArgs::positional(args));
-    obj.borrow_mut()
-        .props
-        .insert("stream".into(), cell(Value::Null));
+    obj.borrow_mut().prop_insert("stream", cell(Value::Null));
     it.filter_no_fclose = prev_nofclose;
     it.filter_warn_ctx = prev_ctx;
     it.stream_filter_busy.remove(&stream_id);
@@ -7670,10 +7665,9 @@ fn filter_instantiate(
             // $filtername/$params get the attach args; ->stream stays
             // null outside filter() calls (zend).
             obj.borrow_mut()
-                .props
-                .insert("filtername".into(), cell(Value::str(name)));
+                .prop_insert("filtername", cell(Value::str(name)));
             let pv = params.map(|c| c.borrow().clone()).unwrap_or(Value::Null);
-            obj.borrow_mut().props.insert("params".into(), cell(pv));
+            obj.borrow_mut().prop_insert("params", cell(pv));
             let _ = stream_val;
             let ok = it
                 .method_invoke(obj.clone(), "onCreate", CallArgs::empty())
@@ -8085,18 +8079,17 @@ fn new_stream_bucket(it: &mut Interp, bytes: Vec<u8>) -> Result<Value, PhpError>
     it.stream_buckets.insert(bid, bytes.clone());
     {
         let mut o = obj.borrow_mut();
-        o.props.insert(
-            "bucket".into(),
+        o.prop_insert(
+            "bucket",
             cell(Value::Resource(Rc::new(RefCell::new(PhpResource::Other {
                 id: bid,
                 kind: "userfilter.bucket",
             })))),
         );
-        o.props
-            .insert("data".into(), cell(Value::bytes(bytes.clone())));
+        o.prop_insert("data", cell(Value::bytes(bytes.clone())));
         let n = Value::Int(bytes.len() as i64);
-        o.props.insert("datalen".into(), cell(n.clone()));
-        o.props.insert("dataLength".into(), cell(n));
+        o.prop_insert("datalen", cell(n.clone()));
+        o.prop_insert("dataLength", cell(n));
     }
     Ok(Value::Object(obj))
 }

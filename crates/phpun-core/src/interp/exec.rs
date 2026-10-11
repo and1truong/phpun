@@ -1613,7 +1613,7 @@ impl<'a> Interp<'a> {
                             // backing slot, no hook write-back. An
                             // uninitialized typed slot isn't iterated
                             // (gh15187_2).
-                            match o.borrow().props.get(&slot_key).cloned() {
+                            match o.borrow().prop_get(&slot_key) {
                                 Some(c) => c,
                                 None if pd.ty.is_some() => continue,
                                 None => cell(Value::Null),
@@ -1682,7 +1682,7 @@ impl<'a> Interp<'a> {
                             }
                         }
                     } else {
-                        let live = { o.borrow().props.get(&slot_key).cloned() };
+                        let live = { o.borrow().prop_get(&slot_key) };
                         match live {
                             Some(c) => c,
                             None => continue, // tombstoned by unset()

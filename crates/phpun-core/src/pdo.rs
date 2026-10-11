@@ -126,7 +126,7 @@ fn stmt_rows(it: &mut Interp, rows: &[Vec<(String, Value)>], pos: usize, mode: i
             if let Value::Object(o) = &obj {
                 let mut ob = o.borrow_mut();
                 for (k, v) in row {
-                    ob.props.insert(k.clone(), Rc::new(RefCell::new(v.clone())));
+                    ob.prop_insert(k.clone(), Rc::new(RefCell::new(v.clone())));
                     ob.prop_order.push(k.clone());
                 }
             }

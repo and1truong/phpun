@@ -1474,22 +1474,28 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
                 // zend_std_compare_objects: different ce → ret 1.
                 return Ordering::Greater;
             }
-            if x.props.len() != y.props.len() {
-                return x.props.len().cmp(&y.props.len());
+            if x.prop_len() != y.prop_len() {
+                return x.prop_len().cmp(&y.prop_len());
             }
             // zend walks the properties hash in insertion order —
             // prop_order mirrors it; any leftover slots not tracked
             // there trail behind.
-            let mut keys: Vec<&String> = x
+            let mut keys: Vec<String> = x
                 .prop_order
                 .iter()
-                .filter(|k| x.props.contains_key(*k))
+                .filter(|k| x.prop_has(k))
+                .cloned()
                 .collect();
-            keys.extend(x.props.keys().filter(|k| !x.prop_order.contains(k)));
+            keys.extend(
+                x.props
+                    .keys()
+                    .filter(|k| !x.prop_order.contains(*k))
+                    .cloned(),
+            );
             for k in keys {
-                match y.props.get(k) {
+                match y.prop_get(&k) {
                     Some(yc) => {
-                        let ord = compare(&x.props[k].borrow(), &yc.borrow());
+                        let ord = compare(&x.prop_get(&k).unwrap().borrow(), &yc.borrow());
                         if ord != Ordering::Equal {
                             return ord;
                         }
@@ -1988,9 +1994,50 @@ impl fmt::Display for Value {
 #[derive(Debug)]
 pub struct PhpClass {
     pub decl: Rc<crate::ast::ClassDecl>,
+    /// Resolved `extends` link, filled on the first chain walk — a
+    /// bound parent never changes, so the hit needs no map lookup or
+    /// lowercase alloc. Only `Some` is cached: a miss re-probes so a
+    /// parent registered later still resolves.
+    pub parent_rc: RefCell<Option<Rc<PhpClass>>>,
+    /// `is_a(Throwable)` verdict, memoized like `parent_rc` — object
+    /// construction asks it for the internal Exception payload on
+    /// every `new`.
+    pub throwable: std::cell::Cell<Option<bool>>,
+    /// Chain-flattened declared props (non-static, backed) in final
+    /// prop_order — built once on first `new`: the seen/backed/order
+    /// machinery is class-fixed so it needn't rerun per object.
+    pub flat_props: std::cell::OnceCell<Rc<Vec<FlatProp>>>,
+    /// Storage key → `flat_props` index, filled alongside `flat_props`:
+    /// routes `prop_get`/`prop_insert` to `PhpObject.slots`.
+    pub prop_slot: std::cell::OnceCell<Rc<HashMap<String, usize>>>,
+    /// 1-entry `find_method_in` memo: (name as looked up, resolution —
+    /// `None` is a cached miss). ponytail: polymorphic sites thrash a
+    /// single slot; upgrade is a small name-keyed map on the class.
+    pub method_ic: MethodIc,
     /// `self::$prop` storage, initialized lazily from declared defaults.
     pub statics: RefCell<HashMap<String, Cell>>,
     pub statics_init: RefCell<bool>,
+}
+
+/// `(method decl, declaring class)` as `find_method_in` resolves it;
+/// `None` = cached miss.
+pub type MethodHit = Option<(Rc<crate::ast::MethodDecl>, Rc<PhpClass>)>;
+/// 1-entry `(looked-up name, hit)` memo slot on `PhpClass`.
+pub type MethodIc = RefCell<Option<(String, MethodHit)>>;
+
+/// One entry of the flattened declared-prop layout: the storage key
+/// (mangled `\0Cls\0name` for private slots, else the plain name)
+/// plus enough to re-run the per-object default evaluation.
+#[derive(Debug)]
+pub struct FlatProp {
+    pub key: String,
+    /// The class whose `decl.props[prop_idx]` this slot came from —
+    /// also the const-self context for default evaluation.
+    pub declaring: Rc<PhpClass>,
+    pub prop_idx: usize,
+    /// Typed prop without a default: reserves its order slot but
+    /// starts *uninitialized* (no cell).
+    pub uninit: bool,
 }
 
 impl PhpClass {
@@ -2012,8 +2059,7 @@ impl PhpClass {
 
     /// Method lookup walking the parent chain.
     pub fn find_method(&self, name: &str) -> Option<Rc<crate::ast::MethodDecl>> {
-        let lname = name.to_lowercase();
-        self.decl.find_method(&lname)
+        self.decl.find_method(name)
     }
 }
 
@@ -2308,9 +2354,15 @@ pub fn mem_last_alloc() -> i64 {
 #[derive(Debug)]
 pub struct PhpObject {
     pub class: Rc<PhpClass>,
-    /// Instance properties (declared + dynamic).
+    /// Declared-prop cells indexed by the class's `flat_props` order —
+    /// `None` = uninitialized (typed, no default) or `unset()`.
+    /// Dynamic props live in `props`.
+    pub slots: Vec<Option<Cell>>,
+    /// Dynamic instance properties only — declared cells live in
+    /// `slots`. Use `prop_get`/`prop_insert`/… which route by key.
     pub props: HashMap<String, Cell>,
-    /// Declared-property order for var_dump/foreach output.
+    /// Property order for var_dump/foreach output: declared keys in
+    /// `flat_props` order, then dynamic inserts; `unset()` tombstones.
     pub prop_order: Vec<String>,
     /// PHP's per-process object handle counter.
     pub id: u64,
@@ -2319,6 +2371,74 @@ pub struct PhpObject {
     /// Typed props that were `unset()` — reads route to `__get` like
     /// undefined props instead of the uninitialized-typed Error.
     pub unset_props: std::collections::HashSet<String>,
+}
+
+impl PhpObject {
+    /// `flat_props` index of a storage key (`\0Cls\0name` private slot
+    /// or plain name), `None` for dynamic/unknown keys.
+    pub fn decl_slot(&self, key: &str) -> Option<usize> {
+        self.class.prop_slot.get().and_then(|m| m.get(key).copied())
+    }
+
+    /// The live cell for `key` — declared slot or dynamic entry.
+    /// Owning `Cell` clone (Rc bump); callers then borrow as usual.
+    pub fn prop_get(&self, key: &str) -> Option<Cell> {
+        match self.decl_slot(key) {
+            Some(i) => self.slots.get(i).and_then(|s| s.as_ref().cloned()),
+            None => self.props.get(key).cloned(),
+        }
+    }
+
+    pub fn prop_has(&self, key: &str) -> bool {
+        match self.decl_slot(key) {
+            Some(i) => self.slots.get(i).is_some_and(|s| s.is_some()),
+            None => self.props.contains_key(key),
+        }
+    }
+
+    /// Write a cell: declared keys go to their slot (the order entry
+    /// already exists), dynamics into the map — the caller keeps doing
+    /// its own prop_order bookkeeping, unchanged from the map era.
+    pub fn prop_insert(&mut self, key: impl AsRef<str>, c: Cell) -> Option<Cell> {
+        let key = key.as_ref();
+        match self.decl_slot(key) {
+            Some(i) => {
+                if self.slots.len() <= i {
+                    self.slots.resize_with(i + 1, || None);
+                }
+                self.slots[i].replace(c)
+            }
+            None => self.props.insert(key.to_string(), c),
+        }
+    }
+
+    /// `unset()` a prop: drop its cell, keep the order tombstone.
+    pub fn prop_take(&mut self, key: &str) -> Option<Cell> {
+        match self.decl_slot(key) {
+            Some(i) => self.slots.get_mut(i).and_then(|s| s.take()),
+            None => self.props.remove(key),
+        }
+    }
+
+    /// Live `(key, cell)` pairs in `prop_order` order — the equivalent
+    /// of iterating the old unified map.
+    pub fn live_props(&self) -> Vec<(String, Cell)> {
+        self.prop_order
+            .iter()
+            .filter_map(|k| self.prop_get(k).map(|c| (k.clone(), c)))
+            .collect()
+    }
+
+    pub fn prop_len(&self) -> usize {
+        self.slots.iter().flatten().count() + self.props.len()
+    }
+
+    /// Drop every prop cell (serialize-freeze-style wipe); order
+    /// metadata stays — same as the old `props.clear()`.
+    pub fn prop_clear(&mut self) {
+        self.slots.iter_mut().for_each(|s| *s = None);
+        self.props.clear();
+    }
 }
 
 impl Drop for PhpObject {

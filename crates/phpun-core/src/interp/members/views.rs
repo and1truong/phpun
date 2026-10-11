@@ -27,7 +27,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         chain.reverse();
         let scope = self.stack.last().and_then(|f| {
@@ -146,7 +146,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         chain.reverse();
         for c in &chain {
@@ -214,7 +214,7 @@ impl<'a> Interp<'a> {
             // A set-only hooked prop still backs a slot — serialization
             // reads it raw, like a plain prop (gh17988).
         }
-        o.borrow().props.get(slot).map(|c| c.borrow().clone())
+        o.borrow().prop_get(slot).map(|c| c.borrow().clone())
     }
 
     /// get_class_vars(): declared prop defaults in parent-first decl
@@ -227,7 +227,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         chain.reverse();
         let scope = self.caller_scope_name();
@@ -371,8 +371,7 @@ impl<'a> Interp<'a> {
                                 Some(Value::Object(o)) => {
                                     let b = o.borrow();
                                     let m = b
-                                        .props
-                                        .get("message")
+                                        .prop_get("message")
                                         .map(|c| c.borrow().to_php_string())
                                         .unwrap_or_else(|| pe.message.clone());
                                     (b.class.name().to_string(), m.to_string())
@@ -451,10 +450,9 @@ impl<'a> Interp<'a> {
             let nt = self.instantiate("reflectionnamedtype", &[])?;
             if let Value::Object(o) = &nt {
                 let mut ob = o.borrow_mut();
-                ob.props
-                    .insert("name".into(), cell(Value::str((*nonnull[0]).clone())));
-                ob.props.insert(
-                    "\0rt\0null".into(),
+                ob.prop_insert("name", cell(Value::str((*nonnull[0]).clone())));
+                ob.prop_insert(
+                    "\0rt\0null",
                     cell(Value::Bool(
                         members.len() > 1 || nonnull[0].as_str() == "mixed",
                     )),
@@ -467,10 +465,8 @@ impl<'a> Interp<'a> {
             let nt = self.instantiate("reflectionnamedtype", &[])?;
             if let Value::Object(o) = &nt {
                 let mut ob = o.borrow_mut();
-                ob.props
-                    .insert("name".into(), cell(Value::str(members[0].clone())));
-                ob.props
-                    .insert("\0rt\0null".into(), cell(Value::Bool(true)));
+                ob.prop_insert("name", cell(Value::str(members[0].clone())));
+                ob.prop_insert("\0rt\0null", cell(Value::Bool(true)));
             }
             return Ok(nt);
         }
@@ -480,10 +476,8 @@ impl<'a> Interp<'a> {
             for m in members {
                 ta.push(Value::str(m));
             }
-            o.borrow_mut().props.insert(
-                "\0rt\0types".into(),
-                cell(Value::Array(Rc::new(RefCell::new(ta)))),
-            );
+            o.borrow_mut()
+                .prop_insert("\0rt\0types", cell(Value::Array(Rc::new(RefCell::new(ta)))));
         }
         Ok(ut)
     }
@@ -501,65 +495,45 @@ impl<'a> Interp<'a> {
         cls_name: Option<&str>,
     ) {
         o.borrow_mut()
-            .props
-            .insert("\0rp\0name".into(), cell(Value::str(&rp_decl.name)));
+            .prop_insert("\0rp\0name", cell(Value::str(&rp_decl.name)));
         // Zend's ReflectionParameter exposes the name
         // as a public prop rendered by var_dump.
         let mut ob = o.borrow_mut();
-        ob.props
-            .insert("name".into(), cell(Value::str(&rp_decl.name)));
+        ob.prop_insert("name", cell(Value::str(&rp_decl.name)));
         if !ob.prop_order.contains(&"name".into()) {
             ob.prop_order.push("name".into());
         }
         drop(ob);
         let mut ob = o.borrow_mut();
-        ob.props
-            .insert("\0rp\0variadic".into(), cell(Value::Bool(rp_decl.variadic)));
-        ob.props
-            .insert("\0rp\0pos".into(), cell(Value::Int(pos as i64)));
-        ob.props
-            .insert("\0rp\0hasdef".into(), cell(Value::Bool(rp_decl.has_def)));
-        ob.props
-            .insert("\0rp\0opt".into(), cell(Value::Bool(rp_decl.opt)));
-        ob.props
-            .insert("\0rp\0def".into(), cell(rp_decl.def.clone()));
-        ob.props
-            .insert("\0rp\0byref".into(), cell(Value::Bool(rp_decl.by_ref)));
-        ob.props
-            .insert("\0rp\0hasty".into(), cell(Value::Bool(rp_decl.hasty)));
-        ob.props.insert(
-            "\0rp\0allownull".into(),
-            cell(Value::Bool(rp_decl.allow_null)),
-        );
+        ob.prop_insert("\0rp\0variadic", cell(Value::Bool(rp_decl.variadic)));
+        ob.prop_insert("\0rp\0pos", cell(Value::Int(pos as i64)));
+        ob.prop_insert("\0rp\0hasdef", cell(Value::Bool(rp_decl.has_def)));
+        ob.prop_insert("\0rp\0opt", cell(Value::Bool(rp_decl.opt)));
+        ob.prop_insert("\0rp\0def", cell(rp_decl.def.clone()));
+        ob.prop_insert("\0rp\0byref", cell(Value::Bool(rp_decl.by_ref)));
+        ob.prop_insert("\0rp\0hasty", cell(Value::Bool(rp_decl.hasty)));
+        ob.prop_insert("\0rp\0allownull", cell(Value::Bool(rp_decl.allow_null)));
         if let Some(cn) = &rp_decl.const_name {
-            ob.props
-                .insert("\0rp\0defconst".into(), cell(Value::str(cn.clone())));
+            ob.prop_insert("\0rp\0defconst", cell(Value::str(cn.clone())));
         }
         if rp_decl.has_def && rp_decl.dmsg.is_none() {
-            ob.props
-                .insert("\0rp\0default".into(), cell(rp_decl.def.clone()));
+            ob.prop_insert("\0rp\0default", cell(rp_decl.def.clone()));
         }
         if let Some((cls, msg)) = &rp_decl.dmsg {
-            ob.props
-                .insert("\0rp\0dmsg".into(), cell(Value::str(msg.clone())));
-            ob.props
-                .insert("\0rp\0dcls".into(), cell(Value::str(cls.clone())));
+            ob.prop_insert("\0rp\0dmsg", cell(Value::str(msg.clone())));
+            ob.prop_insert("\0rp\0dcls", cell(Value::str(cls.clone())));
         }
         let mut ta = PhpArray::default();
         for m in &rp_decl.ty {
             ta.push(Value::str(m));
         }
-        ob.props.insert(
-            "\0rp\0ty".into(),
-            cell(Value::Array(Rc::new(RefCell::new(ta)))),
-        );
-        ob.props
-            .insert("\0rp\0internal".into(), cell(Value::Bool(rp_decl.internal)));
+        ob.prop_insert("\0rp\0ty", cell(Value::Array(Rc::new(RefCell::new(ta)))));
+        ob.prop_insert("\0rp\0internal", cell(Value::Bool(rp_decl.internal)));
         if let Some(f) = fn_name {
-            ob.props.insert("\0rp\0fn".into(), cell(Value::str(f)));
+            ob.prop_insert("\0rp\0fn", cell(Value::str(f)));
         }
         if let Some(c) = cls_name {
-            ob.props.insert("\0rc\0class".into(), cell(Value::str(c)));
+            ob.prop_insert("\0rc\0class", cell(Value::str(c)));
         }
     }
 
@@ -803,10 +777,9 @@ impl<'a> Interp<'a> {
                             ));
                         };
                         let mut ob = obj.borrow_mut();
-                        ob.props
-                            .insert("\0rc\0class".into(), cell(Value::str(&canon)));
-                        ob.props.insert("\0rc\0prop".into(), cell(Value::Null));
-                        ob.props.insert("name".into(), cell(Value::str(&canon)));
+                        ob.prop_insert("\0rc\0class", cell(Value::str(&canon)));
+                        ob.prop_insert("\0rc\0prop", cell(Value::Null));
+                        ob.prop_insert("name", cell(Value::str(&canon)));
                         if !ob.prop_order.contains(&"name".into()) {
                             ob.prop_order.push("name".into());
                         }
@@ -851,8 +824,8 @@ impl<'a> Interp<'a> {
                     .get(1)
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                ob.props.insert("\0rc\0class".into(), cell(cls.clone()));
-                ob.props.insert("\0rc\0prop".into(), cell(prop.clone()));
+                ob.prop_insert("\0rc\0class", cell(cls.clone()));
+                ob.prop_insert("\0rc\0prop", cell(prop.clone()));
                 // Public metadata props the real reflectors expose:
                 // ReflectionProperty::{class,name}, ReflectionMethod::
                 // {class,name}, ReflectionClass/Function::name. `class`
@@ -874,8 +847,8 @@ impl<'a> Interp<'a> {
                 };
                 match ob.class.name().to_lowercase().as_str() {
                     "reflectionproperty" | "reflectionmethod" | "reflectionclassconstant" => {
-                        ob.props.insert("name".into(), cell(prop));
-                        ob.props.insert("class".into(), cell(Value::str(&cname)));
+                        ob.prop_insert("name", cell(prop));
+                        ob.prop_insert("class", cell(Value::str(&cname)));
                         // Public metadata props render in var_dump in
                         // declaration order: name, then class.
                         for k in ["name", "class"] {
@@ -895,7 +868,7 @@ impl<'a> Interp<'a> {
                             },
                             _ => cls,
                         };
-                        ob.props.insert("name".into(), cell(nm));
+                        ob.prop_insert("name", cell(nm));
                         if !ob.prop_order.contains(&"name".into()) {
                             ob.prop_order.push("name".into());
                         }
@@ -920,8 +893,7 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     let mn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0prop")
+                        .prop_get("\0rc\0prop")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = self.conv_str(&mn)?.to_string();
@@ -942,8 +914,7 @@ impl<'a> Interp<'a> {
                             // Static context: Class::method or null $this.
                             let cn = obj
                                 .borrow()
-                                .props
-                                .get("\0rc\0class")
+                                .prop_get("\0rc\0class")
                                 .map(|c| c.borrow().clone())
                                 .unwrap_or(Value::Null);
                             let cn = self.conv_str(&cn)?.to_string();
@@ -959,8 +930,7 @@ impl<'a> Interp<'a> {
                 } else {
                     let cb = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let ca = CallArgs {
@@ -994,8 +964,7 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     let mn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0prop")
+                        .prop_get("\0rc\0prop")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = self.conv_str(&mn)?.to_string();
@@ -1011,8 +980,7 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     let cb = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let ca = self.args_from_array(&arr);
@@ -1024,8 +992,7 @@ impl<'a> Interp<'a> {
             "getshortname" | "getnamespacename" | "innamespace" | "isanonymous" => {
                 let stored = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let (fname, anon) = match &stored {
@@ -1079,8 +1046,7 @@ impl<'a> Interp<'a> {
             | "getclosurethis" => {
                 let stored = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let is_method = obj
@@ -1106,8 +1072,7 @@ impl<'a> Interp<'a> {
                         let cn = self.conv_str(&stored)?.to_string();
                         let mn = obj
                             .borrow()
-                            .props
-                            .get("\0rc\0prop")
+                            .prop_get("\0rc\0prop")
                             .map(|c| c.borrow().clone())
                             .unwrap_or(Value::Null);
                         let mn = self.conv_str(&mn)?.to_string();
@@ -1176,7 +1141,7 @@ impl<'a> Interp<'a> {
                     ),
                     None if is_method => {
                         let cn = self.conv_str(&stored)?.to_string();
-                        let mc = self.classes.get(&cn.to_lowercase()).cloned();
+                        let mc = lkey_get(&self.classes, cn).cloned();
                         (mc.clone(), mc, None)
                     }
                     None => (None, None, None),
@@ -1207,8 +1172,8 @@ impl<'a> Interp<'a> {
                                 let r = self.instantiate("reflectionclass", &[])?;
                                 if let Value::Object(o) = &r {
                                     let mut ob = o.borrow_mut();
-                                    ob.props.insert("name".into(), cell(Value::str(&n)));
-                                    ob.props.insert("\0rc\0class".into(), cell(Value::str(&n)));
+                                    ob.prop_insert("name", cell(Value::str(&n)));
+                                    ob.prop_insert("\0rc\0class", cell(Value::str(&n)));
                                 }
                                 Ok(Some(r))
                             }
@@ -1222,8 +1187,7 @@ impl<'a> Interp<'a> {
             "getproperty" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -1232,19 +1196,17 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?.to_string();
-                let cls = self.classes.get(&cn.to_lowercase()).cloned();
+                let cls = lkey_get(&self.classes, &cn).cloned();
                 let found = cls.as_ref().and_then(|c| self.find_prop_decl(c, &pn));
                 match found {
                     Some((_, dcls)) => {
                         let rp = self.instantiate("reflectionproperty", &[])?;
                         if let Value::Object(o) = &rp {
                             let mut ob = o.borrow_mut();
-                            ob.props
-                                .insert("\0rc\0class".into(), cell(Value::str(dcls.name())));
-                            ob.props.insert("\0rc\0prop".into(), cell(Value::str(&pn)));
-                            ob.props.insert("name".into(), cell(Value::str(&pn)));
-                            ob.props
-                                .insert("class".into(), cell(Value::str(dcls.name())));
+                            ob.prop_insert("\0rc\0class", cell(Value::str(dcls.name())));
+                            ob.prop_insert("\0rc\0prop", cell(Value::str(&pn)));
+                            ob.prop_insert("name", cell(Value::str(&pn)));
+                            ob.prop_insert("class", cell(Value::str(dcls.name())));
                         }
                         Ok(Some(rp))
                     }
@@ -1263,8 +1225,7 @@ impl<'a> Interp<'a> {
                 let pn = self.conv_str(&pn)?.to_string();
                 let target = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 // ReflectionObject wraps the object itself; check its
@@ -1272,8 +1233,7 @@ impl<'a> Interp<'a> {
                 // props.
                 match &target {
                     Value::Object(t) => {
-                        let has =
-                            t.borrow().props.contains_key(&pn) || self.decl_prop(t, &pn).is_some();
+                        let has = t.borrow().prop_has(&pn) || self.decl_prop(t, &pn).is_some();
                         return Ok(Some(Value::Bool(has)));
                     }
                     Value::Callable(_) | Value::Null => {
@@ -1302,15 +1262,13 @@ impl<'a> Interp<'a> {
                 if is_prop {
                     let cn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let cn = self.conv_str(&cn)?.to_string();
                     let pn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0prop")
+                        .prop_get("\0rc\0prop")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let pn = self.conv_str(&pn)?.to_string();
@@ -1335,8 +1293,7 @@ impl<'a> Interp<'a> {
                         .eq_ignore_ascii_case("reflectionparameter");
                     let tys = if is_param {
                         obj.borrow()
-                            .props
-                            .get("\0rp\0ty")
+                            .prop_get("\0rp\0ty")
                             .map(|c| c.borrow().clone())
                             .and_then(|v| match v {
                                 Value::Array(a) => Some(a),
@@ -1350,8 +1307,7 @@ impl<'a> Interp<'a> {
                     // the flag drives object-vs-NULL instead.
                     let hasty = obj
                         .borrow()
-                        .props
-                        .get("\0rp\0hasty")
+                        .prop_get("\0rp\0hasty")
                         .is_some_and(|c| c.borrow().is_truthy());
                     match tys {
                         // No declared type -> NULL (zend returns NULL
@@ -1381,13 +1337,12 @@ impl<'a> Interp<'a> {
             "getdefaultproperties" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mut arr = PhpArray::default();
-                if let Some(cls) = self.classes.get(&cn.to_lowercase()).cloned() {
+                if let Some(cls) = lkey_get(&self.classes, cn).cloned() {
                     let mut chain: Vec<Rc<PhpClass>> = Vec::new();
                     let mut cur = Some(cls);
                     while let Some(c) = cur {
@@ -1396,7 +1351,7 @@ impl<'a> Interp<'a> {
                             .decl
                             .parent
                             .as_ref()
-                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                            .and_then(|p| lkey_get(&self.classes, p).cloned());
                     }
                     for c in chain.iter().rev() {
                         for p in &c.decl.props {
@@ -1439,14 +1394,12 @@ impl<'a> Interp<'a> {
                 let decl: Option<Rc<crate::ast::FunctionDecl>> = if is_method {
                     let cn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0prop")
+                        .prop_get("\0rc\0prop")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = self.conv_str(&mn)?.to_string();
@@ -1461,7 +1414,7 @@ impl<'a> Interp<'a> {
                         }
                     } else {
                         let cn = self.conv_str(&cn)?.to_string();
-                        let c = self.classes.get(&cn.to_lowercase()).cloned();
+                        let c = lkey_get(&self.classes, cn).cloned();
                         match c {
                             Some(c) => self.find_method_in(&c, &mn).map(|(m, sc)| {
                                 scope_cls = Some(sc);
@@ -1473,8 +1426,7 @@ impl<'a> Interp<'a> {
                 } else {
                     let cb = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     self.callable_decl(&cb)
@@ -1486,8 +1438,7 @@ impl<'a> Interp<'a> {
                     } else {
                         match obj
                             .borrow()
-                            .props
-                            .get("\0rc\0class")
+                            .prop_get("\0rc\0class")
                             .map(|c| c.borrow().clone())
                             .unwrap_or(Value::Null)
                         {
@@ -1520,14 +1471,12 @@ impl<'a> Interp<'a> {
             }
             "isvariadic" => Ok(Some(Value::Bool(
                 obj.borrow()
-                    .props
-                    .get("\0rp\0variadic")
+                    .prop_get("\0rp\0variadic")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
             "ispassedbyreference" => Ok(Some(Value::Bool(
                 obj.borrow()
-                    .props
-                    .get("\0rp\0byref")
+                    .prop_get("\0rp\0byref")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
             "allowsnull" => {
@@ -1537,16 +1486,14 @@ impl<'a> Interp<'a> {
                     // nullable flag on \0rt\0null.
                     "reflectionnamedtype" => Ok(Some(Value::Bool(
                         obj.borrow()
-                            .props
-                            .get("\0rt\0null")
+                            .prop_get("\0rt\0null")
                             .is_some_and(|c| c.borrow().is_truthy()),
                     ))),
                     // ReflectionUnionType/IntersectionType — nullable
                     // iff a "null" member was stored.
                     "reflectionuniontype" | "reflectionintersectiontype" => Ok(Some(Value::Bool(
                         obj.borrow()
-                            .props
-                            .get("\0rt\0types")
+                            .prop_get("\0rt\0types")
                             .is_some_and(|c| match &*c.borrow() {
                                 Value::Array(a) => a
                                     .borrow()
@@ -1559,8 +1506,7 @@ impl<'a> Interp<'a> {
                     // ReflectionParameter/Property/others.
                     _ => Ok(Some(Value::Bool(
                         obj.borrow()
-                            .props
-                            .get("\0rp\0allownull")
+                            .prop_get("\0rp\0allownull")
                             .is_some_and(|c| c.borrow().is_truthy()),
                     ))),
                 }
@@ -1570,8 +1516,7 @@ impl<'a> Interp<'a> {
             "isbuiltin" => {
                 let n = obj
                     .borrow()
-                    .props
-                    .get("name")
+                    .prop_get("name")
                     .map(|c| c.borrow().to_php_string().to_lowercase())
                     .unwrap_or_default();
                 Ok(Some(Value::Bool(matches!(
@@ -1603,8 +1548,7 @@ impl<'a> Interp<'a> {
             "getdeclaringfunction" => {
                 let f = obj
                     .borrow()
-                    .props
-                    .get("\0rp\0fn")
+                    .prop_get("\0rp\0fn")
                     .map(|c| c.borrow().to_php_string())
                     .unwrap_or_default();
                 if f.is_empty() {
@@ -1612,8 +1556,7 @@ impl<'a> Interp<'a> {
                 }
                 let c = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().to_php_string())
                     .unwrap_or_default();
                 let cls = if c.is_empty() {
@@ -1625,15 +1568,12 @@ impl<'a> Interp<'a> {
                 if let Value::Object(o) = &v {
                     let mut ob = o.borrow_mut();
                     if !c.is_empty() {
-                        ob.props
-                            .insert("\0rc\0class".into(), cell(Value::str(c.clone())));
+                        ob.prop_insert("\0rc\0class", cell(Value::str(c.clone())));
                     } else {
-                        ob.props
-                            .insert("\0rc\0class".into(), cell(Value::str(f.clone())));
+                        ob.prop_insert("\0rc\0class", cell(Value::str(f.clone())));
                     }
-                    ob.props
-                        .insert("\0rc\0prop".into(), cell(Value::str(f.clone())));
-                    ob.props.insert("name".into(), cell(Value::str(f)));
+                    ob.prop_insert("\0rc\0prop", cell(Value::str(f.clone())));
+                    ob.prop_insert("name", cell(Value::str(f)));
                 }
                 Ok(Some(v))
             }
@@ -1646,7 +1586,7 @@ impl<'a> Interp<'a> {
                     "reflectionparameter" => {
                         let (name, pos, opt, var, byref, hasdef, internal) = {
                             let b = obj.borrow();
-                            let g = |k: &str| b.props.get(k).map(|c| c.borrow().clone());
+                            let g = |k: &str| b.prop_get(k).map(|c| c.borrow().clone());
                             (
                                 g("\0rp\0name")
                                     .map(|v| v.to_php_string())
@@ -1661,7 +1601,7 @@ impl<'a> Interp<'a> {
                                 g("\0rp\0internal").is_some_and(|v| v.is_truthy()),
                             )
                         };
-                        let ms: Vec<String> = match obj.borrow().props.get("\0rp\0ty") {
+                        let ms: Vec<String> = match obj.borrow().prop_get("\0rp\0ty") {
                             Some(c) => match &*c.borrow() {
                                 Value::Array(a) => a
                                     .borrow()
@@ -1676,8 +1616,7 @@ impl<'a> Interp<'a> {
                         let ty = rp_type_txt(&ms);
                         let dc = obj
                             .borrow()
-                            .props
-                            .get("\0rp\0defconst")
+                            .prop_get("\0rp\0defconst")
                             .map(|c| c.borrow().to_php_string());
                         let def = if hasdef {
                             match dc {
@@ -1685,8 +1624,7 @@ impl<'a> Interp<'a> {
                                 None => {
                                     let v = obj
                                         .borrow()
-                                        .props
-                                        .get("\0rp\0def")
+                                        .prop_get("\0rp\0def")
                                         .map(|c| c.borrow().clone())
                                         .unwrap_or(Value::Null);
                                     format!(" = {}", rp_def_txt(&v, internal))
@@ -1718,7 +1656,7 @@ impl<'a> Interp<'a> {
                         } else {
                             "|"
                         };
-                        let ms: Vec<String> = match obj.borrow().props.get("\0rt\0types") {
+                        let ms: Vec<String> = match obj.borrow().prop_get("\0rt\0types") {
                             Some(c) => match &*c.borrow() {
                                 Value::Array(a) => a
                                     .borrow()
@@ -1736,12 +1674,10 @@ impl<'a> Interp<'a> {
                         let (name, null) = {
                             let b = obj.borrow();
                             (
-                                b.props
-                                    .get("name")
+                                b.prop_get("name")
                                     .map(|c| c.borrow().to_php_string())
                                     .unwrap_or_default(),
-                                b.props
-                                    .get("\0rt\0null")
+                                b.prop_get("\0rt\0null")
                                     .is_some_and(|c| c.borrow().is_truthy()),
                             )
                         };
@@ -1759,7 +1695,7 @@ impl<'a> Interp<'a> {
             // ReflectionUnionType/IntersectionType::getTypes() — each
             // member as its own ReflectionNamedType.
             "gettypes" => {
-                let ms: Vec<String> = match obj.borrow().props.get("\0rt\0types") {
+                let ms: Vec<String> = match obj.borrow().prop_get("\0rt\0types") {
                     Some(c) => match &*c.borrow() {
                         Value::Array(a) => a
                             .borrow()
@@ -1776,9 +1712,9 @@ impl<'a> Interp<'a> {
                     let nt = self.instantiate("reflectionnamedtype", &[])?;
                     if let Value::Object(o) = &nt {
                         let mut ob = o.borrow_mut();
-                        ob.props.insert("name".into(), cell(Value::str(m.clone())));
-                        ob.props.insert(
-                            "\0rt\0null".into(),
+                        ob.prop_insert("name", cell(Value::str(m.clone())));
+                        ob.prop_insert(
+                            "\0rt\0null",
                             cell(Value::Bool(m == "null" || m == "mixed")),
                         );
                     }
@@ -1792,8 +1728,7 @@ impl<'a> Interp<'a> {
             "isdefaultvalueconstant" => {
                 let has = obj
                     .borrow()
-                    .props
-                    .get("\0rp\0hasdef")
+                    .prop_get("\0rp\0hasdef")
                     .is_some_and(|c| c.borrow().is_truthy());
                 if !has {
                     return self.fail(PhpError::uncaught(
@@ -1802,15 +1737,12 @@ impl<'a> Interp<'a> {
                         0,
                     ));
                 }
-                Ok(Some(Value::Bool(
-                    obj.borrow().props.contains_key("\0rp\0defconst"),
-                )))
+                Ok(Some(Value::Bool(obj.borrow().prop_has("\0rp\0defconst"))))
             }
             "getdefaultvalueconstantname" => {
                 let has = obj
                     .borrow()
-                    .props
-                    .get("\0rp\0hasdef")
+                    .prop_get("\0rp\0hasdef")
                     .is_some_and(|c| c.borrow().is_truthy());
                 if !has {
                     return self.fail(PhpError::uncaught(
@@ -1821,16 +1753,14 @@ impl<'a> Interp<'a> {
                 }
                 let v = obj
                     .borrow()
-                    .props
-                    .get("\0rp\0defconst")
+                    .prop_get("\0rp\0defconst")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 Ok(Some(v))
             }
             "getposition" => Ok(Some(Value::Int(
                 obj.borrow()
-                    .props
-                    .get("\0rp\0pos")
+                    .prop_get("\0rp\0pos")
                     .map(|c| c.borrow().to_int())
                     .unwrap_or(0),
             ))),
@@ -1839,20 +1769,17 @@ impl<'a> Interp<'a> {
             // reports no default (zend erases it at compile time).
             "isoptional" => Ok(Some(Value::Bool(
                 obj.borrow()
-                    .props
-                    .get("\0rp\0opt")
+                    .prop_get("\0rp\0opt")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
             "getdefaultvalue" => {
                 let ob = obj.borrow();
-                let got = ob.props.get("\0rp\0default").map(|c| c.borrow().clone());
+                let got = ob.prop_get("\0rp\0default").map(|c| c.borrow().clone());
                 let dmsg = ob
-                    .props
-                    .get("\0rp\0dmsg")
+                    .prop_get("\0rp\0dmsg")
                     .map(|c| c.borrow().to_php_string());
                 let dcls = ob
-                    .props
-                    .get("\0rp\0dcls")
+                    .prop_get("\0rp\0dcls")
                     .map(|c| c.borrow().to_php_string());
                 drop(ob);
                 if let Some(v) = got {
@@ -1874,20 +1801,18 @@ impl<'a> Interp<'a> {
             }
             "isdefaultvalueavailable" => Ok(Some(Value::Bool({
                 let ob = obj.borrow();
-                ob.props.contains_key("\0rp\0default") || ob.props.contains_key("\0rp\0dmsg")
+                ob.prop_has("\0rp\0default") || ob.prop_has("\0rp\0dmsg")
             }))),
             "hastype" => {
                 // ReflectionParameter::hasType() — \0rp\0ty members
                 // populated by getParameters().
                 let has = obj
                     .borrow()
-                    .props
-                    .get("\0rp\0hasty")
+                    .prop_get("\0rp\0hasty")
                     .map(|c| c.borrow().is_truthy())
                     .unwrap_or_else(|| {
                         obj.borrow()
-                            .props
-                            .get("\0rp\0ty")
+                            .prop_get("\0rp\0ty")
                             .map(|c| c.borrow().clone())
                             .and_then(|v| match v {
                                 Value::Array(a) => Some(!a.borrow().entries.is_empty()),
@@ -1906,8 +1831,7 @@ impl<'a> Interp<'a> {
                 )?;
                 let ty = obj
                     .borrow()
-                    .props
-                    .get("\0rp\0ty")
+                    .prop_get("\0rp\0ty")
                     .map(|c| c.borrow().clone())
                     .and_then(|v| match v {
                         Value::Array(a) => Some(a),
@@ -1931,8 +1855,8 @@ impl<'a> Interp<'a> {
                         let rc = self.instantiate("reflectionclass", &[])?;
                         if let Value::Object(o) = &rc {
                             let mut ob = o.borrow_mut();
-                            ob.props.insert("\0rc\0class".into(), cell(Value::str(&n)));
-                            ob.props.insert("name".into(), cell(Value::str(&n)));
+                            ob.prop_insert("\0rc\0class", cell(Value::str(&n)));
+                            ob.prop_insert("name", cell(Value::str(&n)));
                             if !ob.prop_order.contains(&"name".into()) {
                                 ob.prop_order.push("name".into());
                             }
@@ -1948,8 +1872,7 @@ impl<'a> Interp<'a> {
                 )?;
                 let has = obj
                     .borrow()
-                    .props
-                    .get("\0rp\0ty")
+                    .prop_get("\0rp\0ty")
                     .map(|c| c.borrow().clone())
                     .and_then(|v| match v {
                         Value::Array(a) => Some(a),
@@ -1971,8 +1894,7 @@ impl<'a> Interp<'a> {
                     .eq_ignore_ascii_case("reflectionfunction");
                 let tn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let tn = self.conv_str(&tn)?.to_string();
@@ -1984,15 +1906,13 @@ impl<'a> Interp<'a> {
                 if is_cc {
                     let cn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let cn = self.conv_str(&cn)?.to_string();
                     let pn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0prop")
+                        .prop_get("\0rc\0prop")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let pn = self.conv_str(&pn)?.to_string();
@@ -2031,15 +1951,13 @@ impl<'a> Interp<'a> {
                 if is_m {
                     let cn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let cn = self.conv_str(&cn)?.to_string();
                     let mn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0prop")
+                        .prop_get("\0rc\0prop")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = self.conv_str(&mn)?.to_string();
@@ -2149,7 +2067,7 @@ impl<'a> Interp<'a> {
                             let resolved = self
                                 .resolve_class(name.trim_start_matches('\\'))
                                 .unwrap_or_else(|| name.clone());
-                            match self.classes.get(&resolved.to_lowercase()).cloned() {
+                            match lkey_get(&self.classes, resolved).cloned() {
                                 Some(c) => c,
                                 None => {
                                     return self
@@ -2281,8 +2199,7 @@ impl<'a> Interp<'a> {
                 };
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -2306,15 +2223,13 @@ impl<'a> Interp<'a> {
                 {
                     let cn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let cn = self.conv_str(&cn)?.to_string();
                     let mn = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0prop")
+                        .prop_get("\0rc\0prop")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = self.conv_str(&mn)?.to_string();
@@ -2329,8 +2244,7 @@ impl<'a> Interp<'a> {
                 } else {
                     let stored = obj
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     match &stored {
@@ -2378,8 +2292,7 @@ impl<'a> Interp<'a> {
                 if clsname == "reflectionnamedtype" {
                     return Ok(Some(
                         obj.borrow()
-                            .props
-                            .get("name")
+                            .prop_get("name")
                             .map(|c| c.borrow().clone())
                             .unwrap_or(Value::Null),
                     ));
@@ -2398,8 +2311,7 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Some(
                     obj.borrow()
-                        .props
-                        .get(key)
+                        .prop_get(key)
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null),
                 ))
@@ -2410,8 +2322,7 @@ impl<'a> Interp<'a> {
             "getparentclass" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -2429,9 +2340,8 @@ impl<'a> Interp<'a> {
                         let rc = self.instantiate("reflectionclass", &[])?;
                         if let Value::Object(o) = &rc {
                             let mut ob = o.borrow_mut();
-                            ob.props
-                                .insert("\0rc\0class".into(), cell(Value::str(&pcn)));
-                            ob.props.insert("name".into(), cell(Value::str(&pcn)));
+                            ob.prop_insert("\0rc\0class", cell(Value::str(&pcn)));
+                            ob.prop_insert("name", cell(Value::str(&pcn)));
                         }
                         Ok(Some(rc))
                     }
@@ -2444,8 +2354,7 @@ impl<'a> Interp<'a> {
             "newinstancewithoutconstructor" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?;
@@ -2455,15 +2364,13 @@ impl<'a> Interp<'a> {
             | "isenumcase" | "isdeprecated" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
@@ -2490,7 +2397,7 @@ impl<'a> Interp<'a> {
                     // ReflectionProperty: visibility/static/readonly off
                     // the PropDecl.
                     "reflectionclass" | "reflectionobject" | "reflectionenum" => {
-                        match self.classes.get(&cn.to_lowercase()) {
+                        match lkey_get(&self.classes, cn) {
                             Some(c) => match lname.as_str() {
                                 "isfinal" => c.decl.is_final,
                                 "isabstract" => c.decl.is_abstract,
@@ -2545,15 +2452,13 @@ impl<'a> Interp<'a> {
             "getfilename" | "isinternal" | "isuserdefined" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
@@ -2591,12 +2496,11 @@ impl<'a> Interp<'a> {
             | "isreadonly" | "isiterable" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
-                let decl = self.classes.get(&cn.to_lowercase()).map(|c| c.decl.clone());
+                let decl = lkey_get(&self.classes, cn).map(|c| c.decl.clone());
                 let b = decl
                     .map(|d| match lname.as_str() {
                         "isinterface" => d.kind == crate::ast::ClassKind::Interface,
@@ -2618,8 +2522,7 @@ impl<'a> Interp<'a> {
             "issubclassof" | "implementsinterface" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -2630,15 +2533,14 @@ impl<'a> Interp<'a> {
                 let tname = match &target {
                     Value::Object(o) => o
                         .borrow()
-                        .props
-                        .get("\0rc\0class")
+                        .prop_get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null),
                     v => v.clone(),
                 };
                 let tname = self.conv_str(&tname)?.to_string().to_lowercase();
                 let mut hit = false;
-                let mut cur = self.classes.get(&cn.to_lowercase()).cloned();
+                let mut cur = lkey_get(&self.classes, cn).cloned();
                 let mut seen = std::collections::HashSet::new();
                 while let Some(c) = cur {
                     if lname == "issubclassof" {
@@ -2646,7 +2548,7 @@ impl<'a> Interp<'a> {
                             .decl
                             .parent
                             .as_ref()
-                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                            .and_then(|p| lkey_get(&self.classes, p).cloned());
                         if let Some(n) = cur.as_ref().map(|c| c.decl.name.to_lowercase()) {
                             if n == tname {
                                 hit = true;
@@ -2662,7 +2564,7 @@ impl<'a> Interp<'a> {
                             if i.to_lowercase() == tname {
                                 hit = true;
                             }
-                            if let Some(ic) = self.classes.get(&i.to_lowercase()).cloned() {
+                            if let Some(ic) = lkey_get(&self.classes, i).cloned() {
                                 for pp in ic.decl.parent.iter().chain(ic.decl.implements.iter()) {
                                     if pp.to_lowercase() == tname {
                                         hit = true;
@@ -2674,7 +2576,7 @@ impl<'a> Interp<'a> {
                             .decl
                             .parent
                             .as_ref()
-                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                            .and_then(|p| lkey_get(&self.classes, p).cloned());
                     }
                     let k = cur.as_ref().map(|c| c.decl.name.to_lowercase());
                     if k.is_none() || !seen.insert(k.unwrap()) {
@@ -2688,15 +2590,14 @@ impl<'a> Interp<'a> {
             "getmethods" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let filter = args.first().map(|c| c.borrow().to_int()).unwrap_or(0);
                 let mut arr = PhpArray::default();
                 let mut seen = std::collections::HashSet::new();
-                let mut cur = self.classes.get(&cn.to_lowercase()).cloned();
+                let mut cur = lkey_get(&self.classes, cn).cloned();
                 while let Some(c) = cur {
                     for m in &c.decl.methods {
                         let key = m.decl.name.to_lowercase();
@@ -2717,18 +2618,10 @@ impl<'a> Interp<'a> {
                         let rm = self.instantiate("reflectionmethod", &[])?;
                         if let Value::Object(o) = &rm {
                             let mut ob = o.borrow_mut();
-                            ob.props.insert(
-                                "\0rc\0class".into(),
-                                cell(Value::str(c.decl.name.clone())),
-                            );
-                            ob.props.insert(
-                                "\0rc\0prop".into(),
-                                cell(Value::str(m.decl.name.as_ref())),
-                            );
-                            ob.props
-                                .insert("name".into(), cell(Value::str(m.decl.name.as_ref())));
-                            ob.props
-                                .insert("class".into(), cell(Value::str(c.decl.name.clone())));
+                            ob.prop_insert("\0rc\0class", cell(Value::str(c.decl.name.clone())));
+                            ob.prop_insert("\0rc\0prop", cell(Value::str(m.decl.name.as_ref())));
+                            ob.prop_insert("name", cell(Value::str(m.decl.name.as_ref())));
+                            ob.prop_insert("class", cell(Value::str(c.decl.name.clone())));
                         }
                         arr.push(rm);
                     }
@@ -2736,15 +2629,14 @@ impl<'a> Interp<'a> {
                         .decl
                         .parent
                         .as_ref()
-                        .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                        .and_then(|p| lkey_get(&self.classes, p).cloned());
                 }
                 Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
             }
             "getmethod" | "hasmethod" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -2753,7 +2645,7 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
-                let cls = self.classes.get(&cn.to_lowercase()).cloned();
+                let cls = lkey_get(&self.classes, &cn).cloned();
                 let found = cls.as_ref().and_then(|c| self.find_method_in(c, &mn));
                 match (lname.as_str(), found) {
                     ("hasmethod", f) => Ok(Some(Value::Bool(f.is_some()))),
@@ -2761,18 +2653,10 @@ impl<'a> Interp<'a> {
                         let rm = self.instantiate("reflectionmethod", &[])?;
                         if let Value::Object(o) = &rm {
                             let mut ob = o.borrow_mut();
-                            ob.props.insert(
-                                "\0rc\0class".into(),
-                                cell(Value::str(dcls.decl.name.clone())),
-                            );
-                            ob.props.insert(
-                                "\0rc\0prop".into(),
-                                cell(Value::str(m.decl.name.as_ref())),
-                            );
-                            ob.props
-                                .insert("name".into(), cell(Value::str(m.decl.name.as_ref())));
-                            ob.props
-                                .insert("class".into(), cell(Value::str(dcls.decl.name.clone())));
+                            ob.prop_insert("\0rc\0class", cell(Value::str(dcls.decl.name.clone())));
+                            ob.prop_insert("\0rc\0prop", cell(Value::str(m.decl.name.as_ref())));
+                            ob.prop_insert("name", cell(Value::str(m.decl.name.as_ref())));
+                            ob.prop_insert("class", cell(Value::str(dcls.decl.name.clone())));
                         }
                         Ok(Some(rm))
                     }
@@ -2787,8 +2671,7 @@ impl<'a> Interp<'a> {
             "isconstructor" | "isdestructor" => {
                 let mn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
@@ -2803,15 +2686,13 @@ impl<'a> Interp<'a> {
             "getstartline" | "getendline" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
@@ -2833,8 +2714,7 @@ impl<'a> Interp<'a> {
             "getdeclaringnamespace" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -2847,15 +2727,13 @@ impl<'a> Interp<'a> {
             "hasreturntype" | "getreturntype" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
@@ -2875,13 +2753,12 @@ impl<'a> Interp<'a> {
             "gettraitaliases" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let mut arr = PhpArray::default();
-                if let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() {
+                if let Some(c) = lkey_get(&self.classes, cn).cloned() {
                     for m in &c.decl.methods {
                         if let Some(orig) = &m.trait_alias_of {
                             let v =
@@ -2897,8 +2774,7 @@ impl<'a> Interp<'a> {
             "getinterfacenames" | "getinterfaces" => {
                 let cv = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = match &cv {
@@ -2931,8 +2807,7 @@ impl<'a> Interp<'a> {
             "getconstant" | "getconstants" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -2961,8 +2836,7 @@ impl<'a> Interp<'a> {
             "getreflectionconstant" | "getreflectionconstants" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -2970,17 +2844,11 @@ impl<'a> Interp<'a> {
                     let v = it.instantiate("reflectionclassconstant", &[])?;
                     if let Value::Object(o) = &v {
                         o.borrow_mut()
-                            .props
-                            .insert("\0rc\0class".into(), cell(Value::str(cname)));
+                            .prop_insert("\0rc\0class", cell(Value::str(cname)));
                         o.borrow_mut()
-                            .props
-                            .insert("\0rc\0prop".into(), cell(Value::str(n)));
-                        o.borrow_mut()
-                            .props
-                            .insert("name".into(), cell(Value::str(n)));
-                        o.borrow_mut()
-                            .props
-                            .insert("class".into(), cell(Value::str(cname)));
+                            .prop_insert("\0rc\0prop", cell(Value::str(n)));
+                        o.borrow_mut().prop_insert("name", cell(Value::str(n)));
+                        o.borrow_mut().prop_insert("class", cell(Value::str(cname)));
                     }
                     Ok(v)
                 };
@@ -3004,15 +2872,13 @@ impl<'a> Interp<'a> {
             "getvalue" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 let pn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?.to_string();
@@ -3040,8 +2906,7 @@ impl<'a> Interp<'a> {
                 // bypasses prop visibility without __set (bug72177).
                 let pn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?.to_string();
@@ -3052,10 +2917,10 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 if let Some(Value::Object(t)) = target {
                     let mut tb = t.borrow_mut();
-                    if !tb.props.contains_key(&pn) && !tb.prop_order.iter().any(|k| k == &pn) {
+                    if !tb.prop_has(&pn) && !tb.prop_order.iter().any(|k| k == &pn) {
                         tb.prop_order.push(pn.clone());
                     }
-                    tb.props.insert(pn.clone(), cell(val));
+                    tb.prop_insert(pn.clone(), cell(val));
                     tb.unset_props.remove(&pn);
                 }
                 Ok(Some(Value::Null))
@@ -3063,8 +2928,7 @@ impl<'a> Interp<'a> {
             "getdeclaringclass" => {
                 let cn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
+                    .prop_get("\0rc\0class")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
@@ -3076,19 +2940,15 @@ impl<'a> Interp<'a> {
                 let v = self.instantiate("reflectionclass", &[])?;
                 if let Value::Object(o) = &v {
                     o.borrow_mut()
-                        .props
-                        .insert("\0rc\0class".into(), cell(Value::str(cn.clone())));
-                    o.borrow_mut()
-                        .props
-                        .insert("name".into(), cell(Value::str(cn)));
+                        .prop_insert("\0rc\0class", cell(Value::str(cn.clone())));
+                    o.borrow_mut().prop_insert("name", cell(Value::str(cn)));
                 }
                 Ok(Some(v))
             }
             "isinitialized" => {
                 let pn = obj
                     .borrow()
-                    .props
-                    .get("\0rc\0prop")
+                    .prop_get("\0rc\0prop")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?;
@@ -3240,6 +3100,35 @@ impl<'a> Interp<'a> {
     }
 
     /// is-a check between two class-name strings.
+    /// `extends` hop resolved through the class table, memoized on the
+    /// class — every chain walk (methods, props, consts, is_a) shares
+    /// it instead of re-lowercasing the parent name per hop.
+    pub(in crate::interp) fn parent_of(&self, c: &Rc<PhpClass>) -> Option<Rc<PhpClass>> {
+        if let Some(p) = c.parent_rc.borrow().as_ref() {
+            return Some(p.clone());
+        }
+        let p = c
+            .decl
+            .parent
+            .as_ref()
+            .and_then(|n| lkey_get(&self.classes, n).cloned());
+        if let Some(p) = &p {
+            *c.parent_rc.borrow_mut() = Some(p.clone());
+        }
+        p
+    }
+
+    /// `is_a(obj-class, Throwable)` memoized on the class — every
+    /// `new` asks it for the internal Exception payload.
+    pub(in crate::interp) fn is_throwable_cls(&mut self, c: &Rc<PhpClass>) -> bool {
+        if let Some(t) = c.throwable.get() {
+            return t;
+        }
+        let t = self.is_throwable_name(&c.decl.name);
+        c.throwable.set(Some(t));
+        t
+    }
+
     pub(in crate::interp) fn is_a_str(&mut self, a: &str, b: &str) -> bool {
         // Type-member checks during signature verification autoload the
         // compared classes — Zend verifies covariance with the real
@@ -3247,7 +3136,7 @@ impl<'a> Interp<'a> {
         // even when it is declared later (abstract_method_9). A name
         // mid-link counts as resolvable without loading
         // (infinite_recursion — `class C extends Z implements C`).
-        if !self.classes.contains_key(&a.to_lowercase())
+        if !lkey_get(&self.classes, a).is_some()
             && !self.linking.iter().any(|c| c.name.eq_ignore_ascii_case(a))
         {
             // The check creates a delayed variance dependency either
@@ -3273,12 +3162,10 @@ impl<'a> Interp<'a> {
         }
         // Aliases canonicalize through the class table: `Bar` (an
         // alias of Foo) compares as `Foo` (typed_properties_084).
-        let canon_b = self
-            .classes
-            .get(&b.trim_start_matches('\\').to_lowercase())
-            .map(|c| c.name().to_string());
+        let canon_b =
+            lkey_get(&self.classes, b.trim_start_matches('\\')).map(|c| c.name().to_string());
         let b = canon_b.as_deref().unwrap_or(b);
-        match self.classes.get(&a.to_lowercase()).cloned() {
+        match lkey_get(&self.classes, a).cloned() {
             Some(c) => self.is_a(&c, b),
             None => self.is_a_unresolved(a, b, 0),
         }
@@ -3315,7 +3202,7 @@ impl<'a> Interp<'a> {
                 self.interfaces
                     .get(&a.to_lowercase())
                     .cloned()
-                    .or_else(|| self.traits.get(&a.to_lowercase()).cloned())
+                    .or_else(|| lkey_get(&self.traits, a).cloned())
             });
         let Some(d) = d else {
             return false;
@@ -3338,19 +3225,29 @@ impl<'a> Interp<'a> {
         cls: &Rc<PhpClass>,
         name: &str,
     ) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
-        let lname = name.to_lowercase();
-        let mut cur = Some(cls.clone());
-        while let Some(c) = cur {
-            if let Some(m) = c.decl.find_method(&lname) {
-                return Some((m, c));
+        // Monomorphic probe: class-keyed resolution is stable (methods
+        // can't be added post-registration), so the last lookup hits.
+        {
+            let ic = cls.method_ic.borrow();
+            if let Some((n, hit)) = ic.as_ref() {
+                if n.eq_ignore_ascii_case(name) {
+                    return hit.clone();
+                }
             }
-            cur = c
-                .decl
-                .parent
-                .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
         }
-        None
+        let mut cur = Some(cls.clone());
+        let mut out = None;
+        while let Some(c) = cur {
+            if let Some(m) = c.decl.find_method(name) {
+                out = Some((m, c));
+                break;
+            }
+            cur = self.parent_of(&c);
+        }
+        if let Ok(mut ic) = cls.method_ic.try_borrow_mut() {
+            *ic = Some((name.to_string(), out.clone()));
+        }
+        out
     }
 
     /// get_class_methods: the class's own methods first, then each
@@ -3371,7 +3268,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         out
     }
@@ -3437,7 +3334,7 @@ impl Interp<'_> {
                 return Some(reflect_decl_arity(&m.decl));
             }
             for p in &id.implements {
-                if let Some(pd) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                if let Some(pd) = lkey_get(&self.interfaces, p).cloned() {
                     todo.push(pd);
                 }
             }

@@ -261,11 +261,12 @@ pub enum Visibility {
 
 impl ClassDecl {
     /// Method lookup walking the `extends` chain (parents resolved via the
-    /// interpreter's class table).
-    pub fn find_method(&self, lname: &str) -> Option<Rc<MethodDecl>> {
+    /// interpreter's class table). PHP folds method names ASCII-insensitively
+    /// at call time — `name` arrives in source case, no lowercase alloc.
+    pub fn find_method(&self, name: &str) -> Option<Rc<MethodDecl>> {
         self.methods
             .iter()
-            .find(|m| m.decl.name.to_lowercase() == lname)
+            .find(|m| m.decl.name.eq_ignore_ascii_case(name))
             .cloned()
     }
 }

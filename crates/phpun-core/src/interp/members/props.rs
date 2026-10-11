@@ -39,7 +39,7 @@ impl<'a> Interp<'a> {
                 break;
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         None
     }
@@ -50,6 +50,63 @@ impl<'a> Interp<'a> {
     /// child redecl still inherits parent hooks; per-hook origin class
     /// drives `__METHOD__` and decl_class). Private props of other
     /// scopes are skipped — they are different properties entirely.
+    /// Promoted-ctor write `$this->{pname} = $v` on a freshly
+    /// instantiated object: the promoted param always synthesizes a
+    /// PropDecl on the ctor's declaring class, so when that decl is
+    /// unhooked, non-readonly and non-private-protected-ambiguous the
+    /// write provably lands in its own slot — skip store_prop's
+    /// scope/visibility/undeclared machinery. Anything else falls
+    /// back to the full path (readonly double-init errors, hooks,
+    /// exotic decls).
+    pub(in crate::interp) fn promoted_prop_write(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        dc: Option<&Rc<PhpClass>>,
+        pname: &str,
+        v: Value,
+    ) -> Result<(), PhpError> {
+        let p = dc.and_then(|c| c.decl.props.iter().find(|p| p.name == pname));
+        // Fast path needs the EFFECTIVE prop to be the same unhooked,
+        // non-readonly decl — a child redeclaring it with a hook (or
+        // different visibility/readonly) goes through store_prop.
+        let direct = match (dc, p) {
+            (Some(dc), Some(p)) if p.hooks.is_none() && !p.readonly => {
+                self.hooked_prop(obj, pname).is_none()
+                    && matches!(self.decl_prop(obj, pname), Some((ep, ref ec))
+                        if ep.visibility == p.visibility && !ep.readonly
+                            && (ep.visibility != crate::ast::Visibility::Private
+                                || ec.name() == dc.name()))
+            }
+            _ => false,
+        };
+        match (dc, p) {
+            (Some(dc), Some(p)) if direct => {
+                let key = if p.visibility == crate::ast::Visibility::Private {
+                    format!("\0{}\0{}", dc.name(), pname)
+                } else {
+                    pname.to_string()
+                };
+                let mut o = obj.borrow_mut();
+                match o.prop_get(&key) {
+                    Some(c) => *c.borrow_mut() = v,
+                    None => {
+                        // Typed-uninit slot: order was reserved at
+                        // instantiate, the cell lands now.
+                        o.prop_insert(key.clone(), cell(v));
+                        if !o.prop_order.contains(&key) {
+                            o.prop_order.push(key.clone());
+                        }
+                    }
+                }
+                o.unset_props.remove(&key);
+                Ok(())
+            }
+            _ => self
+                .store_prop(Value::Object(obj.clone()), pname, v)
+                .map(|_| ()),
+        }
+    }
+
     pub(in crate::interp) fn hooked_prop(
         &self,
         o: &Rc<RefCell<PhpObject>>,
@@ -89,7 +146,7 @@ impl<'a> Interp<'a> {
                 }
             }
             let parent = c.decl.parent.clone();
-            cur = parent.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = parent.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         let (index, owner) = nearest?;
         if hooks.is_empty() {
@@ -107,7 +164,7 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             let par = c.decl.parent.clone();
             chain.push(c.clone());
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         if let Some(r) = key.strip_prefix('\0') {
             let mut it = r.split('\0');
@@ -151,7 +208,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         None
     }
@@ -172,7 +229,7 @@ impl<'a> Interp<'a> {
                 }
             }
             let parent = c.decl.parent.clone();
-            cur = parent.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = parent.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         None
     }
@@ -186,7 +243,7 @@ impl<'a> Interp<'a> {
         pn: &str,
         key: &str,
     ) -> bool {
-        !o.borrow().props.contains_key(key)
+        !o.borrow().prop_has(key)
             && self.decl_prop(o, pn).is_none()
             && !self.obj_is_a(o, "stdclass")
             && !o.borrow().class.decl.attrs.iter().any(|a| {
@@ -230,7 +287,7 @@ impl<'a> Interp<'a> {
                 return true;
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         false
     }
@@ -241,7 +298,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn chain_prop_backed(&self, d: &ClassDecl, name: &str) -> bool {
         let mut an = d.parent.clone();
         while let Some(pn) = an {
-            let Some(pc) = self.classes.get(&pn.to_lowercase()) else {
+            let Some(pc) = lkey_get(&self.classes, pn) else {
                 break;
             };
             if let Some(ap) = pc.decl.props.iter().find(|x| x.name == name) {
@@ -465,7 +522,7 @@ impl<'a> Interp<'a> {
                 found = Some(c.clone());
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         found
     }
@@ -604,7 +661,7 @@ impl<'a> Interp<'a> {
             return self.hook_get_typecheck(p, dcls, v);
         }
         if self.backed_for(o, &p.name, hs) {
-            let value = o.borrow().props.get(&p.name).map(|c| c.borrow().clone());
+            let value = o.borrow().prop_get(&p.name).map(|c| c.borrow().clone());
             return match value {
                 Some(v) => Ok(v),
                 None if p.ty.is_some() => self.fail(PhpError::uncaught(
@@ -1107,7 +1164,7 @@ impl<'a> Interp<'a> {
             if !ob.prop_order.contains(&p.name) {
                 ob.prop_order.push(p.name.clone());
             }
-            ob.props.insert(p.name.clone(), cell(v));
+            ob.prop_insert(p.name.clone(), cell(v));
             return Ok(());
         }
         self.fail(PhpError::uncaught(
@@ -1176,7 +1233,7 @@ impl<'a> Interp<'a> {
                         .decl
                         .parent
                         .as_ref()
-                        .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                        .and_then(|p| lkey_get(&self.classes, p).cloned());
                 }
                 // zend's visibility resolution only applies to the
                 // object's own class (and `*`, handled above).
@@ -1230,7 +1287,7 @@ impl<'a> Interp<'a> {
                 0,
             ));
         };
-        let Some(parent) = self.classes.get(&parent_name.to_lowercase()).cloned() else {
+        let Some(parent) = lkey_get(&self.classes, &parent_name).cloned() else {
             return self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot use \"parent\" when current class scope has no parent",
@@ -1258,7 +1315,7 @@ impl<'a> Interp<'a> {
                 }
             }
             let par = c.decl.parent.clone();
-            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = par.and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         let Some((pd, pcls)) = nearest else {
             return self.fail(PhpError::uncaught(
@@ -1370,7 +1427,7 @@ impl<'a> Interp<'a> {
         // Plain parent prop: get reads the slot, set writes it (and —
         // like a plain assignment — the implicit set returns the value).
         if is_get {
-            if !o.borrow().props.contains_key(pn) {
+            if !o.borrow().prop_has(pn) {
                 // Implicit get reads the shared backing slot; an
                 // uninitialized typed prop is a catchable Error naming
                 // the decl visible from the object (parent_get_plain_…).
@@ -1389,8 +1446,7 @@ impl<'a> Interp<'a> {
                 }
             }
             Ok(o.borrow()
-                .props
-                .get(pn)
+                .prop_get(pn)
                 .map(|c| c.borrow().clone())
                 .unwrap_or(Value::Null))
         } else {
@@ -1399,7 +1455,7 @@ impl<'a> Interp<'a> {
             if !ob.prop_order.iter().any(|k| k == pn) {
                 ob.prop_order.push(pn.to_string());
             }
-            ob.props.insert(pn.to_string(), cell(v.clone()));
+            ob.prop_insert(pn, cell(v.clone()));
             Ok(v)
         }
     }
@@ -1546,7 +1602,7 @@ impl<'a> Interp<'a> {
         if !self.prop_visible(&cls, pn) {
             return None;
         }
-        let value = o.borrow().props.get(&k)?.borrow().clone();
+        let value = o.borrow().prop_get(&k)?.borrow().clone();
         Some((value, k))
     }
 
@@ -1828,7 +1884,7 @@ impl<'a> Interp<'a> {
                             } else {
                                 pd.name.clone()
                             };
-                            let held = o.borrow().props.get(&dk).cloned();
+                            let held = o.borrow().prop_get(&dk);
                             return match held {
                                 Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
                                     Ok(cell(c.borrow().clone()))
@@ -1860,7 +1916,7 @@ impl<'a> Interp<'a> {
                                 } else {
                                     pd.name.clone()
                                 };
-                                let held = o.borrow().props.get(&dk).cloned();
+                                let held = o.borrow().prop_get(&dk);
                                 return match held {
                                     Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
                                         Ok(cell(c.borrow().clone()))
@@ -1936,7 +1992,7 @@ impl<'a> Interp<'a> {
                             // Nullable uninit slots byref-init to null.
                             let nc = cell(Value::Null);
                             self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
-                            o.borrow_mut().props.insert(pn.clone(), nc);
+                            o.borrow_mut().prop_insert(pn.clone(), nc);
                         }
                     }
                 }
@@ -2006,7 +2062,7 @@ impl<'a> Interp<'a> {
                 }
                 let undeclared = self.decl_prop(&o, &pn).is_none();
                 let mut ob = o.borrow_mut();
-                if !ob.props.contains_key(&key) {
+                if !ob.prop_has(&key) {
                     if !ob.prop_order.contains(&key) {
                         ob.prop_order.push(key.clone());
                     }
@@ -2023,9 +2079,9 @@ impl<'a> Interp<'a> {
                             pn.clone(),
                         ));
                     }
-                    ob.props.insert(key.clone(), nc);
+                    ob.prop_insert(key.clone(), nc);
                 }
-                let slot = ob.props.get(&key).unwrap().clone();
+                let slot = ob.prop_get(&key).unwrap().clone();
                 drop(ob);
                 if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     if let Some(tys) = &pd.ty {
@@ -2076,11 +2132,11 @@ impl<'a> Interp<'a> {
         });
         if let Some(dc) = dc {
             let k = format!("\0{}\0{}", dc, pn);
-            if o.borrow().props.contains_key(&k) {
+            if o.borrow().prop_has(&k) {
                 return Some(k);
             }
         }
-        if o.borrow().props.contains_key(pn) {
+        if o.borrow().prop_has(pn) {
             return Some(pn.to_string());
         }
         None
@@ -2127,7 +2183,7 @@ impl<'a> Interp<'a> {
                         } else {
                             pd.name.clone()
                         };
-                        if pd.readonly && o.borrow().props.contains_key(&dk) {
+                        if pd.readonly && o.borrow().prop_has(&dk) {
                             return self.fail(PhpError::uncaught(
                                 "Error",
                                 format!(
@@ -2188,7 +2244,7 @@ impl<'a> Interp<'a> {
                 }
                 if let Some(k) = self.obj_prop_key(&o, &pn).filter(|_| hidden.is_none()) {
                     let mut ob = o.borrow_mut();
-                    let prune = if let Some(c) = ob.props.remove(&k) {
+                    let prune = if let Some(c) = ob.prop_take(&k) {
                         // unset() severs the typed slot: refs bound to it
                         // become plain variables again (typed_properties_090).
                         let ptr = Rc::as_ptr(&c) as usize;
@@ -2324,7 +2380,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         (crate::ast::Visibility::Public, String::new())
     }

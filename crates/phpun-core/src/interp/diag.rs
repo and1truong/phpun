@@ -461,8 +461,7 @@ impl<'a> Interp<'a> {
             // Throwable) render the `Uncaught X:` block.
             let is_parse_err = class == "ParseError";
             let msg = o
-                .props
-                .get("message")
+                .prop_get("message")
                 .map(|c| c.borrow().to_php_string())
                 .unwrap_or_default();
             let (file, line, thrown, tr, msg, eval_ctx, mut next) = match &o.internal {
@@ -514,8 +513,7 @@ impl<'a> Interp<'a> {
                 let co = co.borrow();
                 let cls = co.class.name().to_string();
                 let m = co
-                    .props
-                    .get("message")
+                    .prop_get("message")
                     .map(|c| c.borrow().to_php_string())
                     .unwrap_or_default();
                 let (f, l, tr2, dm, p) = match &co.internal {

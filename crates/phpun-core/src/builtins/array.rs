@@ -534,7 +534,7 @@ pub(crate) fn dispatch(
                         Value::Object(o) => {
                             let ob = o.borrow();
                             for n in &ob.prop_order {
-                                if let Some(c) = ob.props.get(n) {
+                                if let Some(c) = ob.prop_get(n) {
                                     arr.push(c.borrow().clone());
                                 }
                             }
@@ -967,8 +967,7 @@ pub(crate) fn dispatch(
                             .unwrap_or(Value::Null),
                         None => o
                             .borrow()
-                            .props
-                            .get(&slot)
+                            .prop_get(&slot)
                             .map(|c| c.borrow().clone())
                             .unwrap_or(Value::Null),
                     };

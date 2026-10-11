@@ -28,7 +28,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         None
     }
@@ -50,7 +50,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         let Some((pd, dcls)) = found else {
             return Ok(());
@@ -338,7 +338,7 @@ impl<'a> Interp<'a> {
         // — zend links the child to the parent's storage cell, so
         // `D::$a` and `C::$a` write through the same reference.
         if let Some(pname) = &cls.decl.parent {
-            if let Some(p) = self.classes.get(&pname.to_lowercase()).cloned() {
+            if let Some(p) = lkey_get(&self.classes, pname).cloned() {
                 self.statics_init(&p)?;
                 for (k, v) in p.statics.borrow().iter() {
                     cls.statics
@@ -671,6 +671,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(Value::Object(self.alloc_obj(PhpObject {
                         class: oc,
+                        slots: Vec::new(),
                         props,
                         prop_order: order,
                         id: 0,
@@ -724,8 +725,7 @@ impl<'a> Interp<'a> {
                             "\0dt\0tz",
                         ] {
                             let v = sb
-                                .props
-                                .get(k)
+                                .prop_get(k)
                                 .map(|c| c.borrow().clone())
                                 .unwrap_or(Value::Int(0));
                             props.insert(k.to_string(), cell(v));
@@ -734,6 +734,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(Value::Object(self.alloc_obj(PhpObject {
                         class: oc,
+                        slots: Vec::new(),
                         props,
                         prop_order: order,
                         id: 0,
@@ -767,10 +768,8 @@ impl<'a> Interp<'a> {
                         let mut ob = o.borrow_mut();
                         ob.props.retain(|k, _| k.starts_with("\0di\0"));
                         ob.prop_order = vec!["from_string".into(), "date_string".into()];
-                        ob.props
-                            .insert("from_string".into(), cell(Value::Bool(true)));
-                        ob.props
-                            .insert("date_string".into(), cell(Value::str(&spec)));
+                        ob.prop_insert("from_string", cell(Value::Bool(true)));
+                        ob.prop_insert("date_string", cell(Value::str(&spec)));
                     }
                     Ok(v)
                 }
@@ -844,7 +843,7 @@ impl<'a> Interp<'a> {
                         let is_throwable = {
                             let ob = o.borrow();
                             matches!(ob.internal, Some(ObjectInternal::Exception { .. }))
-                                || self.is_throwable_name(&ob.class.decl.name)
+                                || self.is_throwable_cls(&ob.class)
                         };
                         if is_throwable {
                             if let Some(v) = self.throwable_method(o, name, &args)? {
@@ -979,10 +978,10 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         for iname in ifaces {
-            if let Some(id) = self.interfaces.get(&iname.to_lowercase()) {
+            if let Some(id) = lkey_get(&self.interfaces, iname) {
                 for cd in &id.consts {
                     if cd.name == name {
                         return Some((cd.clone(), id.file.clone()));
@@ -1031,10 +1030,10 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         for iname in ifaces {
-            if let Some(id) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+            if let Some(id) = lkey_get(&self.interfaces, iname).cloned() {
                 for cd in &id.consts {
                     if seen.insert(cd.name.clone()) {
                         out.push((cd.name.clone(), (cd.clone(), id.file.clone())));
@@ -1113,10 +1112,10 @@ impl<'a> Interp<'a> {
         let lit = Self::is_lit_class_ref(e);
         let name = self.class_name_of(e)?;
         self.scope_kw_err(&name, lit)?;
-        if !self.classes.contains_key(&name.to_lowercase()) {
+        if !lkey_get(&self.classes, &name).is_some() {
             self.run_autoload(&name)?;
         }
-        match self.classes.get(&name.to_lowercase()) {
+        match lkey_get(&self.classes, &name) {
             Some(c) => Ok(c.clone()),
             None => self.fail(PhpError::uncaught(
                 "Error",
@@ -1250,12 +1249,12 @@ impl<'a> Interp<'a> {
                     }
                 }
                 for i in &c.implements {
-                    if let Some(f) = self.interfaces.get(&i.to_lowercase()).cloned() {
+                    if let Some(f) = lkey_get(&self.interfaces, i).cloned() {
                         stack.push(f);
                     }
                 }
                 if let Some(p) = &c.parent {
-                    if let Some(f) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                    if let Some(f) = lkey_get(&self.interfaces, p).cloned() {
                         stack.push(f);
                     }
                 }
@@ -1302,7 +1301,7 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         let mut seen = std::collections::HashSet::new();
         let mut queue: Vec<String> = ifaces;
@@ -1310,7 +1309,7 @@ impl<'a> Interp<'a> {
             if !seen.insert(iname.to_lowercase()) {
                 continue;
             }
-            if let Some(c) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+            if let Some(c) = lkey_get(&self.interfaces, iname).cloned() {
                 for cd in &c.consts {
                     if cd.name == name {
                         let old = self.const_self.replace(cls.clone());
@@ -1363,12 +1362,12 @@ impl<'a> Interp<'a> {
                     return true;
                 }
                 for i in &c.implements {
-                    if let Some(f) = self.interfaces.get(&i.to_lowercase()).cloned() {
+                    if let Some(f) = lkey_get(&self.interfaces, i).cloned() {
                         stack.push(f);
                     }
                 }
                 if let Some(p) = &c.parent {
-                    if let Some(f) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                    if let Some(f) = lkey_get(&self.interfaces, p).cloned() {
                         stack.push(f);
                     }
                 }
@@ -1389,14 +1388,14 @@ impl<'a> Interp<'a> {
                 .decl
                 .parent
                 .as_ref()
-                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                .and_then(|p| lkey_get(&self.classes, p).cloned());
         }
         let mut seen = std::collections::HashSet::new();
         while let Some(iname) = ifaces.pop() {
             if !seen.insert(iname.to_lowercase()) {
                 continue;
             }
-            if let Some(c) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+            if let Some(c) = lkey_get(&self.interfaces, iname).cloned() {
                 if c.consts.iter().any(|cd| cd.name == name) {
                     return true;
                 }
