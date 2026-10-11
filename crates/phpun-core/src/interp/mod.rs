@@ -3160,6 +3160,12 @@ impl<'a> Interp<'a> {
     /// __destruct — `unset($closure)` decrefs the closure's bound
     /// $this and captures (Zend refcount semantics — closure_005).
     pub(in crate::interp) fn destruct_dying_value(&mut self, v: &Value) -> Result<(), PhpError> {
+        if matches!(
+            v,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        ) {
+            return Ok(());
+        }
         // A displaced zval that stays alive is Zend's purple-add — a
         // potential cycle root entering the buffer (gc/bug70805).
         let purple = match v {
@@ -6965,6 +6971,21 @@ impl<'a> Interp<'a> {
                 if Rc::strong_count(a) - 1 > 1 {
                     self.gc_note_purple(Rc::as_ptr(a) as usize);
                 } else {
+                    // No graph target or PHP callback can appear during this
+                    // last-owner walk. Mixed/nested/resource tables retain
+                    // the full dying-cell snapshot before callbacks run.
+                    if a.borrow().entries.iter().all(|(_, c)| {
+                        matches!(
+                            &*c.borrow(),
+                            Value::Null
+                                | Value::Bool(_)
+                                | Value::Int(_)
+                                | Value::Float(_)
+                                | Value::Str(_)
+                        )
+                    }) {
+                        return;
+                    }
                     let dying = {
                         let b = a.borrow();
                         self.gc_dying_acquire(b.entries.iter().map(|(_, c)| Rc::as_ptr(c)))
