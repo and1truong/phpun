@@ -1,0 +1,27 @@
+{
+  "php": {
+    "exit": 0,
+    "stdout": "Cannot indirectly modify readonly property PackedReadonly::$a\n[[false,false,false,false],[true,true,true,true]]\n[\"front\",\"splice\",true,true]\nbool(false)\n[true,true,true] [false,true,true]\n",
+    "stderr": ""
+  },
+  "main0ddef-latest": {
+    "exit": 0,
+    "stdout": "Cannot indirectly modify readonly property PackedReadonly::$a\n[[false,false,false,false],[true,true,true,true]]\n[\"front\",\"splice\",true,true,true]\nbool(false)\n[true,true,true] [false,true,true]\n",
+    "stderr": ""
+  },
+  "memory-limit-main": {
+    "exit": 0,
+    "stdout": "Cannot indirectly modify readonly property PackedReadonly::$a\n[[false,false,false,false],[true,true,true,true]]\n[\"front\",\"splice\",true,true,true]\nbool(false)\n[true,true,true] [false,true,true]\n",
+    "stderr": ""
+  },
+  "packed-scalar-main": {
+    "exit": 0,
+    "stdout": "Cannot indirectly modify readonly property PackedReadonly::$a\n[[false,false,false,false],[true,true,true,true]]\n[\"front\",\"splice\",true,true,true]\nbool(false)\n[true,true,true] [false,true,true]\n",
+    "stderr": ""
+  },
+  "compact-packed": {
+    "exit": 0,
+    "stdout": "Cannot indirectly modify readonly property PackedReadonly::$a\n[[false,false,false,false],[true,true,true,true]]\n[\"front\",\"splice\",true,true,true]\nbool(false)\n[true,true,true] [false,true,true]\n",
+    "stderr": ""
+  }
+}

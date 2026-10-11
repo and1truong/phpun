@@ -1,0 +1,22 @@
+{
+  "new-byref-ctor.php": {
+    "gate": true,
+    "PHP_output": "int(2)\nint(2)\nint(9)\n",
+    "main_output": "int(2)\nint(2)\nint(9)\n"
+  },
+  "method-ctor-global-rebind.php": {
+    "gate": true,
+    "PHP_output": "int(9)\nint(9)\nint(9)\nint(9)\n",
+    "main_output": "int(9)\nint(9)\nint(9)\nint(9)\n"
+  },
+  "method-ctor-global-alias.php": {
+    "gate": false,
+    "PHP_output": "int(9)\nint(9)\nint(2)\nint(2)\n",
+    "main_output": "int(2)\nint(2)\nint(2)\nint(2)\n"
+  },
+  "constructor-global-alias.php": {
+    "gate": false,
+    "PHP_output": "int(9)\nint(9)\n",
+    "main_output": "int(2)\nint(2)\n"
+  }
+}

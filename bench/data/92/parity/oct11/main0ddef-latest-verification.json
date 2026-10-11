@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "a8d427bbcc2590946161f88a9330ab0a661bc88eedf2069a56075d1a2d932965",
+  "source": "0ddef51956b02645aa94dabd4419ba4e6568b500",
+  "parent": "memory-limit-main",
+  "summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "changes": []
+}

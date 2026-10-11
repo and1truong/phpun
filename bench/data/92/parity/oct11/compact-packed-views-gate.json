@@ -1,0 +1,5 @@
+{
+  "gate": "supported readonly/reference/foreach/shift/unshift/sort/ArrayIterator: exit/stdout/stderr == PHP8.5.11-n",
+  "stdout": "Cannot indirectly modify readonly property PackedReadonly::$a\n[[false,false,false,false],[true,true,true,true]]\n[\"front\",true,true,true]\nbool(false)\n[true,true,true] [false,true,true]\n[false,true,true]\n",
+  "excluded_probe": "full shift/unshift/splice case has pre-existing main mismatch, retained in packed-views-comparison.json"
+}
