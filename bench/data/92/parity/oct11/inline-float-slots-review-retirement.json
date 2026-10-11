@@ -1,0 +1,13 @@
+{
+  "review_thread": "PRRT_kwDOU4oR3M6rPPr2",
+  "decision": "P2 review correctly identifies 8\u219224 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31\u22123.6%/confirm\u22123.7%,long\u22121.6%/confirm\u2212.6%,wholedefaultflat/long+2.8% andphysical\u221250002requests/\u22121200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.",
+  "ordinary_slot_bytes": 8,
+  "withdrawn_slot_bytes": 24,
+  "reverts": [
+    "b217672",
+    "82c76dc"
+  ],
+  "production_runtime_equal": "8a77753cbba5855910480c736e967fdc92c81f71",
+  "production_diff": "diff --git a/crates/phpun-core/src/interp/vm.rs b/crates/phpun-core/src/interp/vm.rs\nindex 7fafcf4..6b0ed12 100644\n--- a/crates/phpun-core/src/interp/vm.rs\n+++ b/crates/phpun-core/src/interp/vm.rs\n@@ -4742,6 +4742,11 @@ unset($a); var_dump($weak->get());\n         else {\n             panic!(\"object\");\n         };\n+        assert_eq!(\n+            std::mem::size_of_val(&object.borrow().slots[0]),\n+            std::mem::size_of::<usize>(),\n+            \"ordinary declared-property slots stay one pointer\"\n+        );\n         assert!(super::Rc::ptr_eq(\n             &object.borrow().prop_order,\n             &other.borrow().prop_order\n",
+  "frozen_canonical_elf": "1042bda18d5128c871a82e748e88be9008380d8ccc004c940bc1e8478a11fc9e"
+}
