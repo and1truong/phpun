@@ -2681,3 +2681,35 @@ Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/pcre-pattern-cache-*.
+
+## #330: perf(pcre): reuse compiled patterns in a bounded interpreter cache (2026-10-11)
+
+Review correction to#333: reset_request clears request-derived pattern keys and compiled native code in warm workers, not only Interp destruction.
+
+Same bounded256 cache/canonical misses and per-invocation limits/UTF/error state. ponytail comment now names byte-budgeted LRU upgrade when measured real working sets exceed the ceiling.
+
+Runtime 0217e12b545f31bf38b94aae3cb45a3b3ad6d3b7; timing source 0217e12b545f31bf38b94aae3cb45a3b3ad6d3b7; report/integration source 0217e12b545f31bf38b94aae3cb45a3b3ad6d3b7.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/50-regex.php | 40.584 | 43.276 | 1.0663 |
+| bench/profile/pcre-patterns.php 10000 4 | 80.706 | 77.861 | 0.9647 |
+| bench/profile/pcre-patterns.php 10000 300 | 90.743 | 91.690 | 1.0104 |
+| examples/composer/run.php | 8.295 | 7.853 | 0.9468 |
+
+Corrected frozen0217e12/2ccbf3d:31corpus40.087→39.142ms(−2.4%),small-pattern79.036→79.304(+.3%,flat),Composer9.207→8.995(−2.3%). Initialreview7corpus+6.6%,patterns−3.5%,Composer−5.3% retained. These compare old/new CACHE ELFs, not an additional cache speedup. Initialcache/main31small-pattern−13.1%,whole7geo+2.66%negative remain historical; no combined/parity gain claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Same ONE cache check now proves weak-code release and cache-empty/recompile after reset_request, the shared warm-worker boundary. Workspace/fmt/clippy/native25+19/profile allPASS.
+Corrected all3406PHPT only2knownrange crash/timeout swaps;601knownfails unchanged. CandidateGCfulltimeout retained,serialized10s PASS;parentcache serialized8195msPASS.
+Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/pcre-pattern-cache-review-*.

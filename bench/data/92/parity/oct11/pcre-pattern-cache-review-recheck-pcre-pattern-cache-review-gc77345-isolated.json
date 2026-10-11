@@ -1,0 +1,19 @@
+{
+  "summary": {
+    "total": 1,
+    "passed": 1,
+    "failed": 0,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 0,
+    "unsupported": 0,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 1,
+    "compatibility_pct": 100.00
+  },
+  "results": [
+    {"file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt", "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)", "status": "pass", "reason": "", "duration_ms": 8595}
+  ]
+}
