@@ -2732,6 +2732,7 @@ impl<'a> Interp<'a> {
         frame.args.clear();
         frame.value_args.clear();
         frame.vm_sites.clear();
+        frame.vm_span = None;
         let pending_caps = std::mem::take(&mut self.pending_gen_captures);
         for (n, c, by_ref) in pending_caps {
             let c2 = if by_ref { c } else { cell(c.borrow().clone()) };
@@ -2783,13 +2784,13 @@ impl<'a> Interp<'a> {
         if abi {
             let n = argv.len() as u64;
             std::mem::swap(&mut self.cur().value_args, argv);
-            self.vm_call_reserve(&mut args, n);
+            self.vm_direct_reserve(&mut args, n);
             padd!(1, __p);
             return self.vm_run(decl, comp, args);
         }
         args.cells = self.vm_arg_cells(argv);
         let n = args.cells.len() as u64;
-        self.vm_call_reserve(&mut args, n);
+        self.vm_direct_reserve(&mut args, n);
         padd!(1, __p);
         self.vm_run(decl, comp, args)
     }
@@ -3161,6 +3162,7 @@ impl<'a> Interp<'a> {
         frame.args.clear();
         frame.value_args.clear();
         frame.vm_sites.clear();
+        frame.vm_span = None;
         let pending_caps = std::mem::take(&mut self.pending_gen_captures);
         for (n, c, by_ref) in pending_caps {
             let c2 = if by_ref { c } else { cell(c.borrow().clone()) };
@@ -3208,13 +3210,13 @@ impl<'a> Interp<'a> {
         if abi {
             let n = argv.len() as u64;
             std::mem::swap(&mut self.cur().value_args, argv);
-            self.vm_call_reserve(&mut args, n);
+            self.vm_direct_reserve(&mut args, n);
             padd!(1, __p);
             return self.vm_run(decl, comp, args);
         }
         args.cells = self.vm_arg_cells(argv);
         let n = args.cells.len() as u64;
-        self.vm_call_reserve(&mut args, n);
+        self.vm_direct_reserve(&mut args, n);
         padd!(1, __p);
         self.vm_run(decl, comp, args)
     }
@@ -3453,6 +3455,17 @@ DivisionByZeroError:Division by zero
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
         let mut it = Interp::new("arena.php");
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
+        let frame = it.frame_new("direct");
+        it.stack.push(frame);
+        let charges = it.mem_tracked.len();
+        let mut args = super::super::CallArgs::empty();
+        it.vm_direct_reserve(&mut args, 2);
+        assert!(args.vm_sites.is_empty());
+        assert_eq!(it.mem_tracked.len(), charges);
+        assert!(it.stack.last().unwrap().vm_span.is_some());
+        let frame = it.stack_pop().unwrap();
+        assert!(frame.vm_span.is_none());
+        it.frame_recycle(frame);
         let result = it.run_source(
             r#"<?php
             function scalar($n) { return $n + 1; }
@@ -3474,5 +3487,6 @@ DivisionByZeroError:Division by zero
             initial
         );
         assert!(it.mem_tracked.values().all(|charge| charge.vm.is_none()));
+        assert!(it.vm_frame_pool.iter().all(|frame| frame.vm_span.is_none()));
     }
 }
