@@ -847,7 +847,7 @@ bytes465086016→388949018(−16.4%). Object allocations still100000,
 remaining storage/GC work not solved. No broad parity claim or multiplying
 step ratios; raw timings/hashes/maps/correction source in oct11/receiver-*.
 
-## Guarded pure integer native tier (#240)
+## Guarded pure integer native experiments (#240, superseded by review fix below)
 
 Final runtime d089dbb, parent runtime75e78c5 (#242). x86_64 Linux only; other
 platforms retain VM. Reuse existing Ops/declaration cache/libc. No fib pattern
@@ -912,3 +912,47 @@ raw PHP hash/config/numeric timings unchanged. Native raw script's stale
 Next: pinned constructor metadata (#243), pure integer comparator native
 entry before callback frame/binding, then real array/object storage and string
 builtin costs. Parent merges do not block child implementation; no self-merge.
+
+## Native P1 review fix and fresh release validation (#245)
+
+Reviewer4240135045 correctly found that page-rounding `len` introduced an
+out-of-bounds source read in copy_nonoverlapping. Fixed be0e810: copy exactly
+e.bytes.len(); mapping/protection/unmapping retain rounded length. Fix is
+merged into constructor and comparator child branches. Earlier native trial
+measurements above are pre-fix exploratory evidence, superseded by this run.
+
+AddressSanitizer on fresh, isolated source/core builds: original e513822 fails
+with READ4096 heap-buffer-overflow; fixed source1b6c124 (tree identical to
+be0e810) passes the existing native execution/guard-replay unit. First cross-
+worktree attempt reused a fixed artifact and is retained as stale-target,
+excluded from evidence; forced package clean before actual before/after runs.
+Leak detection disabled: this checks the invalid read, not all project leaks
+or uninstrumented JIT instructions. Raw logs/exits/clean commands retained.
+
+Fresh be0e810 release workspace8core22runtime19format,fm/clippy pass;25script
+plus19workload byte/exit/error PHP-n gates,VM-profile and3406PHPT rerun retain
+2727pass603fail25skip38unsupported6crash7timeout. Known range resource
+crash/timeout changes are in the raw map, no new semantic failure claim.
+
+Seven rotating PHP/parent/fixed medians, profiler-off isolated:
+
+| Workload | PHP/parent/fixed ms | Fixed/parent | Fixed/PHP |
+|---|---:|---:|---:|
+| startup | 3.660/6.176/6.082 | 0.985 | 1.662 |
+| fib26 | 10.901/132.499/8.300 | 0.063 | **0.761** |
+| sieve | 7.251/210.098/213.868 | 1.018 | 29.496 |
+| strings | 15.507/187.282/174.966 | 0.934 | 11.283 |
+| arrays | 17.694/174.846/169.521 | 0.970 | 9.581 |
+| objects | 8.559/241.990/251.167 | 1.038 | 29.344 |
+| regex | 6.624/42.179/39.944 | 0.947 | 6.030 |
+| JSON | 158.365/519.994/527.113 | 1.014 | 3.328 |
+| DB | 28.562/112.089/111.586 | 0.996 | 3.907 |
+| app100,20 | 4.850/35.502/35.766 | 1.007 | 7.374 |
+| Composer | 5.309/8.159/8.364 | 1.025 | 1.576 |
+
+Nine-bench native-host geo8.183→5.946×PHP,time step0.727(−27.3%).
+Fib−93.7% vsparent and~24% faster than native PHP. Sieve+1.8%,objects+3.8%,
+JSON+1.4%,app+0.7%,Composer+2.5% retained; other non-target changes are not
+broad wins. Full suite still far from parity, user's2.71× remains separate.
+Exact fixed hash/config/raw samples and P1 before/after sources are in
+native-fixed-*; no pre-fix dataset relabelled as fixed.
