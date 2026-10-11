@@ -1,0 +1,32 @@
+{
+  "runtime": "556d7e6898f99e79880aa460eb046ed23adf41c7",
+  "source": "cb1ad5462a49788b8217c5a925ca12f5cd288ab2",
+  "tracked_clean": "only untracked vendor symlink",
+  "php": "8.5.11 -n; OPcache loaded but CLI disabled; JIT disabled",
+  "phpt_changes": {
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": [
+      "crash",
+      "timeout"
+    ],
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": [
+      "timeout",
+      "crash"
+    ]
+  },
+  "rebuild_note": "initial default-profile cargo clean did not remove release; identical parent hash detected before measurement; explicit --release clean and genuine1m36 rebuild produced distinct hash. No stale binary speed results published",
+  "physical_allocations": {
+    "strings": {
+      "parent_requests": 2144443,
+      "candidate_requests": 1578563,
+      "parent_bytes": 65157144,
+      "candidate_bytes": 50991224
+    },
+    "objects_20x5000": {
+      "parent_requests": 10963259,
+      "candidate_requests": 10963260,
+      "parent_bytes": 299512830,
+      "candidate_bytes": 302691342
+    }
+  },
+  "scope": "public owned strict_sig API/reflection unchanged; only hot shared type-check uses private static view"
+}
