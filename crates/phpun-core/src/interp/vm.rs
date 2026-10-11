@@ -3644,9 +3644,19 @@ DivisionByZeroError:Division by zero
             assert_eq!(bytes.as_ref(), expected.as_slice());
         }
         let subject = super::Value::str("unchanged");
-        let mut argv = vec![super::Value::str(""), super::Value::str("x"), subject.clone()];
+        let mut argv = vec![
+            super::Value::str(""),
+            super::Value::str("x"),
+            subject.clone(),
+        ];
         let value = it
-            .vm_call("str_replace", "str_replace", &mut argv, 1, &super::CachedFn::Builtin)
+            .vm_call(
+                "str_replace",
+                "str_replace",
+                &mut argv,
+                1,
+                &super::CachedFn::Builtin,
+            )
             .unwrap();
         let (super::Value::Str(before), super::Value::Str(after)) = (&subject, &value) else {
             panic!("string")
