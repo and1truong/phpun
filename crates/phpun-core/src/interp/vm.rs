@@ -2899,10 +2899,10 @@ impl<'a> Interp<'a> {
 
     /// Fresh positional callback values only: original/reference argument cells
     /// must use call_value. Pool the value vector before invoking the shared ABI.
-    pub(crate) fn call_value_pair(
+    pub(crate) fn call_values<const N: usize>(
         &mut self,
         callable: &Value,
-        values: [Value; 2],
+        values: [Value; N],
         nonref: bool,
     ) -> Result<Value, PhpError> {
         let Some((decl, comp, closure)) = self.vm_callback_values_target(callable, &values) else {
@@ -2910,7 +2910,7 @@ impl<'a> Interp<'a> {
             // value-vector transfer for bound/object/string/captured callbacks.
             let mut args = super::CallArgs::positional(values.into_iter().map(cell).collect());
             if nonref {
-                args.nonref_cells.extend(0..2);
+                args.nonref_cells.extend(0..N);
             }
             return self.call_value(callable, args);
         };
@@ -2931,7 +2931,7 @@ impl<'a> Interp<'a> {
     fn vm_callback_values_target<'cb>(
         &mut self,
         callable: &'cb Value,
-        values: &[Value; 2],
+        values: &[Value],
     ) -> Option<(&'cb Rc<FunctionDecl>, Rc<Compiled>, &'cb Rc<PhpCallable>)> {
         let Value::Callable(c) = callable else {
             return None;
@@ -3549,7 +3549,7 @@ DivisionByZeroError:Division by zero
         };
         let weak = std::rc::Rc::downgrade(c);
         let result = it
-            .call_value_pair(
+            .call_values(
                 &callable,
                 [crate::value::Value::Int(2), crate::value::Value::Int(1)],
                 false,
@@ -3564,7 +3564,7 @@ DivisionByZeroError:Division by zero
         {
             for _ in 0..70 {
                 assert!(matches!(
-                    it.call_value_pair(
+                    it.call_values(
                         &callable,
                         [super::Value::Int(2), super::Value::Int(1)],
                         false
@@ -3584,7 +3584,7 @@ DivisionByZeroError:Division by zero
                 _ => panic!("callback graph was not native"),
             }
             let error = it
-                .call_value_pair(
+                .call_values(
                     &callable,
                     [super::Value::Int(i64::MAX), super::Value::Int(1)],
                     false,
@@ -3604,6 +3604,53 @@ DivisionByZeroError:Division by zero
             weak.upgrade().is_none(),
             "pooled callback frame retained callable owner"
         );
+
+        // The same proof must reach native code for one fresh value, without
+        // retaining its callable owner or skipping typed overflow replay.
+        let mut it = Interp::new("single-callback.php");
+        it.run_source("<?php function singleOwned(int $x): int { return $x * 3 + 1; }");
+        let callable = it
+            .eval(&crate::ast::Expr::Closure(crate::ast::ClosureExpr {
+                decl: (*it.functions["singleowned"]).clone(),
+                uses: Vec::new(),
+                arrow: false,
+                is_static: false,
+            }))
+            .unwrap();
+        let super::Value::Callable(c) = &callable else {
+            panic!("closure")
+        };
+        let weak = std::rc::Rc::downgrade(c);
+        for _ in 0..70 {
+            assert!(matches!(
+                it.call_values(&callable, [super::Value::Int(2)], false)
+                    .unwrap(),
+                super::Value::Int(7)
+            ));
+        }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let super::CallableKind::Closure(decl) = &c.kind else {
+                panic!("closure")
+            };
+            match &it.compiled_fns[&(Rc::as_ptr(decl) as usize)].3 {
+                super::native::State::Ready(p) => assert!(p.executions.get() > 0),
+                _ => panic!("single callback did not enter native"),
+            }
+        }
+        let error = it
+            .call_values(&callable, [super::Value::Int(i64::MAX)], false)
+            .unwrap_err();
+        assert!(
+            error.message.contains("Return value must be of type int"),
+            "{}",
+            error.message
+        );
+        assert!(it.call_trace.is_empty());
+        assert_eq!(it.vm_stack.len(), 1);
+        assert_eq!(it.vm_stack[0].used, 32 + super::super::VM_FRAME_SLOTS * 16);
+        drop(callable);
+        assert!(weak.upgrade().is_none(), "single callback owner retained");
     }
 
     #[test]

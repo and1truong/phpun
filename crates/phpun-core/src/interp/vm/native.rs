@@ -648,20 +648,27 @@ pub(super) fn execute(
 pub(super) fn callback(
     it: &mut Interp<'_>,
     decl: &Rc<FunctionDecl>,
-    values: &[Value; 2],
+    values: &[Value],
 ) -> Option<Value> {
-    let [Value::Int(a), Value::Int(b)] = values else {
+    let mut arguments = [0i64; 16];
+    if values.len() > arguments.len() {
         return None;
-    };
+    }
+    for (i, value) in values.iter().enumerate() {
+        let Value::Int(n) = value else {
+            return None;
+        };
+        arguments[i] = *n;
+    }
     let program = cached(it, decl, true)?;
-    let span = (super::super::VM_FRAME_SLOTS + 2) * 16;
+    let span = (super::super::VM_FRAME_SLOTS + values.len() as u64) * 16;
     let top = it.vm_stack.last_mut()?;
     if top.size.saturating_sub(top.used) < span {
         return None;
     }
     let used = top.used;
     top.used += span;
-    let result = run(it, decl, &program, &[*a, *b]);
+    let result = run(it, decl, &program, &arguments[..values.len()]);
     let top = it.vm_stack.last_mut().unwrap();
     assert_eq!(top.used, used + span, "native callback root span leak");
     top.used = used;
