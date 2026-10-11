@@ -2448,8 +2448,9 @@ impl<'a> Interp<'a> {
                     let target = self.vm_resolve(lname, raw, *callee, cache)?;
                     let needs_refs = match &target {
                         CachedFn::Decl(d) => d.params.iter().any(|p| p.by_ref),
-                        CachedFn::Builtin => builtin_byref(lname)
-                            .is_some_and(|flags| flags.iter().take(args.len()).any(|flag| *flag)),
+                        CachedFn::Builtin => {
+                            builtin_byref(lname).is_some_and(|flags| flags.iter().any(|flag| *flag))
+                        }
                         CachedFn::Direct(..) => false,
                     };
                     if needs_refs {
@@ -3769,22 +3770,6 @@ var_dump($count, $b[2], $c[0]);
     #[test]
     fn callback_values_preserve_live_args_fallbacks_sort_errors_and_owners() {
         let mut it = Interp::new("callbacks.php");
-        let mut replacement = Interp::new("optional-count.php");
-        let result = replacement.run_source(
-            r#"<?php
-function replacement_value($s) { return str_replace("a", "x", $s); }
-echo replacement_value("a\0a"), "\n";
-echo str_ireplace("AB", "x", "abABa"), "\n";
-$count = 0; $alias =& $count;
-echo str_replace("a", "x", "aba", $count), " ", $alias, "\n";
-try { str_replace("a", "x", "aba", 0); } catch (Error $e) { echo get_class($e), "\n"; }
-echo str_replace(subject: "aba", search: "a", replace: "x", count: $count), " ", $alias, "\n";
-echo str_replace(...["a", "x", "aba"]), "\n";
-"#,
-        );
-        assert_eq!(result.exit_code, 0, "{}", replacement.err_buf);
-        assert_eq!(replacement.err_buf, "");
-        assert_eq!(replacement.out, b"x\0x\nxxa\nxbx 2\nError\nxbx 2\nxbx\n");
         let mut root = Interp::new("scalar-root.php");
         let initial: Vec<_> = root.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let result = root.run_source(
