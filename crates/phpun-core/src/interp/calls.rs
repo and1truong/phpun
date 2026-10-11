@@ -1230,7 +1230,7 @@ impl<'a> Interp<'a> {
 
     /// Call any callable-ish Value: Callable, string name, [obj,'m'], obj
     /// with __invoke.
-    pub fn call_value(&mut self, v: &Value, args: CallArgs) -> Result<Value, PhpError> {
+    pub fn call_value(&mut self, v: &Value, mut args: CallArgs) -> Result<Value, PhpError> {
         match v {
             Value::Callable(c) => {
                 match &c.kind {
@@ -1306,7 +1306,7 @@ impl<'a> Interp<'a> {
                         {
                             if let Some(comp) = self.vm_compiled(&decl) {
                                 if !comp.needs_bind {
-                                    return self.vm_run(&decl, &comp, args);
+                                    return self.vm_run(&decl, &comp, &mut args);
                                 }
                             }
                         }
@@ -5281,7 +5281,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn invoke_fn_run(
         &mut self,
         decl: &Rc<FunctionDecl>,
-        args: CallArgs,
+        mut args: CallArgs,
         this_obj: Option<Rc<RefCell<PhpObject>>>,
         scope_class: Option<Rc<PhpClass>>,
         decl_class: Option<Rc<PhpClass>>,
@@ -5329,7 +5329,7 @@ impl<'a> Interp<'a> {
         if args.named.is_empty() {
             if let Some(c) = self.vm_compiled(decl) {
                 if !c.needs_bind {
-                    return self.vm_run(decl, &c, args);
+                    return self.vm_run(decl, &c, &mut args);
                 }
             }
         }
