@@ -1471,3 +1471,42 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/gc-scalar-cells-*.
+
+## #266: perf(handles): test weak liveness without temporary strong owners (2026-10-11)
+
+ObjHandle::alive uses Weak::strong_count()!=0 instead of upgrade().is_some() on the existing single-threaded Rc handles. Avoid creating/dropping a temporary strong owner for each liveness test.
+
+Preserve the256-slot dead tail scan, dead-slot LIFO, silent-death handling, PHP-visible handle reuse and cleanup. No new cache/alive bits or deferred scan. Existing owner/reuse/weak lifetime runnable checks retained.
+
+Runtime 889f89faa05dc253f72ee7e23e4914805094e24f; measured source a7da86f9e2b359f933c0cd1801de5830b7e9be0f.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 201.174 | 207.766 | 1.0328 |
+| bench/40-objects.php 20 5000 | 776.502 | 792.623 | 1.0208 |
+| bench/profile/objects.php ctor 5000 | 39.258 | 39.150 | 0.9972 |
+| bench/profile/arrays.php map 20000 | 32.044 | 30.580 | 0.9543 |
+| bench/30-arrays.php | 91.447 | 83.726 | 0.9156 |
+| bench/20-strings.php | 127.948 | 120.110 | 0.9387 |
+| bench/11-sieve.php | 79.284 | 77.075 | 0.9721 |
+| bench/10-fib.php | 8.689 | 8.479 | 0.9759 |
+| bench/app/cli.php 100 20 | 33.986 | 33.195 | 0.9767 |
+| examples/composer/run.php | 8.580 | 7.666 | 0.8934 |
+
+Seven target objects+3.3%/long+2.1% retained;31 followup objects202.887→199.631ms(−1.6%),long796.588→794.683ms(−0.2%). Small/flat target change, not a broad speed claim. Nontarget arrays/strings differences are not attributed to this two-line handle change. Physical requests unchanged.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects: requests 8763025→8763025; bytes 275057282→275057274.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Full concurrent PHPT has bug63635 pass→timeout10s; both binaries rechecked serialized at10s: parent pass4104ms,candidate pass4130ms. Original raw map and two isolated reports retained separately; release build competition removed for rechecks.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/weak-liveness-*.
