@@ -146,13 +146,20 @@ impl<'a> Interp<'a> {
             Expr::StaticProp { class, name } => {
                 // `C::$var()` — dynamic static method call.
                 let cls = self.class_of(class)?;
-                let mn = Self::nul_trunc(&self.prop_name(name)?);
-                let fm = self.find_method_in(&cls, &mn);
+                let mraw;
+                let mn = match name {
+                    crate::ast::PropName::Name(s) => Self::nul_trunc(s),
+                    _ => {
+                        mraw = self.prop_name(name)?;
+                        Self::nul_trunc(&mraw)
+                    }
+                };
+                let fm = self.find_method_in(&cls, mn);
                 let names_ok = fm.is_some();
                 let params = fm.map(|m| m.0.decl.params.clone()).unwrap_or_default();
-                let vals = self.arg_cells(args, &params, &mn, false, site, false, names_ok)?;
+                let vals = self.arg_cells(args, &params, mn, false, site, false, names_ok)?;
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
-                return self.static_invoke_vis(cls, &mn, vals, None, fwd);
+                return self.static_invoke_vis(cls, mn, vals, None, fwd);
             }
             _ => {
                 // `$f()`, `($f)()`, `($o->p)()`, `g()()`, `$arr[0]()`,
@@ -1544,8 +1551,15 @@ impl<'a> Interp<'a> {
             },
             Expr::MethodCall { obj, name, .. } => {
                 let ov = self.eval(obj)?;
-                let mn = Self::nul_trunc(&self.prop_name(name)?);
-                self.fcc_method(&ov, &mn)
+                let mraw;
+                let mn = match name {
+                    crate::ast::PropName::Name(s) => Self::nul_trunc(s),
+                    _ => {
+                        mraw = self.prop_name(name)?;
+                        Self::nul_trunc(&mraw)
+                    }
+                };
+                self.fcc_method(&ov, mn)
             }
             Expr::StaticCall { class, name, .. } => {
                 let cls = self.fcc_class_of(class)?;
@@ -1555,7 +1569,7 @@ impl<'a> Interp<'a> {
                 let cls = self.fcc_class_of(class)?;
                 let nv = self.eval(name)?;
                 let mn = match nv {
-                    Value::Str(s) => Self::nul_trunc(&crate::value::lossy(&s)),
+                    Value::Str(s) => Self::nul_trunc(&crate::value::lossy(&s)).to_string(),
                     _ => {
                         return self.fail(PhpError::uncaught(
                             "Error",
@@ -1589,6 +1603,7 @@ impl<'a> Interp<'a> {
                     throwable: std::cell::Cell::new(None),
                     flat_props: std::cell::OnceCell::new(),
                     prop_slot: std::cell::OnceCell::new(),
+                    method_ic: std::cell::RefCell::new(None),
                     statics: std::cell::RefCell::new(std::collections::HashMap::new()),
                     statics_init: std::cell::RefCell::new(false),
                 }));

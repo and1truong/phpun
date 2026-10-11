@@ -121,6 +121,7 @@ impl<'a> Interp<'a> {
                 throwable: std::cell::Cell::new(None),
                 flat_props: std::cell::OnceCell::new(),
                 prop_slot: std::cell::OnceCell::new(),
+                method_ic: std::cell::RefCell::new(None),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });
@@ -2767,6 +2768,7 @@ impl<'a> Interp<'a> {
                 throwable: std::cell::Cell::new(None),
                 flat_props: std::cell::OnceCell::new(),
                 prop_slot: std::cell::OnceCell::new(),
+                method_ic: std::cell::RefCell::new(None),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });

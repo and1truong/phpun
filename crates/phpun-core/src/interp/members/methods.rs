@@ -1810,7 +1810,16 @@ impl<'a> Interp<'a> {
         } else {
             self.eval(obj)?
         };
-        let mn = Self::nul_trunc(&self.prop_name(name)?);
+        // Literal names borrow — prop_name/nul_trunc allocate only
+        // for dynamic names or NUL-carrying spellings.
+        let mraw;
+        let mn = match name {
+            crate::ast::PropName::Name(s) => Self::nul_trunc(s),
+            _ => {
+                mraw = self.prop_name(name)?;
+                Self::nul_trunc(&mraw)
+            }
+        };
         match ov {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {
@@ -1818,9 +1827,9 @@ impl<'a> Interp<'a> {
                 // Zend binds the method at INIT_METHOD_CALL — before
                 // argument evaluation — so a missing method with no
                 // __call fallback fatals before any argument runs.
-                let fm = self.find_method_in(&cls, &mn);
+                let fm = self.find_method_in(&cls, mn);
                 if fm.is_none()
-                    && self.scope_private_method(&mn).is_none()
+                    && self.scope_private_method(mn).is_none()
                     && self.find_method_in(&cls, "__call").is_none()
                 {
                     return self.fail(PhpError::uncaught(
@@ -1834,9 +1843,9 @@ impl<'a> Interp<'a> {
                     .as_ref()
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals = self.arg_cells(args, &params, &mn, false, site, false, names_ok)?;
+                let argvals = self.arg_cells(args, &params, mn, false, site, false, names_ok)?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
-                self.method_invoke_vis(o.clone(), &mn, argvals, fm)
+                self.method_invoke_vis(o.clone(), mn, argvals, fm)
             }
             Value::Null => {
                 if nullsafe {
@@ -1856,7 +1865,7 @@ impl<'a> Interp<'a> {
                     _ => vec![],
                 };
                 let argvals =
-                    self.arg_cells(args, &params, &mn, false, site, false, !params.is_empty())?;
+                    self.arg_cells(args, &params, mn, false, site, false, !params.is_empty())?;
                 // `$f->__invoke()` runs the internal Closure::__invoke —
                 // diagnostics name `Closure::__invoke` and drop the
                 // ", called in" suffix (closure_059).
@@ -1869,7 +1878,7 @@ impl<'a> Interp<'a> {
                 // `$fn->call($newThis, ...$args)`: bind with an omitted
                 // scope then invoke — previous scope preserved when the
                 // new instance is compatible (closure_036/038).
-                let argvals = self.arg_cells(args, &[], &mn, false, site, false, false)?;
+                let argvals = self.arg_cells(args, &[], mn, false, site, false, false)?;
                 let mut ca = argvals;
                 let newthis = ca
                     .cells
@@ -1892,7 +1901,7 @@ impl<'a> Interp<'a> {
                 self.call_value(&Value::Callable(c), ca)
             }
             Value::Callable(c) if mn.eq_ignore_ascii_case("bindto") => {
-                let argvals = self.arg_cells(args, &[], &mn, false, site, false, false)?;
+                let argvals = self.arg_cells(args, &[], mn, false, site, false, false)?;
                 let this = argvals.cells.first().map(|c| c.borrow().clone());
                 let scope = argvals.cells.get(1).map(|c| c.borrow().clone());
                 let new_this = match &this {
@@ -4071,6 +4080,7 @@ impl<'a> Interp<'a> {
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
+                        method_ic: std::cell::RefCell::new(None),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     })

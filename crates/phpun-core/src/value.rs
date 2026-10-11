@@ -2010,10 +2010,20 @@ pub struct PhpClass {
     /// Storage key → `flat_props` index, filled alongside `flat_props`:
     /// routes `prop_get`/`prop_insert` to `PhpObject.slots`.
     pub prop_slot: std::cell::OnceCell<Rc<HashMap<String, usize>>>,
+    /// 1-entry `find_method_in` memo: (name as looked up, resolution —
+    /// `None` is a cached miss). ponytail: polymorphic sites thrash a
+    /// single slot; upgrade is a small name-keyed map on the class.
+    pub method_ic: MethodIc,
     /// `self::$prop` storage, initialized lazily from declared defaults.
     pub statics: RefCell<HashMap<String, Cell>>,
     pub statics_init: RefCell<bool>,
 }
+
+/// `(method decl, declaring class)` as `find_method_in` resolves it;
+/// `None` = cached miss.
+pub type MethodHit = Option<(Rc<crate::ast::MethodDecl>, Rc<PhpClass>)>;
+/// 1-entry `(looked-up name, hit)` memo slot on `PhpClass`.
+pub type MethodIc = RefCell<Option<(String, MethodHit)>>;
 
 /// One entry of the flattened declared-prop layout: the storage key
 /// (mangled `\0Cls\0name` for private slots, else the plain name)

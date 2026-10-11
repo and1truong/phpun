@@ -1251,7 +1251,7 @@ impl<'a> Interp<'a> {
                 let cls = s.class_of(class)?;
                 let nv = s.eval(name)?;
                 let n = match nv {
-                    Value::Str(v) => Self::nul_trunc(&crate::value::lossy(&v)),
+                    Value::Str(v) => Self::nul_trunc(&crate::value::lossy(&v)).to_string(),
                     _ => {
                         return s.fail(PhpError::uncaught(
                             "Error",

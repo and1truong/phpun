@@ -3225,14 +3225,29 @@ impl<'a> Interp<'a> {
         cls: &Rc<PhpClass>,
         name: &str,
     ) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
+        // Monomorphic probe: class-keyed resolution is stable (methods
+        // can't be added post-registration), so the last lookup hits.
+        {
+            let ic = cls.method_ic.borrow();
+            if let Some((n, hit)) = ic.as_ref() {
+                if n.eq_ignore_ascii_case(name) {
+                    return hit.clone();
+                }
+            }
+        }
         let mut cur = Some(cls.clone());
+        let mut out = None;
         while let Some(c) = cur {
             if let Some(m) = c.decl.find_method(name) {
-                return Some((m, c));
+                out = Some((m, c));
+                break;
             }
             cur = self.parent_of(&c);
         }
-        None
+        if let Ok(mut ic) = cls.method_ic.try_borrow_mut() {
+            *ic = Some((name.to_string(), out.clone()));
+        }
+        out
     }
 
     /// get_class_methods: the class's own methods first, then each

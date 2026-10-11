@@ -411,6 +411,7 @@ impl<'a> Interp<'a> {
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
+                        method_ic: std::cell::RefCell::new(None),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     }),
@@ -3806,6 +3807,7 @@ impl<'a> Interp<'a> {
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
+                        method_ic: std::cell::RefCell::new(None),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
                     }),
@@ -4013,8 +4015,8 @@ impl<'a> Interp<'a> {
 
     /// Zend method names are C strings — a NUL byte truncates the
     /// name (`"\0"` invokes `""`; bug46238).
-    pub(in crate::interp) fn nul_trunc(s: &str) -> String {
-        s.split('\0').next().unwrap_or_default().to_string()
+    pub(in crate::interp) fn nul_trunc(s: &str) -> &str {
+        s.split('\0').next().unwrap_or_default()
     }
 }
 
