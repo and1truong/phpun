@@ -2014,6 +2014,9 @@ pub struct PhpClass {
     /// `None` is a cached miss). ponytail: polymorphic sites thrash a
     /// single slot; upgrade is a small name-keyed map on the class.
     pub method_ic: MethodIc,
+    /// name()'s truncated display form — the input (decl.name) never
+    /// changes after registration, so the split/scan runs once.
+    pub short_name: std::cell::OnceCell<Box<str>>,
     /// `self::$prop` storage, initialized lazily from declared defaults.
     pub statics: RefCell<HashMap<String, Cell>>,
     pub statics_init: RefCell<bool>,
@@ -2044,17 +2047,27 @@ impl PhpClass {
     pub fn name(&self) -> &str {
         // Anonymous classes carry a `\0FILE:LINE$SEQ` mangled suffix
         // (or the older `$LINE` uniquifier) internally; the public
-        // display name truncates at the marker.
-        let n = self.decl.name.split('\0').next().unwrap_or(&self.decl.name);
-        // Ordinary names cannot contain the anonymous-class marker.
-        if !n.contains('@') {
-            return n;
-        }
-        if let Some(pos) = n.find("@anonymous$") {
-            &n[..pos + "@anonymous".len()]
-        } else {
-            n
-        }
+        // display name truncates at the marker. Memoized — decl.name
+        // is fixed at registration.
+        self.short_name
+            .get_or_init(|| {
+                let n = self
+                    .decl
+                    .name
+                    .split('\0')
+                    .next()
+                    .unwrap_or(&self.decl.name);
+                // Ordinary names cannot contain the anonymous-class marker.
+                if !n.contains('@') {
+                    return n.into();
+                }
+                if let Some(pos) = n.find("@anonymous$") {
+                    n[..pos + "@anonymous".len()].into()
+                } else {
+                    n.into()
+                }
+            })
+            .as_ref()
     }
 
     /// Method lookup walking the parent chain.

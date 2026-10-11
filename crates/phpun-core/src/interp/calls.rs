@@ -1604,6 +1604,7 @@ impl<'a> Interp<'a> {
                     flat_props: std::cell::OnceCell::new(),
                     prop_slot: std::cell::OnceCell::new(),
                     method_ic: std::cell::RefCell::new(None),
+                        short_name: std::cell::OnceCell::new(),
                     statics: std::cell::RefCell::new(std::collections::HashMap::new()),
                     statics_init: std::cell::RefCell::new(false),
                 }));
