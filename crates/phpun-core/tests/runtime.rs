@@ -642,6 +642,16 @@ class ThrowableCtorProbe extends Exception {
     function __construct() { parent::__construct('engine'); echo $this->getMessage(), "\n"; }
 }
 new ThrowableCtorProbe;
+class PrivatePromotionBase {
+    function __construct(private int $x) {}
+    function baseValue() { return $this->x; }
+}
+class PrivatePromotionChild extends PrivatePromotionBase {
+    private int $x = 99;
+    function childValue() { return $this->x; }
+}
+$collision = new PrivatePromotionChild(7);
+echo 'private ', $collision->baseValue(), ' ', $collision->childValue(), "\n";
 "#,
         &[],
     );
@@ -689,6 +699,7 @@ negative
 default 12
 native 2
 engine
+private 7 99
 "#
     );
     assert_eq!(err, "");
