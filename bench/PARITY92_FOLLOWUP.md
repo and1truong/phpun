@@ -812,3 +812,37 @@ raw timings, physical requests/copies, PHPT maps and standalone resource
 rechecks are in data/92/parity/oct11/trace-* and borrow-*. #237 remains open.
 This rules out copy-byte counts as sufficient evidence for the next tier;
 method teardown and removing repeated scalar call/dispatch work remain next.
+
+## Receiver teardown guard (#239)
+
+Runtime75e78c5, parent#238 runtime9d1544f (trace prototypes reverted). Skip
+frame object-cell vector/hashmap bookkeeping only when the receiver has an
+owner beyond this frame's raw handle+$this cell and no other frame object
+cell/arg/alias must be considered. Other frames use the shared destructor
+pass. ONE runnable WeakReference/object-arg/TypeError/named-call ownership
+check covers normal returns, fallback and owner release.
+
+Workspace7core/22runtime/19format checks,fm/clippy,23 VM/arena/receiver
+script+19workload PHP byte gates,measure/http-load/VM-profile checks pass.
+3406PHPT comparable2727pass603fail25skip38unsupported6crash7timeout.
+Only range_bug71132 timeout→crash relative parent, known pathological
+range near INT_MIN. Initial misconfigured SKIPIF-under-SUT map retained
+separately; all3406 rerun with --sut candidate/--php native reference.
+No gain claim from altered skip conditions.
+
+Seven isolated alternating profiler-off pairs, PHP exit/stdout/stderr gate:
+
+| Workload | Parent/candidate median ms | Candidate/parent |
+|---|---:|---:|
+| objects5×5000 | 253.969/231.728 | 0.912 |
+| objects20×5000 | 1008.835/960.085 | 0.952 |
+| profile objects norm10 | 6.335/6.319 | 0.997 |
+| profile objects ctor10 | 6.492/6.370 | 0.981 |
+| fib26 | 135.418/134.564 | 0.994 |
+| app100,20 | 41.583/35.356 | 0.850 |
+| Composer | 7.892/7.738 | 0.980 |
+
+Separate physical objects20×5000 requests14463259→13463260(−6.9%),
+bytes465086016→388949018(−16.4%). Object allocations still100000,
+remaining storage/GC work not solved. No broad parity claim or multiplying
+step ratios; raw timings/hashes/maps/correction source in oct11/receiver-*.
