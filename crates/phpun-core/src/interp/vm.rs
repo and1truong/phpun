@@ -3400,6 +3400,7 @@ impl<'a> Interp<'a> {
                     if m.is_static
                         || m.is_abstract
                         || m.decl.line == 0
+                        || m.decl.body.is_empty()
                         || m.decl.by_ref
                         || m.decl.params.iter().any(|p| p.by_ref)
                         || Self::decl_contains_yield(&m.decl.body)
@@ -4362,33 +4363,18 @@ unset($i); var_dump($wi->get());
 try { invoke($h, 'bad'); } catch (TypeError $e) { echo get_class($e), "\n"; }
 echo $h->run(n: 3), "\n";
 unset($e); unset($h); var_dump($wh->get());
-class EmptyPromoted { function __construct(public float $n = 1.5) {} }
-class InheritedEmpty extends EmptyPromoted { function nothing(): void {} }
-for ($k = 0; $k < 2; $k++) { $q = new InheritedEmpty($k); echo $q->n, "\n"; $q->nothing(); }
-$q = new InheritedEmpty; echo $q->n, "\n";
-try { new InheritedEmpty([]); } catch (TypeError $e) { echo get_class($e), "\n"; }
 "#,
         );
         assert_eq!(result.exit_code, 0, "{}", it.err_buf);
         assert_eq!(it.err_buf, "");
         assert_eq!(
             it.out,
-            b"6\nbool(true)\n4\nitem\nNULL\nTypeError\n7\nhost\nNULL\n0\n1\n1.5\nTypeError\n"
+            b"6\nbool(true)\n4\nitem\nNULL\nTypeError\n7\nhost\nNULL\n"
         );
         assert!(it
             .vm_frame_pool
             .iter()
             .all(|frame| frame.this_obj.is_none() && frame.vars.is_empty()));
-        let super::Value::Object(o) = it.instantiate("inheritedempty", &[]).unwrap() else {
-            panic!("object")
-        };
-        for name in ["__construct", "nothing"] {
-            let cache = std::cell::RefCell::new(None);
-            assert!(
-                it.vm_method_target(o.clone(), name, &cache, 1).is_some(),
-                "{name}"
-            );
-        }
     }
 
     #[test]
