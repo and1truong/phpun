@@ -395,8 +395,7 @@ pub struct Interp<'a> {
     vm_frame_pool: Vec<Box<Frame>>,
     /// Popped trace frames — keeps String/Vec capacity alive so the
     /// steady-state call path stops allocating (`site`/`post` phases).
-    #[allow(clippy::vec_box)]
-    trace_pool: Vec<Box<crate::value::TraceFrame>>,
+    trace_pool: Vec<crate::value::TraceFrame>,
     classes: crate::value::FxMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
     pub traits: HashMap<String, Rc<ClassDecl>>,
@@ -682,8 +681,7 @@ pub struct Interp<'a> {
     /// Process-wide anonymous-class sequence (`$0`, `$1`, ...).
     anon_class_seq: u64,
     /// Live call stack (user + builtin) for getTrace() snapshots.
-    #[allow(clippy::vec_box)]
-    call_trace: Vec<Box<TraceFrame>>,
+    call_trace: Vec<TraceFrame>,
     /// Pending fatal error message for exceptions raised as PhpError.
     res_counter: u64,
     shutdown_fns: Vec<(Value, Vec<Cell>)>,
@@ -1412,13 +1410,6 @@ struct GcScan {
 }
 
 impl<'a> Interp<'a> {
-    /// Builtin/engine frames share the stable shell pool with compiled calls.
-    pub(in crate::interp) fn trace_push(&mut self, frame: TraceFrame) {
-        let mut shell = self.trace_pool.pop().unwrap_or_default();
-        *shell = frame;
-        self.call_trace.push(shell);
-    }
-
     /// zend pops the trace frame on return; the shell goes back to the
     /// pool so the next call_site_frame reuses its allocations.
     pub(in crate::interp) fn trace_pop(&mut self) {
@@ -7776,7 +7767,7 @@ impl<'a> Interp<'a> {
                     .collect(),
             ),
         };
-        self.trace_push(TraceFrame {
+        self.call_trace.push(TraceFrame {
             args_frame: None,
             function: name.to_string().into(),
             class: None,
@@ -8501,7 +8492,7 @@ impl<'a> Interp<'a> {
             // `#0 %s(%d): [constant expression]()`).
             let const_frame = self.class_const_ctx > 0;
             if const_frame {
-                self.trace_push(TraceFrame {
+                self.call_trace.push(TraceFrame {
                     args_frame: None,
                     function: "[constant expression]".to_string().into(),
                     class: None,
