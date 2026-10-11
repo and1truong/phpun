@@ -510,7 +510,7 @@ impl Program {
             return None;
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(e.bytes.as_ptr(), code.cast::<u8>(), len);
+            std::ptr::copy_nonoverlapping(e.bytes.as_ptr(), code.cast::<u8>(), e.bytes.len());
             if libc::mprotect(code, len, libc::PROT_READ | libc::PROT_EXEC) != 0 {
                 libc::munmap(code, len);
                 return None;
