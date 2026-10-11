@@ -3971,6 +3971,29 @@ var_dump($count, $b[2], $c[0]);
             };
             assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
         }
+        let mut append = Interp::new("packed-append.php");
+        let stmts = crate::parser::parse_source(
+            r#"<?php
+$a=[];for($i=0;$i<8;$i++)$a[]=$i*2;
+$b=$a;$b[]=99;
+$c=$a;$r=&$c[2];$r=7;
+$d=[];$d[]=1;$d['x']=2;$d[]=3;
+echo json_encode([$a,$b,$c,$d]),"\n";
+"#,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            append.exec_block(&stmts),
+            super::super::Flow::Normal
+        ));
+        assert_eq!(append.out, b"[[0,2,4,6,8,10,12,14],[0,2,4,6,8,10,12,14,99],[0,2,7,6,8,10,12,14],{\"0\":1,\"x\":2,\"1\":3}]\n");
+        for (name, inline) in [("a", true), ("b", true), ("c", false), ("d", false)] {
+            let super::Value::Array(a) = append.globals.vars[name].borrow().clone() else {
+                panic!("array");
+            };
+            assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
+        }
         let mut regions = Interp::new("bool-regions.php");
         let result = regions.run_source(
             r#"<?php

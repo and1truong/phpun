@@ -77,8 +77,8 @@ const IDX_MIN: usize = 48;
 
 /// Dense scalar tables keep values inline. Exporting Cell handles or using
 /// a canonical Vec mutator materializes the same ordered Cell table once.
-/// ponytail: only zero-based scalar fills start packed; other producers and
-/// reference/mixed mutators retain Cells until measured storage work extends it.
+/// ponytail: scalar fills and dense scalar appends start packed; exported
+/// references/mixed mutators retain Cells, extend other producers only with measured gates.
 #[derive(Debug)]
 pub struct ArrayEntries(ArrayStorage);
 
@@ -187,6 +187,26 @@ impl ArrayEntries {
             _ => None,
         })
     }
+    fn append_packed_scalar(&mut self, value: &Value) -> bool {
+        if !matches!(
+            value,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        ) {
+            return false;
+        }
+        if matches!(&self.0, ArrayStorage::Cells(c) if c.is_empty()) {
+            *self = Self::packed(Vec::new());
+        }
+        let ArrayStorage::Packed(p) = &mut self.0 else {
+            return false;
+        };
+        let Some(values) = p.scalar.get_mut().as_mut() else {
+            return false;
+        };
+        values.push(value.clone());
+        true
+    }
+
     pub(crate) fn store_packed_scalar(&mut self, key: i64, value: &Value) -> bool {
         if key < 0
             || !matches!(
@@ -544,7 +564,26 @@ impl PhpArray {
         self.pos_of(k).map(|p| self.entries[p].1.clone())
     }
 
+    /// Dense scalar append needs no exported Cell. References/mixed storage keep the original path.
+    pub(crate) fn push_packed_scalar(&mut self, value: &Value) -> bool {
+        if !self.packed || i64::try_from(self.entries.len()).ok() != Some(self.next) {
+            return false;
+        }
+        let Some(next) = self.next.checked_add(1) else {
+            return false;
+        };
+        if !self.entries.append_packed_scalar(value) {
+            return false;
+        }
+        self.next = next;
+        self.mem_note_append();
+        true
+    }
+
     pub fn push(&mut self, v: Value) {
+        if self.push_packed_scalar(&v) {
+            return;
+        }
         let k = ArrKey::Int(self.next);
         self.mem_note_key(&k);
         alloc_hit(9);
@@ -567,6 +606,9 @@ impl PhpArray {
             if self.entries.store_packed_scalar(*i, &v) {
                 return;
             }
+        }
+        if matches!(&k, ArrKey::Int(i) if *i == self.next) && self.push_packed_scalar(&v) {
+            return;
         }
         alloc_hit(9);
         self.set_cell(k, Rc::new(RefCell::new(v)));

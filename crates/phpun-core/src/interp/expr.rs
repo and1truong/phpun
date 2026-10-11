@@ -6279,6 +6279,33 @@ impl<'a> Interp<'a> {
                 }
                 continue;
             }
+            // Root-variable append after all existing container/detach gates.
+            // Scalar tables cannot run a PHP callback during CoW or the store.
+            if n == 0
+                && last == 0
+                && k.is_none()
+                && rhs_late.is_none()
+                && !compound
+                && !self.detached_dim
+                && !self.in_handler
+                && self.dim_throw.is_none()
+                && !self.is_ref_cell(&c)
+                && det.is_some_and(|d| !Self::is_superglobal(&d.name))
+                && matches!(
+                    &v,
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+                )
+                && matches!(&*c.borrow(), Value::Array(a) if a.borrow().packed
+                    && (a.borrow().entries.is_scalar_packed() || a.borrow().entries.is_empty()))
+            {
+                let mut b = c.borrow_mut();
+                self.cow_split(&mut b);
+                if let Value::Array(a) = &*b {
+                    if a.borrow_mut().push_packed_scalar(&v) {
+                        return Ok(v);
+                    }
+                }
+            }
             // An existing packed scalar has no exported Cell or typed-slot
             // owner. Keep the validated final write inline; deferred RHS,
             // detached operands and compound writes use the canonical fetch.
