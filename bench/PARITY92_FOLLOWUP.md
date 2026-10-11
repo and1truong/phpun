@@ -956,3 +956,40 @@ JSON+1.4%,app+0.7%,Composer+2.5% retained; other non-target changes are not
 broad wins. Full suite still far from parity, user's2.71× remains separate.
 Exact fixed hash/config/raw samples and P1 before/after sources are in
 native-fixed-*; no pre-fix dataset relabelled as fixed.
+
+## #243: borrow pinned constructor parameter metadata (2026-10-11)
+
+The resolved Rc<Method> keeps its immutable declaration alive during shared
+argument binding. Borrow its parameter slice instead of cloning the complete
+Vec<Param> for every construction; inherited-owner diagnostics and the same
+named/by-reference/default/promoted/type binder remain in place. Runtime ac3d7dd
+(6 additions/4 deletions in expr.rs); fresh release inherits P1 fix be0e810.
+Existing promoted-slot binding test covers the shared constructor path.
+
+Seven isolated profiler-off alternating fixed-parent/candidate PHP byte gates:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/40-objects.php | 249.202/245.316 | 0.984 |
+| bench/40-objects.php 20 5000 | 980.168/989.296 | 1.009 |
+| bench/10-fib.php | 8.809/8.520 | 0.967 |
+| bench/30-arrays.php | 174.942/173.068 | 0.989 |
+| bench/app/cli.php 100 20 | 36.882/36.158 | 0.980 |
+| examples/composer/run.php | 8.719/8.232 | 0.944 |
+
+Objects31 follow-up248.653→242.777ms (−2.4%); long20×5000
+988.904→983.079ms (−0.6%, effectively flat). The preliminary pre-copy-fix
+−6.7%/−5.2% object medians are retained as exploratory evidence, **not current
+speed claims**. This change reduces allocation cost; it does not close the
+large object gap or establish broad application/PHP parity.
+
+Separate instrumented100000-construction probe: physical requests13,463,260
+→12,763,259 (−700,001/~5.2%), requested bytes388,949,018→320,686,734
+(−17.6%); obj_new100000 and cell994898 events unchanged. These are allocation
+requests/bytes, not CPU time; neither timings nor native mmap bytes are counted
+as malloc measurements. Both probe outputs match PHP. Fresh gates below.
+
+Workspace/fmt/clippy and fresh25script+19workload byte/exit/error gates,
+VM-profile pass. Full3406PHPT2727pass603fail25skip38unsupported6crash7timeout;
+individual status changes vs fixed native parent: {"/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": ["crash", "timeout"], "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": ["timeout", "crash"]}.
+Existing failures/resource limits retained. External CI not yet green.

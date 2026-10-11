@@ -1,0 +1,38 @@
+{
+  "runtime": "ac3d7dde6a2792a8ab232f11c7127a38eea625ce + inherited native-copy fix be0e810",
+  "build_source": "8a9534f; documentation/merge-only descendants",
+  "sha256": {
+    "native-fixed": "6780a3fe1a8e5cfea823849b335b06086fa53cc1f270b03e2f070dfb9e055442",
+    "ctor-fixed": "78e4b18ef8f4d0c16393fb3a0bed0421ea9764478c2f7e1c35d451c73509eac0"
+  },
+  "dirty": "Only untracked vendor symlink; tracked runtime source clean",
+  "build": "Rust1.99.0; clean phpun-core before worktree switch; release LTO/codegen-units1; tests/fmt/clippy pass",
+  "timing": "Fresh 7 alternating pairs + isolated31 follow-up; stdout/stderr/exit byte-identical nativePHP8.5.11 -n; profilers off",
+  "negative_trial": "ctor-fixed-invalid-argv-partial: second workload invalid mode20 rejected by PHP. One completed default row retained separately, excluded from final claims. Correct argv rerun from scratch.",
+  "prior_trial": "ctor-timings pre-native-copy-fix; exploratory only, superseded by fresh fixed measurements.",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes": {
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": [
+      "crash",
+      "timeout"
+    ],
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": [
+      "timeout",
+      "crash"
+    ]
+  },
+  "gates": "workspace/fmt/clippy;25script+19workload byte/exit/stderr gates;VM-profile;3406PHPT"
+}
