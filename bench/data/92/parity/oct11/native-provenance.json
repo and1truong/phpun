@@ -1,0 +1,37 @@
+{
+  "configuration": {
+    "opcache_loaded": true,
+    "opcache.enable_cli": "0",
+    "opcache.jit": "disable"
+  },
+  "php_hash": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f",
+  "parent_runtime": "75e78c55e4eee0da2113bebad435e4a9f81d7f8a",
+  "artifacts": {
+    "initial": {
+      "runtime": "83e0b387901ca5e86edb0dab9fbe944d961b2755",
+      "binary": "native-integers-initial",
+      "sha256": "f77f53c78acd3252eb71c0b6ba3c96c4c0b54c306bc9d4f3d4b4e1e4bc019f43"
+    },
+    "cache-map": {
+      "runtime": "3ca4ca745a508fad04a503ebfb3325d35b01a2ad",
+      "binary": "native-integers-cache-map",
+      "sha256": "1c534ea7bdcfebf1392d6567986756a63edf74695398010bfc09da62f052a09b"
+    },
+    "decl-cache": {
+      "runtime": "b4db7bac29ef95246b611c3b96d77a4fb6dde4de",
+      "binary": "native-integers-decl-cache",
+      "sha256": "373bfabee8365542efeedfca8aa2f6fb4de5e212e803e6fe739894481719ff9e"
+    },
+    "final": {
+      "runtime": "d089dbba522fd3db1b8bb8b585ab21daf5fd4cb9",
+      "binary": "native-integers",
+      "sha256": "b8cef882690a994e21eddf4b2eda33538f170c5bef99c0f719c4bc5cdf61a15e"
+    }
+  },
+  "raw_label_correction": "Copied timing script retained native_runtime=83e0b38 for later artifacts; exact runtime mappings above, stack_source and binary hashes identify each correctly. Do not relabel the initial negative dataset as final. dirty=true is the untracked vendor symlink; tracked source clean in all timing runs.",
+  "cache_map_startup_exclusion": "Cache-map prototype seven-triplet startup overlapped the 0.175s oracle script batch. This row is retained but excluded from speed claims; final seven-triplet and isolated31 startup do not overlap checks/build/profilers. Other cache-map cases started after that batch ended.",
+  "gate": "workspace8core/22runtime/19format,fm/clippy;25 script+19 workload PHP exit/stdout/stderr gates,VM-profile diagnostics;3406PHPT2727pass603fail25skip38unsupported6crash7timeout. Two preexisting range crash/timeout changes, original maps retained.",
+  "debug_stack": "Initial native guard test overflowed the default2MiB Rust test-thread stack while replaying depth100 through the VM. Test uses32MiB thread stack; CLI depth100 probes byte-gate with both parent and candidate, no production stack change.",
+  "memory": "current arena root already reserved by shared binder; nested same-page spans checked/repaid. Page-growth/depth/uninit/overflow exits disable that native program and replay pure root through VM. W^X mappings<=128KiB code per graph,<=8MiB total live rounded mappings,16funcs/1024ops/256slots/16params and4096 cached declarations. Native code mappings are not malloc counter requests.",
+  "physical_allocation": "fib26 requested allocations32254\u219232269,bytes5979410\u21925983254; not an allocation win. trace_frame392835\u219285 is an event count, not physical allocations or PHP-visible calls."
+}

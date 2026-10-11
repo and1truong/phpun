@@ -846,3 +846,69 @@ Separate physical objects20×5000 requests14463259→13463260(−6.9%),
 bytes465086016→388949018(−16.4%). Object allocations still100000,
 remaining storage/GC work not solved. No broad parity claim or multiplying
 step ratios; raw timings/hashes/maps/correction source in oct11/receiver-*.
+
+## Guarded pure integer native tier (#240)
+
+Final runtime d089dbb, parent runtime75e78c5 (#242). x86_64 Linux only; other
+platforms retain VM. Reuse existing Ops/declaration cache/libc. No fib pattern
+recognizer, memoization or benchmark-specific program. Pure global fixed-arity
+integer call graphs only; no refs/defaults/variadics/attrs/namespaces, canonical
+AST bridges, globals, builtins/introspection, objects/arrays/closures/methods.
+Root binding/trace/return/destruction stay shared. Check integer overflow,
+initialized locals, dependency identity, depth64 and current arena capacity.
+Unwind all nested spans and replay pure root in VM on failure; page growth,
+errors and deadlines retain VM behavior. No observable prefix is replayed.
+Code pages are RW then RX, owned until calls end; code graph bounds and8MiB
+rounded mapped-page budget enforced. Failed mapping/code generation falls back.
+
+ONE runnable actual-native execution witness plus overflow/TypeError/depth/
+uninit/page-capacity replay and clean arena check. Depth100 VM replay needs
+32MiB debug test-thread stack; initial2MiB thread overflow retained as a
+resource limitation, no production stack change.25 PHP script probes include
+mutually recursive graphs, conditional joins, increment/decrement, factorial
+overflow, receiver ownership and160-arg arena growth;19 workloads all byte/
+exit/error gated. Workspace8core/22runtime/19format,fm/clippy and VM-profile
+checks pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout; two
+known range crash/timeout changes relative parent, no new fail/pass change.
+
+Seven rotating native PHP/parent/candidate isolated profiler-off pairs:
+
+| Workload | PHP/parent/native median ms | Native/parent | Native/PHP |
+|---|---:|---:|---:|
+| startup | 3.747/6.167/6.328 | 1.026 | 1.689 |
+| fib26 | 11.461/136.707/8.512 | 0.062 | **0.743** |
+| sieve | 7.265/204.239/216.819 | 1.062 | 29.846 |
+| strings | 13.302/159.997/162.384 | 1.015 | 12.208 |
+| arrays | 16.999/172.540/175.252 | 1.016 | 10.310 |
+| objects | 7.860/251.919/248.384 | 0.986 | 31.600 |
+| regex | 7.570/38.865/39.701 | 1.022 | 5.245 |
+| JSON | 177.883/547.290/561.897 | 1.027 | 3.159 |
+| DB | 28.939/121.728/113.546 | 0.933 | 3.924 |
+| app100,20 | 4.903/34.930/34.251 | 0.981 | 6.986 |
+| Composer | 4.470/7.812/8.517 | 1.090 | 1.905 |
+
+Nine-bench native-host geomean8.060→5.973×PHP;time step0.741 (−25.9%).
+Fib−93.8% and beats native PHP on this host; **full suite is not at parity**,
+not a replacement/extrapolation for the user's2.71× dataset. Negative sieve/
+Composer/JSON medians retained. Isolated31 follow-up: sieve209.919→215.262
+(+2.5%),arrays173.038→172.421(flat),Composer8.109→8.280(+2.1%).
+No other workloads claimed faster from this global-integer tier.
+
+Initial83e0b38 prototype also beats PHP on fib but regresses sieve12.9%,
+arrays5.3%,objects2.6%. Cache moved off Compiled then off Interp to existing
+declaration cache; method/callback VM shells avoid outlined native entry.
+All four artifact hashes, raw negatives and cache-layout trials retained.
+Cache-map startup overlapped a short oracle batch and is excluded from speed
+claims; raw row preserved. Its other rows and final/follow-up timings isolated.
+
+Physical fib26 requests32254→32269,bytes5979410→5983254: no allocation win.
+trace_frame392835→85 is an EVENT count; native inner calls do not create
+observable PHP frames unless VM replay is needed. Mapped executable pages are
+separate from malloc requests. Old OPcache-module-not-loaded description in
+arena manifest corrected: native PHP module is loaded, enable_cli=0,JIT=disable;
+raw PHP hash/config/numeric timings unchanged. Native raw script's stale
+83e0b38 label is corrected by hash→runtime manifest (not rewriting samples).
+
+Next: pinned constructor metadata (#243), pure integer comparator native
+entry before callback frame/binding, then real array/object storage and string
+builtin costs. Parent merges do not block child implementation; no self-merge.
