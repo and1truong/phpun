@@ -1,0 +1,203 @@
+{
+  "source": "3049d578badebd67347eac16d69b6dd0921f29c7",
+  "runtime": "42256afd3849a6cc03e4ea20c49554f009e46c52",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2731,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.69
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "fail",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "pass",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "fail",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "strings100",
+      "before": {
+        "requests": 1298282,
+        "bytes": 94538901
+      },
+      "after": {
+        "requests": 1298282,
+        "bytes": 94538889
+      }
+    },
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 858127,
+        "bytes": 49973368
+      },
+      "after": {
+        "requests": 858127,
+        "bytes": 49973356
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 616041,
+        "bytes": 26544330
+      },
+      "after": {
+        "requests": 616041,
+        "bytes": 26544318
+      }
+    }
+  ],
+  "binary_sha256": "73787429d9801f2c31b923b9d0b2db0bea548e93cb7934893a5979aa14641e83",
+  "scope": "Move the existing guarded top-level scalar builtin path before the pooled argument-vector lease. The unchanged kernel reads the consumed value-stack slice; success truncates the arguments and pushes the result. This removes argument-vector copying for eligible calls without adding a kernel, cache, pool, dependency, or unsafe code.",
+  "fallbacks": "Existing INIT resolution, user overrides, exposed globals, profiler/coverage, type, page, memory-limit, callsite and fatal-frame guards remain. Normal calls retain the original argument-vector path. ONE existing arena check executes nested eligible calls and proves correct output plus no separate argument-vector lease. The inherited full-range substring fix and its source identity/partial-result charge remain.",
+  "serialized_boundary_rechecks": [
+    {
+      "binary": "surviving-object-dtor-review",
+      "label": "gc77345",
+      "result": {
+        "summary": {
+          "total": 1,
+          "passed": 1,
+          "failed": 0,
+          "xfailed": 0,
+          "xpassed": 0,
+          "skipped": 0,
+          "unsupported": 0,
+          "borked": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "applicable": 1,
+          "compatibility_pct": 100.0
+        },
+        "results": [
+          {
+            "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+            "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+            "status": "pass",
+            "reason": "",
+            "duration_ms": 9332
+          }
+        ]
+      }
+    },
+    {
+      "binary": "surviving-object-dtor-review",
+      "label": "generator-send",
+      "result": {
+        "summary": {
+          "total": 1,
+          "passed": 0,
+          "failed": 1,
+          "xfailed": 0,
+          "xpassed": 0,
+          "skipped": 0,
+          "unsupported": 0,
+          "borked": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "applicable": 1,
+          "compatibility_pct": 0.0
+        },
+        "results": [
+          {
+            "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+            "name": "$generator->send() returns the yielded value",
+            "status": "fail",
+            "reason": "",
+            "duration_ms": 9335
+          }
+        ]
+      }
+    },
+    {
+      "binary": "scalar-value-stack-review",
+      "label": "gc77345",
+      "result": {
+        "summary": {
+          "total": 1,
+          "passed": 1,
+          "failed": 0,
+          "xfailed": 0,
+          "xpassed": 0,
+          "skipped": 0,
+          "unsupported": 0,
+          "borked": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "applicable": 1,
+          "compatibility_pct": 100.0
+        },
+        "results": [
+          {
+            "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+            "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+            "status": "pass",
+            "reason": "",
+            "duration_ms": 7785
+          }
+        ]
+      }
+    },
+    {
+      "binary": "scalar-value-stack-review",
+      "label": "generator-send",
+      "result": {
+        "summary": {
+          "total": 1,
+          "passed": 0,
+          "failed": 1,
+          "xfailed": 0,
+          "xpassed": 0,
+          "skipped": 0,
+          "unsupported": 0,
+          "borked": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "applicable": 1,
+          "compatibility_pct": 0.0
+        },
+        "results": [
+          {
+            "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+            "name": "$generator->send() returns the yielded value",
+            "status": "fail",
+            "reason": "",
+            "duration_ms": 9292
+          }
+        ]
+      }
+    }
+  ],
+  "phpt_changes_after_boundary_rechecks": [],
+  "corrected_parent_source": "ea991d4a4b9a825b1d8124c3de41c84f0774bb45",
+  "pre_review_results_are_historical": true
+}

@@ -1,0 +1,14 @@
+[
+  {
+    "name": "surviving-object-dtor-review",
+    "exit": 0,
+    "stdout": "1500000\n1500000\n1500000\n1500000\n1500000\n1500000\n1234\n",
+    "stderr": ""
+  },
+  {
+    "name": "scalar-value-stack-review",
+    "exit": 0,
+    "stdout": "1500000\n1500000\n1500000\n1500000\n1500000\n1500000\n1234\n",
+    "stderr": ""
+  }
+]

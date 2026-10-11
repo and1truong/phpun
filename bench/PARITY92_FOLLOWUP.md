@@ -3248,3 +3248,39 @@ Raw/source/hashes in bench/data/92/parity/oct11/surviving-object-dtor-*.
 ## PR357 P1 review: full-range source identity (2026-10-11)
 
 P1review: full normalized substr reuses source zend_string. Shared borrowed range preserves source Rc/charge when input is string;canonical bytes conversion stays before integer reads,non-string conversion/new partialresults retain originalcharge/trace. mb_strcut trims borrowed boundary before originalValuebytes producer. ONEexistingarena check proves0/negative/oversizedfullranges preservepointer/nocharge. Release54b28f/ELF58266af: original4MB fullrange native/candidateexit0(stdout/stderrbyteexact),oldparentfalseOOM255;canonicalprofilematchesstdout/exit. Originalpartial4MBOOMremainsnativebyteexactinclframe. Workspace/fmt/clippy/native25+19/profilePASS. Full3406onlygenerator timeout→fail;serializedsame10s parent9265/candidate9068ms bothFAIL;full2732pass600fail25skip38unsupported6crash5timeout retained,notcompatgain. No newtimingclaim;oldcohortsretainoriginalfrozenhashes. Complete priorissue92body archivedverbatim beforeconsolidation,withhash/update_at;latestbodygovernsroadmap.
+
+## #360: perf(vm): read exact scalar builtin arguments from the value stack (2026-10-11)
+
+Move the existing guarded top-level scalar builtin path before the pooled argument-vector lease. The unchanged kernel reads the consumed value-stack slice; success truncates the arguments and pushes the result. This removes argument-vector copying for eligible calls without adding a kernel, cache, pool, dependency, or unsafe code.
+
+Existing INIT resolution, user overrides, exposed globals, profiler/coverage, type, page, memory-limit, callsite and fatal-frame guards remain. Normal calls retain the original argument-vector path. ONE existing arena check executes nested eligible calls and proves correct output plus no separate argument-vector lease. The inherited full-range substring fix and its source identity/partial-result charge remain.
+
+Runtime 42256afd3849a6cc03e4ea20c49554f009e46c52; timing source 3049d578badebd67347eac16d69b6dd0921f29c7; report/integration source 3049d578badebd67347eac16d69b6dd0921f29c7.
+
+31 alternating profiler-off PHP8.5.11 -n byte-gated pairs; independent negative confirmation; fresh seven rotating PHP/main/parent/candidate pairs. Physical diagnostics run separately.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 48.608 | 45.250 | 0.9309 |
+| bench/20-strings.php 100 | 214.663 | 200.554 | 0.9343 |
+| bench/40-objects.php | 88.858 | 88.374 | 0.9946 |
+| bench/app/cli.php 100 20 | 32.302 | 33.614 | 1.0406 |
+| bench/60-json.php | 412.455 | 399.642 | 0.9689 |
+
+Corrected-parent 31 pairs: strings 48.608→45.250ms (−6.9%), strings100 214.663→200.554ms (−6.6%); objects −0.5% (flat), JSON −3.1%, app +4.1%. Fresh whole seven: main 3.88537→candidate 2.70542×PHP; candidate/parent −0.87%, strings −6.7%, long strings −8.2%. Objects still 12.126×PHP and long objects 20.128×PHP. Whole negatives: fib +2.1%, sieve +1.7%, DB +4.7%, app +3.2%, long objects +1.7%. Additional 31 negative checks: app +0.6%, DB +1.6%, fib +4.4%, sieve +2.4%; retained as a tradeoff, not dismissed. Initial pre-review cohorts separately retained: target strings −6.4%/long −8.4%, app +3.1%, JSON +2.7%; they do not describe the corrected integration. Physical requests unchanged; a 12-byte diagnostic byte delta is not a heap improvement. Retain the small shared-path change for repeated string benefit; no CPU attribution, multiplication of cohorts, or parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings100: requests 1298282→1298282; bytes 94538901→94538889.
+- objects5: requests 858127→858127; bytes 49973368→49973356.
+- arrays: requests 616041→616041; bytes 26544330→26544318.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Full-range 4MB native and candidate exit/stdout/stderr match; original partial-result 4MB fatal remains byte-identical, including callsite. Canonical profile gates pass.
+All 3406 PHPT statuses compared with the freshly rebuilt, full-range-corrected parent: only GC pass→timeout and the existing generator fail→timeout. Serialized same-10s parent/candidate rechecks: GC PASS (9332/7785ms), generator FAIL (9335/9292ms). Full candidate: 2731 pass, 599 fail, 25 skip, 38 unsupported, 6 crash, 7 timeout. No new status difference after those rechecks; partial compatibility, not a suite pass.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/scalar-value-stack-review-*.
