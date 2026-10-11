@@ -395,8 +395,7 @@ pub(crate) fn dispatch(
                 off.min(len)
             } as usize;
             let mut end = len as usize;
-            if let Some(l) = args.get(3) {
-                let l = l.borrow().to_int();
+            if let Some(l) = nullable_int_arg(args, 3) {
                 end = if l < 0 {
                     (len + l).max(start as i64) as usize
                 } else {

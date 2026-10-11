@@ -426,6 +426,8 @@ foreach (['mb_substr', 'mb_strcut'] as $fn) {
     echo $fn('aé中z', 1, null), ' ', $fn('aé中z', 1), ' ', $fn('aé中z', 1, 0), "|\n";
 }
 echo bin2hex(substr_replace("a\0b\xff", 'X', 1, null)), ' ', bin2hex(substr_replace("a\0b\xff", 'X', 1)), ' ', bin2hex(substr_replace("a\0b\xff", 'X', 1, 0)), "\n";
+echo substr_replace(string:'abcd', replace:'X', offset:1, length:null), "\n";
+foreach (['strspn','strcspn'] as $fn) echo $fn('abba!', 'ab', 1, null), ' ', $fn('abba!', 'ab', 1), ' ', $fn('abba!', 'ab', 1, 0), "\n";
 "#,
         &[],
     );
@@ -460,6 +462,9 @@ cast-error 99
 é中z é中z |
 é中z é中z |
 6158 6158 61580062ff
+aX
+3 3 0
+0 0 0
 "#
     );
     assert_eq!(err, "");

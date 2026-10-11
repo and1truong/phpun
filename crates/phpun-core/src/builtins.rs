@@ -1000,7 +1000,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "substr_replace" => bp!(
             ("string", Req),
             ("replace", Req),
-            ("start", Req),
+            ("offset", Req),
             ("length", Null)
         ),
         "trim" | "ltrim" | "rtrim" => {
