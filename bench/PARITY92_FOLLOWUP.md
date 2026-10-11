@@ -1361,3 +1361,47 @@ Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass;
 all3406individualPHPTstatuses identical to one-value callback parent2727pass
 603fail25skip38unsupported6crash7timeout. Explicit release clean/rebuild.
 ExternalCI not assertedgreen. Next #262 ordinary user-method dispatcher.
+
+## #262: skip engine-family interception for ordinary PHP methods (2026-10-11)
+
+After canonical visibility/private target resolution, a concrete PHP method
+on a declared ordinary root PHP class with no parent/interfaces cannot be a
+native-family method. Invoke the same shared user method/binder directly.
+Internal/inherited/interface/abstract/missing cases keep the old dispatcher.
+No shape cache, changed promotion/write/type/frame/trace/GC protocol.
+Runtime3a206b5,25add/1delete including ONE existing promoted check extended
+for ArrayIterator and Throwable ancestor/override fallback.
+Separate objectCPUprofile1965samples/zero lost: method_invoke_pre34.66%
+inclusive/invoke_method25.29%inclusive; these overlap, never add them.
+Raw perf.data kept locally with published hash/symbol report.
+
+Seven alternating isolated profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/40-objects.php | 216.377/204.803 | 0.947 |
+| bench/40-objects.php 20 5000 | 878.917/776.039 | 0.883 |
+| bench/profile/objects.php ctor 5000 | 46.372/41.161 | 0.888 |
+| bench/profile/objects.php norm 5000 | 64.179/52.910 | 0.824 |
+| bench/30-arrays.php | 85.430/87.929 | 1.029 |
+| bench/20-strings.php | 122.554/119.472 | 0.975 |
+| bench/11-sieve.php | 76.768/74.809 | 0.974 |
+| bench/10-fib.php | 8.066/8.038 | 0.997 |
+| bench/app/cli.php 100 20 | 34.175/34.130 | 0.999 |
+| examples/composer/run.php | 8.458/8.291 | 0.980 |
+
+31pairs for target noise and initial arrays+2.9% negative:
+
+- bench/40-objects.php: 224.207/197.116ms (0.879).
+- bench/30-arrays.php: 88.177/85.875ms (0.974).
+
+Objectsdefault31−12.1%,long7−11.7%,ctorphase−11.2%,normphase−17.6%.
+Physical100kobjectrequests10,863,260→8,763,260 (−2,100,000/~19.3%),
+bytes302,289,539→285,089,519 (−5.7%). Initial arrays+2.9% retained,
+31followup−2.6%; no nontarget attribution or object/suite PHP parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+extended
+promoted/native ancestor PHP byte gates andVM-profile pass. All3406individual
+PHPTstatuses identical to parent2727pass603fail25skip38unsupported6crash
+7timeout. Explicit release clean/rebuild;externalCI not assertedgreen.
+Next #263 checked remainder/proven bool native roots; #264 no-target scalar
+GC cells; #266 Weak liveness; #267 shared scalar builtin kernels.
