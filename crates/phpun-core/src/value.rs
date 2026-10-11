@@ -114,9 +114,6 @@ impl ArrayEntries {
             Vec::capacity,
         )
     }
-    pub fn clone(&self) -> Vec<(ArrKey, Cell)> {
-        std::ops::Deref::deref(self).clone()
-    }
     fn packed_clone(&self) -> Option<Vec<Value>> {
         self.scalar.borrow().clone()
     }
