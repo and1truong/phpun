@@ -1,0 +1,50 @@
+{
+  "source": "651422f61514b552a6198428d5ff51a03f988464",
+  "runtime": "33876df32ef544eb799b126d0e567793e0a1de3e",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 8,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "strings",
+      "before": {
+        "requests": 617503,
+        "bytes": 29057534
+      },
+      "after": {
+        "requests": 617501,
+        "bytes": 29057516
+      }
+    }
+  ],
+  "binary_sha256": "131fd0801bb105d8e4b269f29cf4c043221fa8a7ac59e121a2545fd886e1ea60",
+  "scope": "For a bounded known list of string/math/JSON/regex names, select the existing original extension dispatcher directly. All other names retain the FAMILIES scan. Same kernel implementation and shared deferred cast-error handling, no duplicate algorithms.",
+  "fallbacks": "Canonical builtin binder/frame/ZPP/by-ref/diagnostics remain; namespaced/user resolution happens before this builtin root. No argument ABI or memory/GC changes. Existing shared string and private collision runnable checks reused."
+}
