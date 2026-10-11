@@ -6,6 +6,8 @@
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(in crate::interp) mod native;
 
+mod bool_loop;
+
 use std::cmp::Ordering;
 use std::rc::Rc;
 
@@ -174,6 +176,10 @@ struct CachedProp {
 }
 
 enum Op {
+    BoolLoop {
+        end: usize,
+        executions: std::cell::Cell<u64>,
+    },
     Const(Value),
     /// Shared AST expression implementation; slots and frame vars alias.
     Canonical(Box<Expr>),
@@ -850,6 +856,10 @@ impl Compiler {
                 inc,
                 body,
             } => {
+                let region = self.emit(Op::BoolLoop {
+                    end: 0,
+                    executions: std::cell::Cell::new(0),
+                });
                 for e in init {
                     self.expr(e)?;
                     self.emit(Op::Pop);
@@ -884,6 +894,11 @@ impl Compiler {
                 }
                 if let Some(jf) = jf {
                     self.patch(jf, end);
+                }
+                if bool_loop::eligible(&self.ops[region + 1..end]) {
+                    if let Op::BoolLoop { end: target, .. } = &mut self.ops[region] {
+                        *target = end;
+                    }
                 }
             }
             Stmt::Break(level) | Stmt::Continue(level) => {
@@ -2087,6 +2102,18 @@ impl<'a> Interp<'a> {
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
+                Op::BoolLoop { end, executions } => {
+                    if *end > pc && vs.is_empty() {
+                        if let Some(line) = self.vm_bool_loop(comp, slots, pc + 1, *end)? {
+                            executions.set(executions.get().saturating_add(1));
+                            self.cur_line = line;
+                            self.send_line = None;
+                            self.last_ret_cell = None;
+                            pc = *end;
+                            continue;
+                        }
+                    }
+                }
                 Op::Const(v) => vs.push(v.clone()),
                 Op::Foreach {
                     arr,
@@ -3926,6 +3953,38 @@ var_dump($count, $b[2], $c[0]);
             };
             assert_eq!(a.borrow().entries.is_scalar_packed(), inline, "{name}");
         }
+        let mut regions = Interp::new("bool-regions.php");
+        let result = regions.run_source(
+            r#"<?php
+function typed_region() {
+ $a=array_fill(0, 12, true);
+ for ($i=2; $i<12; $i++) { for ($j=$i*2; $j<12; $j+=$i) $a[$j]=false; }
+ $count=0; for ($i=2; $i<12; $i++) if ($a[$i]) $count++;
+ return $count;
+}
+function shared_region() {
+ $a=array_fill(0, 4, true); $copy=$a;
+ for ($i=0; $i<4; $i++) $a[$i]=false;
+ return json_encode([$a,$copy]);
+}
+function overflow_region() {
+ $a=[true]; $v=PHP_INT_MAX;
+ for ($i=0; $i<1; $i++) { $a[$i]=false; $v++; }
+ return json_encode([$a,is_float($v)]);
+}
+echo typed_region(),"\n",shared_region(),"\n",overflow_region(),"\n";
+"#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", regions.err_buf);
+        assert_eq!(regions.err_buf, "");
+        assert_eq!(
+            regions.out,
+            b"5\n[[false,false,false,false],[true,true,true,true]]\n[[false],true]\n"
+        );
+        let decl = regions.functions["typed_region"].clone();
+        let compiled = regions.vm_compiled(&decl).unwrap();
+        assert!(compiled.ops.iter().any(|op| matches!(op,
+            super::Op::BoolLoop { executions, .. } if executions.get() > 0)));
     }
 
     #[test]

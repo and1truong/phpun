@@ -150,6 +150,30 @@ impl ArrayEntries {
             ArrayStorage::Packed(p) => p.scalar.borrow().clone(),
         }
     }
+    pub(crate) fn packed_bools(&self) -> Option<Vec<bool>> {
+        let ArrayStorage::Packed(p) = &self.0 else {
+            return None;
+        };
+        p.scalar
+            .borrow()
+            .as_ref()?
+            .iter()
+            .map(|v| match v {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .collect()
+    }
+    pub(crate) fn replace_packed_bools(&mut self, values: &[bool]) {
+        let ArrayStorage::Packed(p) = &mut self.0 else {
+            unreachable!()
+        };
+        let slots = p.scalar.get_mut().as_mut().unwrap();
+        assert_eq!(slots.len(), values.len());
+        for (slot, value) in slots.iter_mut().zip(values) {
+            *slot = Value::Bool(*value);
+        }
+    }
     fn packed_get(&self, key: &ArrKey) -> Option<Option<Value>> {
         let ArrayStorage::Packed(p) = &self.0 else {
             return None;

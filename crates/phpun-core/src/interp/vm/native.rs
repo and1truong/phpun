@@ -177,7 +177,9 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             Op::Call { argc, .. } => (*argc as usize, 1),
             Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => (1, 0),
             Op::Return => (1, 0),
-            Op::Line(_) | Op::Sweep | Op::InitCall { .. } | Op::Jump(_) => (0, 0),
+            Op::Line(_) | Op::Sweep | Op::BoolLoop { .. } | Op::InitCall { .. } | Op::Jump(_) => {
+                (0, 0)
+            }
             _ => return None,
         };
         let next = n.checked_sub(take)? + give;
@@ -461,7 +463,7 @@ impl Emitter {
                     self.emit(&[0x49, 0x89, 0x06, 0xb0, 1]);
                     returns.push(self.branch(None));
                 }
-                Op::Line(_) | Op::InitCall { .. } | Op::Sweep | Op::Pop => {}
+                Op::Line(_) | Op::BoolLoop { .. } | Op::InitCall { .. } | Op::Sweep | Op::Pop => {}
                 _ => return None,
             }
         }
