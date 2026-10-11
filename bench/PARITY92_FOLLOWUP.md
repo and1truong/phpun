@@ -1659,3 +1659,7 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/null-substr-length-*.
+
+### #284 review: nullable length root and named replacement offset
+
+Runtime a2dfbd2cf3292acdc39c5de03c230014efc25e19. Shared nullable_int_arg handles omitted/null versus explicit0 for substr,substr_replace,mb_substr,mb_strcut,strspn,strcspn. Correct substr_replace named parameter from start to PHP offset. Existing shared string runnable check covers all siblings, multibyte/binary omitted/null/0 and named replacement. NativePHP8.5.11 -n byte probe passes for core substr/replacement/span cases; native oracle lacks mbstring, so no native mb oracle claim. Workspace/fmt/clippy and explicit release clean/rebuild pass;25+19+VM-profile gates pass. All3406individualPHPT statuses identical original #284, existing2727pass603fail retained. Correctness-only inherited review fix, not a new timing claim. Binary/source/raw verification under nullable-length-review-*; original pre-review timing artifacts remain separate.
