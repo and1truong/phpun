@@ -6281,9 +6281,13 @@ impl<'a> Interp<'a> {
             }
             // Root-variable append after all existing container/detach gates.
             // Scalar tables cannot run a PHP callback during CoW or the store.
-            if n == 0
+            if k.is_none()
+                && matches!(
+                    &v,
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+                )
+                && n == 0
                 && last == 0
-                && k.is_none()
                 && rhs_late.is_none()
                 && !compound
                 && !self.detached_dim
@@ -6291,10 +6295,6 @@ impl<'a> Interp<'a> {
                 && self.dim_throw.is_none()
                 && !self.is_ref_cell(&c)
                 && det.is_some_and(|d| !Self::is_superglobal(&d.name))
-                && matches!(
-                    &v,
-                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
-                )
                 && matches!(&*c.borrow(), Value::Array(a) if a.borrow().packed
                     && (a.borrow().entries.is_scalar_packed() || a.borrow().entries.is_empty()))
             {

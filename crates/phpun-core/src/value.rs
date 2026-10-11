@@ -188,12 +188,7 @@ impl ArrayEntries {
         })
     }
     fn append_packed_scalar(&mut self, value: &Value) -> bool {
-        if !matches!(
-            value,
-            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
-        ) {
-            return false;
-        }
+        // The sole caller proves a non-graph scalar before this storage mutation.
         if matches!(&self.0, ArrayStorage::Cells(c) if c.is_empty()) {
             *self = Self::packed(Vec::new());
         }
@@ -566,7 +561,12 @@ impl PhpArray {
 
     /// Dense scalar append needs no exported Cell. References/mixed storage keep the original path.
     pub(crate) fn push_packed_scalar(&mut self, value: &Value) -> bool {
-        if !self.packed || i64::try_from(self.entries.len()).ok() != Some(self.next) {
+        if !matches!(
+            value,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        ) || !self.packed
+            || i64::try_from(self.entries.len()).ok() != Some(self.next)
+        {
             return false;
         }
         let Some(next) = self.next.checked_add(1) else {
