@@ -1,0 +1,7 @@
+allocs: 852095 bytes: 36353259
+  cell: 120015
+  mem_track: 20005
+  trace_frame: 20000
+  to_string: 154
+  array_new: 144
+  obj_new: 20000

@@ -2179,3 +2179,45 @@ Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 602, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/live-owner-realloc-*.
+
+## #311: perf(vm): use value arguments for proven promoted constructors (2026-10-11)
+
+Allow existing promoted_slots constructors in the value ABI and remove empty-body method-target veto. Reuse existing Slot::Arg promoted stores/default float widening and early materialization before property hooks. No duplicate binder/storage/backend.
+
+Fixed by-value/constant defaults only; retain reference/named/unpacked/type/visibility/private/abstract/native/hook/OOM/page/trace/lifetime canonical guards. Provided-byref InitNew fallback unchanged.
+
+Runtime 2e4dba83dc47d190c57ee118b41d52d23a42860b; timing source 2e4dba83dc47d190c57ee118b41d52d23a42860b; report/integration source 2e4dba83dc47d190c57ee118b41d52d23a42860b.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 147.867 | 149.524 | 1.0112 |
+| bench/40-objects.php 20 5000 | 589.765 | 606.161 | 1.0278 |
+| bench/20-strings.php | 56.203 | 55.039 | 0.9793 |
+| bench/20-strings.php 100 | 254.167 | 248.064 | 0.9760 |
+| bench/11-sieve.php | 63.718 | 64.165 | 1.0070 |
+| bench/30-arrays.php | 77.686 | 79.267 | 1.0203 |
+| bench/60-json.php | 521.534 | 524.661 | 1.0060 |
+| bench/10-fib.php | 8.287 | 8.475 | 1.0226 |
+| bench/50-regex.php | 39.237 | 39.404 | 1.0043 |
+| bench/70-db.php | 106.134 | 107.083 | 1.0089 |
+| bench/app/cli.php 100 20 | 32.688 | 34.355 | 1.0510 |
+| examples/composer/run.php | 8.176 | 7.771 | 0.9505 |
+
+Seven actual objects pairs +1.1%default/+2.8%long,31 +1.1%both: no ordinary object win. Physical actualobjects unchanged1633154: $pts[]=new uses Canonical assignment, so compiled constructor is not reached. Separate general direct $p=new promoted ctor20000 probe: allocations852095→732090(−120005),cell events120015→80015;7pairs63.043→61.382ms(−2.6%),31pairs64.924→59.891(−7.8%). This demonstrates bounded compiled constructor benefit, not benchmark40/parity benefit. Initialapp+5.1%,31app−.8%flat; other initial negatives retained.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1633154→1633154; bytes 68356830→68356838.
+- ctor-direct: requests 852095→732090; bytes 36353259→30929407.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing receiver unit extends default/inherited/func_get_args/ref/type-error/weak ctor cases and asserts cached compiled value_abi. Extra native complete type message/default/extra/ref probes pass.
+All3406individualPHPT compared; 2 known range crash/timeout swaps; no new fail/pass/skip.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/promoted-ctor-value-abi-*.
