@@ -72,10 +72,13 @@ impl<'a> Interp<'a> {
         let direct = match (dc, p) {
             (Some(dc), Some(p)) if p.hooks.is_none() && !p.readonly => {
                 self.hooked_prop(obj, pname).is_none()
-                    && matches!(self.decl_prop(obj, pname), Some((ep, ref ec))
-                        if ep.visibility == p.visibility && !ep.readonly
+                    && self.decl_prop_site(obj, pname).is_some_and(|(index, ec)| {
+                        let ep = &ec.decl.props[index];
+                        ep.visibility == p.visibility
+                            && !ep.readonly
                             && (ep.visibility != crate::ast::Visibility::Private
-                                || ec.name() == dc.name()))
+                                || ec.name() == dc.name())
+                    })
             }
             _ => false,
         };
