@@ -1,0 +1,9 @@
+allocs: 32479 bytes: 6010970
+  cell: 25
+  vm_site: 8
+  mem_track: 20
+  trace_frame: 3
+  call_args: 5
+  to_string: 161
+  array_new: 143
+  obj_new: 4
