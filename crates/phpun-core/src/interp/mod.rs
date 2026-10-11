@@ -6365,7 +6365,7 @@ impl<'a> Interp<'a> {
         let mut gens: Vec<(Rc<RefCell<PhpObject>>, usize)> = Vec::new();
         {
             let b = o.borrow();
-            for name in &b.prop_order {
+            for name in b.prop_order.iter() {
                 let Some(c) = b.prop_get(name) else {
                     continue;
                 };
@@ -7602,8 +7602,8 @@ impl<'a> Interp<'a> {
                 previous: None,
             });
             if !o.prop_order.contains(&"message".into()) {
-                o.prop_order.push("message".into());
-                o.prop_order.push("code".into());
+                Rc::make_mut(&mut o.prop_order).push("message".into());
+                Rc::make_mut(&mut o.prop_order).push("code".into());
             }
         }
         obj

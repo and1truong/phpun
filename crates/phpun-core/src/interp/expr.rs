@@ -4328,7 +4328,7 @@ impl<'a> Interp<'a> {
                             .unwrap_or_else(|| pn.clone());
                         let mut ob = o.borrow_mut();
                         if !ob.prop_order.contains(&key) {
-                            ob.prop_order.push(key.clone());
+                            Rc::make_mut(&mut ob.prop_order).push(key.clone());
                         }
 
                         let old = ob.prop_insert(key.clone(), src.clone());
@@ -5517,7 +5517,7 @@ impl<'a> Interp<'a> {
                             return Ok(v);
                         }
                         if !ob.prop_order.contains(&k) {
-                            ob.prop_order.push(k.clone());
+                            Rc::make_mut(&mut ob.prop_order).push(k.clone());
                         }
                         ob.prop_insert(k, cell(v.clone()));
                         drop(ob);
@@ -5581,7 +5581,7 @@ impl<'a> Interp<'a> {
                     let mut ob = o.borrow_mut();
                     let pn = pn.to_string();
                     if !ob.prop_order.contains(&pn) {
-                        ob.prop_order.push(pn.clone());
+                        Rc::make_mut(&mut ob.prop_order).push(pn.clone());
                     }
                     ob.prop_insert(pn, cell(v.clone()));
                     drop(ob);
@@ -9360,7 +9360,7 @@ impl<'a> Interp<'a> {
                             self.warn(&format!("Undefined property: {}::${}", cn, pn))?;
                             let mut ob = o.borrow_mut();
                             if !ob.prop_order.contains(&pn) {
-                                ob.prop_order.push(pn.clone());
+                                Rc::make_mut(&mut ob.prop_order).push(pn.clone());
                             }
                             ob.props
                                 .entry(pn.clone())
@@ -10613,7 +10613,7 @@ impl<'a> Interp<'a> {
                     }
                     let ob = o.borrow();
                     let cls = ob.class.clone();
-                    for n in &ob.prop_order {
+                    for n in ob.prop_order.iter() {
                         if let Some(c) = ob.prop_get(n) {
                             // Int-keyed buckets decode to int keys like
                             // zend's property-HT int slots.
@@ -10675,7 +10675,7 @@ impl<'a> Interp<'a> {
                         class: cls,
                         slots: Vec::new(),
                         props,
-                        prop_order: order,
+                        prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
                         unset_props: std::collections::HashSet::new(),

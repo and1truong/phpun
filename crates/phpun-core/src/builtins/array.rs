@@ -543,7 +543,7 @@ pub(crate) fn dispatch(
                         // becomes `[0 => $v]` (bug52193).
                         Value::Object(o) => {
                             let ob = o.borrow();
-                            for n in &ob.prop_order {
+                            for n in ob.prop_order.iter() {
                                 if let Some(c) = ob.prop_get(n) {
                                     arr.push(c.borrow().clone());
                                 }

@@ -5730,7 +5730,7 @@ fn select_chain(it: &mut Interp, chain: &mut Vec<Value>, class: &str, msg: Strin
         let mut ob = o.borrow_mut();
         ob.prop_insert("previous", cell(p));
         if !ob.prop_order.iter().any(|k| k == "previous") {
-            ob.prop_order.push("previous".into());
+            Rc::make_mut(&mut ob.prop_order).push("previous".into());
         }
     }
     chain.push(e);

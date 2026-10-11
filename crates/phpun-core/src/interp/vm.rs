@@ -4579,6 +4579,18 @@ unset($a); var_dump($weak->get());
         else {
             panic!("object")
         };
+        let super::Value::Object(other) = constructors.instantiate("valuector", &[]).unwrap()
+        else { panic!("object"); };
+        assert!(super::Rc::ptr_eq(&object.borrow().prop_order, &other.borrow().prop_order));
+        {
+            let mut first = object.borrow_mut();
+            super::Rc::make_mut(&mut first.prop_order).push("extra".into());
+            first.prop_insert("extra", super::cell(super::Value::Int(1)));
+        }
+        assert!(!super::Rc::ptr_eq(&object.borrow().prop_order, &other.borrow().prop_order));
+        assert!(object.borrow().prop_has("extra"));
+        assert!(!other.borrow().prop_order.iter().any(|key| key == "extra"));
+        assert!(!other.borrow().prop_has("extra"));
         let target = constructors
             .vm_method_target(object, "__construct", &std::cell::RefCell::new(None), 1)
             .expect("empty promoted constructor retains direct target");

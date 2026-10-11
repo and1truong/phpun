@@ -993,7 +993,7 @@ fn stdclass(it: &mut Interp, props: HashMap<String, Cell>, order: Vec<String>) -
         class: cls,
         slots: Vec::new(),
         props,
-        prop_order: order,
+        prop_order: Rc::new(order),
         id: 0,
         internal: None,
         unset_props: std::collections::HashSet::new(),

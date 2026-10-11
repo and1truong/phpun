@@ -2229,6 +2229,7 @@ pub struct PhpClass {
     /// prop_order — built once on first `new`: the seen/backed/order
     /// machinery is class-fixed so it needn't rerun per object.
     pub flat_props: std::cell::OnceCell<Rc<Vec<FlatProp>>>,
+    pub prop_order_template: std::cell::OnceCell<Rc<Vec<String>>>,
     /// Storage key → `flat_props` index, filled alongside `flat_props`:
     /// routes `prop_get`/`prop_insert` to `PhpObject.slots`.
     pub prop_slot: std::cell::OnceCell<Rc<HashMap<String, usize>>>,
@@ -2593,7 +2594,8 @@ pub struct PhpObject {
     pub props: HashMap<String, Cell>,
     /// Property order for var_dump/foreach output: declared keys in
     /// `flat_props` order, then dynamic inserts; `unset()` tombstones.
-    pub prop_order: Vec<String>,
+    /// Class-fixed names are shared; each mutator uses Rc::make_mut.
+    pub prop_order: Rc<Vec<String>>,
     /// PHP's per-process object handle counter.
     pub id: u64,
     /// Internal payload for builtin classes (e.g. Exception fields).

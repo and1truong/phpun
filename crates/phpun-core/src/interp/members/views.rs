@@ -172,7 +172,7 @@ impl<'a> Interp<'a> {
         // enumerable props.
         let emitted: std::collections::HashSet<String> =
             entries.iter().map(|(_, s, _)| s.clone()).collect();
-        for k in &o.borrow().prop_order {
+        for k in o.borrow().prop_order.iter() {
             if emitted.contains(k)
                 || (k.starts_with('\0') && crate::value::int_prop_index(k).is_none())
             {
@@ -501,7 +501,7 @@ impl<'a> Interp<'a> {
         let mut ob = o.borrow_mut();
         ob.prop_insert("name", cell(Value::str(&rp_decl.name)));
         if !ob.prop_order.contains(&"name".into()) {
-            ob.prop_order.push("name".into());
+            Rc::make_mut(&mut ob.prop_order).push("name".into());
         }
         drop(ob);
         let mut ob = o.borrow_mut();
@@ -781,7 +781,7 @@ impl<'a> Interp<'a> {
                         ob.prop_insert("\0rc\0prop", cell(Value::Null));
                         ob.prop_insert("name", cell(Value::str(&canon)));
                         if !ob.prop_order.contains(&"name".into()) {
-                            ob.prop_order.push("name".into());
+                            Rc::make_mut(&mut ob.prop_order).push("name".into());
                         }
                         return Ok(Some(Value::Null));
                     }
@@ -853,7 +853,7 @@ impl<'a> Interp<'a> {
                         // declaration order: name, then class.
                         for k in ["name", "class"] {
                             if !ob.prop_order.contains(&k.into()) {
-                                ob.prop_order.push(k.into());
+                                Rc::make_mut(&mut ob.prop_order).push(k.into());
                             }
                         }
                     }
@@ -870,7 +870,7 @@ impl<'a> Interp<'a> {
                         };
                         ob.prop_insert("name", cell(nm));
                         if !ob.prop_order.contains(&"name".into()) {
-                            ob.prop_order.push("name".into());
+                            Rc::make_mut(&mut ob.prop_order).push("name".into());
                         }
                     }
                     _ => {}
@@ -1858,7 +1858,7 @@ impl<'a> Interp<'a> {
                             ob.prop_insert("\0rc\0class", cell(Value::str(&n)));
                             ob.prop_insert("name", cell(Value::str(&n)));
                             if !ob.prop_order.contains(&"name".into()) {
-                                ob.prop_order.push("name".into());
+                                Rc::make_mut(&mut ob.prop_order).push("name".into());
                             }
                         }
                         Ok(Some(rc))
@@ -2918,7 +2918,7 @@ impl<'a> Interp<'a> {
                 if let Some(Value::Object(t)) = target {
                     let mut tb = t.borrow_mut();
                     if !tb.prop_has(&pn) && !tb.prop_order.iter().any(|k| k == &pn) {
-                        tb.prop_order.push(pn.clone());
+                        Rc::make_mut(&mut tb.prop_order).push(pn.clone());
                     }
                     tb.prop_insert(pn.clone(), cell(val));
                     tb.unset_props.remove(&pn);

@@ -410,6 +410,7 @@ impl<'a> Interp<'a> {
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
+                        prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
                         method_ic: std::cell::RefCell::new(None),
                         short_name: std::cell::OnceCell::new(),
@@ -3689,7 +3690,7 @@ impl<'a> Interp<'a> {
             class: cls,
             slots: Vec::new(),
             props: HashMap::new(),
-            prop_order: vec![],
+            prop_order: Rc::new(vec![]),
             id: 0,
             internal: Some(ObjectInternal::WeakRef(Rc::downgrade(&target))),
             unset_props: std::collections::HashSet::new(),
@@ -3908,6 +3909,7 @@ impl<'a> Interp<'a> {
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
                         flat_props: std::cell::OnceCell::new(),
+                        prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
                         method_ic: std::cell::RefCell::new(None),
                         short_name: std::cell::OnceCell::new(),
@@ -3916,7 +3918,7 @@ impl<'a> Interp<'a> {
                     }),
                     slots: Vec::new(),
                     props: HashMap::new(),
-                    prop_order: vec![],
+                    prop_order: Rc::new(vec![]),
                     id: 0,
                     internal: None,
                     unset_props: std::collections::HashSet::new(),
@@ -3928,9 +3930,10 @@ impl<'a> Interp<'a> {
         // are class-fixed, computed once in flat_props_of.
         let flat = self.flat_props_of(&cls);
         let mut slots: Vec<Option<Cell>> = vec![None; flat.len()];
-        let mut prop_order = Vec::with_capacity(flat.len());
+        let prop_order = cls.prop_order_template.get_or_init(|| {
+            Rc::new(flat.iter().map(|fp| fp.key.clone()).collect())
+        }).clone();
         for (fi, fp) in flat.iter().enumerate() {
-            prop_order.push(fp.key.clone());
             if fp.uninit {
                 continue;
             }
