@@ -1,0 +1,61 @@
+{
+  "source": "e4df1d9e5fbf13f6de59afb3e00bfb123ad3b7ba",
+  "runtime": "c44f9ea9e26b13bd2888cf57147c0eaa7fc6e69e",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1663202,
+        "bytes": 69796932
+      },
+      "after": {
+        "requests": 1663202,
+        "bytes": 69796960
+      }
+    },
+    {
+      "label": "gcgraph",
+      "before": {
+        "requests": 35122,
+        "bytes": 6196203
+      },
+      "after": {
+        "requests": 35122,
+        "bytes": 6192007
+      }
+    }
+  ],
+  "binary_sha256": "33f740fe0901dfaf5c268fda1af22712fd3212de6e9a6baefccce8593fbcbb4c",
+  "scope": "Use existing FxMap/FxSet for GcScan and temporary pointer-only visited/reach/dead sets. Keep persistent purple/dying state and all graph,root,refcount,typed/generator/destructor logic. Ordinary-merge current main7b74c2e (#305); explicit fresh frozen runtimec44f9ea/binary33f740f, not pre305 prototype. Also roll up rejected #301 report data from closed-parent #304; that experiment has no runtime delta.",
+  "fallbacks": "Canonical graph discovery, depth/refcount accounting, typed pins, duplicate Cell identities, generator/closure/internal storage and buffer-overflow paths all retained. ONE existing registered/plain-cell fixture extended for live typed root,40deadtyped pairs and callable cycle; existing scanner check adopts visited-set type."
+}
