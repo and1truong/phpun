@@ -11,8 +11,9 @@ use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
     compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
-    trace_arg, ArrKey, CallableKind, Cell, FlatProp, GenSetup, GenState, Numeric, ObjectInternal,
-    PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, PhpStr, TraceFrame, Value,
+    trace_arg, ArrKey, CallableKind, Cell, FlatProp, FxMap, FxSet, GenSetup, GenState, Numeric,
+    ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, PhpStr, TraceFrame,
+    Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -1377,38 +1378,38 @@ pub(in crate::interp) fn ob_split_view(
 struct GcScan {
     /// Container ptr → direct refcounted targets (flood-fill edges);
     /// covers unregistered containers reached transitively.
-    edges: HashMap<usize, Vec<usize>>,
+    edges: FxMap<usize, Vec<usize>>,
     /// Cell ptr → slots the cell occupies inside scanned containers.
-    cell_slots: HashMap<usize, usize>,
+    cell_slots: FxMap<usize, usize>,
     /// Cell ptr → the cell (kept for strong-count checks).
-    cells: HashMap<usize, Cell>,
+    cells: FxMap<usize, Cell>,
     /// Node ptr → cells directly holding a clone of it.
-    cell_edges: HashMap<usize, HashSet<usize>>,
+    cell_edges: FxMap<usize, FxSet<usize>>,
     /// Node ptr → bare clones held in non-cell positions (gen
     /// sends/throws, buffered item keys, saved call setup).
-    raw_edges: HashMap<usize, usize>,
+    raw_edges: FxMap<usize, usize>,
     /// Universe node ptrs (objects + registered arrays) — the sweep
     /// set; these hold their bookkeeping clone in the scan vectors.
-    universe: HashSet<usize>,
+    universe: FxSet<usize>,
     /// Non-universe containers discovered mid-scan — plain arrays and
     /// closures; kept so their strong counts can be checked like the
     /// nodes' (the map clone is each one's bookkeeping +1).
-    nodes: HashMap<usize, Value>,
+    nodes: FxMap<usize, Value>,
     /// In-flight slot decrefs (`gc_note_dying` walks) — a snapshot of
     /// `Interp::gc_dying` taken at pass start.
     dying: HashMap<usize, usize>,
     /// Containers reached through internal-machinery prop cells only
     /// (`\0Cls\0prop` on GC_PROPLESS_CLASSES): engine-modeled storage,
     /// not zvals — dead ones don't count toward the collect total.
-    internal: HashSet<usize>,
+    internal: FxSet<usize>,
     /// Containers reached through at least one real zval edge — an
     /// `internal`-marked container with a real edge counts normally.
-    plain: HashSet<usize>,
+    plain: FxSet<usize>,
     /// Cell ptr → engine-bookkeeping clone count. `typed_slots` pins a
     /// clone of every typed prop's cell for write-gating — like
     /// `dying`, those aren't zval holders, so they can't root the cell's
     /// payload (gc_048's typed `$cycleRef` prop cell).
-    pins: HashMap<usize, usize>,
+    pins: FxMap<usize, usize>,
 }
 
 impl<'a> Interp<'a> {
@@ -6450,7 +6451,7 @@ impl<'a> Interp<'a> {
         // Dedup: a node registered more than once (`reg_arr_ref` fires
         // per `=&` bind) must hold exactly one scan clone — the root
         // test's bookkeeping assumes +1 per node.
-        let mut seen: HashSet<usize> = HashSet::new();
+        let mut seen: FxSet<usize> = FxSet::default();
         for h in &self.obj_handles {
             if let ObjHandle::Obj(w) = h {
                 if let Some(o) = w.upgrade() {
@@ -6469,7 +6470,7 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let mut pins: HashMap<usize, usize> = HashMap::new();
+        let mut pins: FxMap<usize, usize> = FxMap::default();
         for (c, ..) in self.typed_slots.values() {
             *pins.entry(Rc::as_ptr(c) as usize).or_insert(0) += 1;
         }
@@ -6490,7 +6491,7 @@ impl<'a> Interp<'a> {
         // containers get their own edge lists so reachability
         // traverses them (a registered array inside a plain array
         // inside a live object is reachable).
-        let mut visited: HashSet<usize> = HashSet::new();
+        let mut visited: FxSet<usize> = FxSet::default();
         for o in &objs {
             let t = Rc::as_ptr(o) as usize;
             if visited.insert(t) {
@@ -6514,7 +6515,7 @@ impl<'a> Interp<'a> {
         // means an external holder keeps the node alive. Non-universe
         // containers discovered mid-scan root their targets too (a
         // plain array held by a var is alive).
-        let mut reach: HashSet<usize> = HashSet::new();
+        let mut reach: FxSet<usize> = FxSet::default();
         for o in &objs {
             let t = Rc::as_ptr(o) as usize;
             if Self::gc_is_root(&scan, t, Rc::strong_count(o)) {
@@ -6560,7 +6561,7 @@ impl<'a> Interp<'a> {
         // nested plain arrays, a self-capturing closure): unreachable
         // and not externally held, they die with the set by refcount
         // drop and count toward the collect total like Zend zvals.
-        let mut dead_nodes: HashSet<usize> = HashSet::new();
+        let mut dead_nodes: FxSet<usize> = FxSet::default();
         for (t, v) in &scan.nodes {
             if reach.contains(t) {
                 continue;
@@ -6580,14 +6581,14 @@ impl<'a> Interp<'a> {
             // (purpled) root belongs to — Zend's buffer is the
             // candidate set. Components without a buffered member
             // keep waiting for their own decrefs to note them.
-            let mut dead_all: HashSet<usize> = dead_nodes.clone();
+            let mut dead_all: FxSet<usize> = dead_nodes.clone();
             for o in &dead {
                 dead_all.insert(Rc::as_ptr(o) as usize);
             }
             for a in &dead_arrs {
                 dead_all.insert(Rc::as_ptr(a) as usize);
             }
-            let mut freed: HashSet<usize> = HashSet::new();
+            let mut freed: FxSet<usize> = FxSet::default();
             let mut stack: Vec<usize> = dead_all
                 .iter()
                 .copied()
@@ -6730,7 +6731,7 @@ impl<'a> Interp<'a> {
         scan: &mut GcScan,
         out: &mut Vec<usize>,
         depth: u8,
-        visited: &mut HashSet<usize>,
+        visited: &mut FxSet<usize>,
         internal: bool,
     ) {
         if depth == 0 {
@@ -6756,7 +6757,7 @@ impl<'a> Interp<'a> {
         scan: &mut GcScan,
         out: &mut Vec<usize>,
         depth: u8,
-        visited: &mut HashSet<usize>,
+        visited: &mut FxSet<usize>,
         internal: bool,
     ) {
         if depth == 0 {
@@ -6859,7 +6860,7 @@ impl<'a> Interp<'a> {
         scan: &mut GcScan,
         out: &mut Vec<usize>,
         depth: u8,
-        visited: &mut HashSet<usize>,
+        visited: &mut FxSet<usize>,
     ) {
         if depth == 0 {
             return;

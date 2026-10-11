@@ -1,0 +1,14 @@
+{
+  "binary": "pure-root-builtins",
+  "binary_sha256": "d193a8f5293a859e25ac9e0c698e474ae2077c3cea1c5903c5fab1709840bc87",
+  "source": "f4313bd93f4cff704ee2707640d4fb83cdcfd38e",
+  "argv": [
+    "bench/40-objects.php",
+    "300",
+    "5000"
+  ],
+  "event": "cpu-clock:u199Hz/DWARF8192",
+  "samples": 2228,
+  "lost": 0,
+  "timing": "profile only,not speed evidence"
+}

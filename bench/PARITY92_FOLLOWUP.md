@@ -1929,3 +1929,129 @@ no new fail/pass/skip. Candidate summary retained: {'total': 3406, 'passed': 272
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/pure-root-builtins-*.
+
+## #301: perf(vm): report rejected optional builtin reference-SEND experiment (2026-10-11)
+
+Experiment limited InitCall builtin reference flags to supplied positional args, retaining supplied references/user declarations/named/unpack. This unlocked existing guarded 3-arg replacement kernels. The prototype was tested and measured, then REJECTED; final source uses an ordinary revert and has no runtime delta from #302.
+
+Do not treat the rejected frozen candidate ELF c02f8b6 as final runtime. Original reference SEND is restored. Full raw negatives, physical counters and native alias/error/named/unpack probes retained. No allocation gain implies a speed gain.
+
+Runtime bc148d8df07176022991a40fb2f5697d2e24b735; timing source ebf62d63a4d59e110fb08ea2d0eae5c69660c379; report/integration source ebf62d63a4d59e110fb08ea2d0eae5c69660c379.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 54.599 | 57.701 | 1.0568 |
+| bench/20-strings.php 100 | 241.244 | 246.946 | 1.0236 |
+| bench/profile/strings.php replace 20000 | 689.913 | 626.080 | 0.9075 |
+| bench/profile/strings.php slice 20000 | 68.005 | 71.072 | 1.0451 |
+| bench/40-objects.php | 155.317 | 159.929 | 1.0297 |
+| bench/11-sieve.php | 65.607 | 64.277 | 0.9797 |
+| bench/30-arrays.php | 78.601 | 78.016 | 0.9925 |
+| bench/60-json.php | 519.294 | 516.556 | 0.9947 |
+| bench/10-fib.php | 8.557 | 9.267 | 1.0830 |
+| bench/app/cli.php 100 20 | 34.145 | 33.152 | 0.9709 |
+| examples/composer/run.php | 8.832 | 8.541 | 0.9670 |
+
+7pairs strings+5.7%default/+2.4%long,objects+3.0%,fib+8.3%,slice+4.5%,sieve−2.0%,arrays−.7%,JSON−.5%,app−2.9%,Composer−3.3%.31negativefollowupstrings+1.0%default/+2.8%long,objects+.2%,fib+3.6%,slice−2.9%. Target strings still no speed benefit. Physicalstrings100 requests2902882→2850882(−52000),bytes120177245→114093273; tiny argv path delta included. Replace selector has switch/AST root, physicalrequests992181 unchanged; its timing−9.3% is not proof of InitCall optimization. Revert rather than ship a measured slowdown.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings100: requests 2902882→2850882; bytes 120177245→114093273.
+- replace20000: requests 992181→992181; bytes 5452238184→5452238212.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing callback unit extended in prototype; native omitted/provided aliases,named/unpack,arity/type errors,regex optional outputs,user default/variadic refs byte-identical. Original unit restored by ordinary revert.
+All3406individualPHPT compared; 0 known range crash/timeout swaps,
+no new fail/pass/skip. Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/optional-builtin-ref-args-*.
+
+Final #301 decision: ordinary revert restores exact #302 runtime (crates/Cargo diff empty, checked). Frozen optional-builtin-ref-args ELF is rejected; final uses verified parent pure-root-builtins ELF d193a8f and parent status map. No source rebuild needed for unchanged runtime.
+
+## #303: perf(gc): use existing Fx tables for pointer scratch identities (2026-10-11)
+
+Historical pre-#305 candidate: use existing FxMap/FxSet for GcScan and temporary pointer-only visited/reach/dead sets. Persistent purple/dying state, traversal, root counts, callbacks and destructor order unchanged; no new abstraction/dependency. Frozen sourceb0a02f2/binaryfccfcdc and timingdb6adbe. Main#305 was merged afterward; final integration is rebuilt/gated/measured separately, never attribute these old pairs to final current main.
+
+Canonical graph discovery, depth/refcount accounting, typed pins, duplicate Cell identities, generator/closure/internal storage and buffer-overflow paths all retained. ONE existing registered/plain-cell fixture extended for live typed root,40deadtyped pairs and callable cycle; existing scanner check adopts visited-set type.
+
+Runtime b0a02f2105ef3591a33db1cfc00bb61bb5ae5eab; timing source db6adbea7cafa41ae6cd6cd4c5312245b2172349; report/integration source c44f9ea9e26b13bd2888cf57147c0eaa7fc6e69e.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 149.908 | 148.603 | 0.9913 |
+| bench/40-objects.php 20 5000 | 606.164 | 608.406 | 1.0037 |
+| bench/20-strings.php | 56.942 | 59.400 | 1.0432 |
+| bench/11-sieve.php | 66.147 | 65.318 | 0.9875 |
+| bench/30-arrays.php | 79.073 | 85.124 | 1.0765 |
+| bench/60-json.php | 536.640 | 537.399 | 1.0014 |
+| bench/10-fib.php | 8.528 | 8.603 | 1.0088 |
+| bench/50-regex.php | 41.480 | 41.478 | 0.9999 |
+| bench/70-db.php | 107.104 | 109.686 | 1.0241 |
+| bench/app/cli.php 100 20 | 35.225 | 34.439 | 0.9777 |
+| examples/composer/run.php | 9.178 | 8.475 | 0.9234 |
+
+7pairs objects149.908→148.603ms(−.9%),long606.164→608.406(+.4%),strings+4.3%,arrays+7.7%,JSON+.1%,fib+.9%,regexflat,DB+2.4%,app−2.2%,Composer−7.7%.31followup arrays−1.3%,strings+6.3%,longobjects−1.2%,DB−.9%; strings regression retained, no normal-objects or overall speedup claim. Independent7pairs extracted200000-node cyclic linked-list PHPT workload13274.766→9281.903ms(−30.1%), everyexit/stdout/stderr==nativePHP8.5.11-n. Fullsuite GC testparenttimeout10s/candidatepass9085ms;serializedparenttimeout10007ms/candidatepass9508ms confirms timeout boundary. This is performance admission at10s,not a repaired semantic failure. Physicalobjects5 requests1663202 identical;gcgraph35122 identical. Hashing-work gain,not allocator-elision.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1663202→1663202; bytes 69796944→69796940.
+- gcgraph: requests 35122→35122; bytes 6196215→6191987.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing fixture nativePHP parent-output verified;typed/shared/callable cycles pass. Serialized GC threshold rechecks and whole3406raw status maps retained.
+All3406PHPT:bug77345_gc_1 timeout→pass (serialized10s parenttimeout/candidatepass confirmed),plus2knownrangecrash/timeout swaps;no new failures.2730pass/601fail;existing compatibility gaps remain.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/gc-pointer-tables-*.
+
+## #303: perf(gc): use existing Fx tables for pointer scratch identities (2026-10-11)
+
+Use existing FxMap/FxSet for GcScan and temporary pointer-only visited/reach/dead sets. Keep persistent purple/dying state and all graph,root,refcount,typed/generator/destructor logic. Ordinary-merge current main7b74c2e (#305); explicit fresh frozen runtimec44f9ea/binary33f740f, not pre305 prototype. Also roll up rejected #301 report data from closed-parent #304; that experiment has no runtime delta.
+
+Canonical graph discovery, depth/refcount accounting, typed pins, duplicate Cell identities, generator/closure/internal storage and buffer-overflow paths all retained. ONE existing registered/plain-cell fixture extended for live typed root,40deadtyped pairs and callable cycle; existing scanner check adopts visited-set type.
+
+Runtime c44f9ea9e26b13bd2888cf57147c0eaa7fc6e69e; timing source e4df1d9e5fbf13f6de59afb3e00bfb123ad3b7ba; report/integration source e4df1d9e5fbf13f6de59afb3e00bfb123ad3b7ba.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 153.195 | 152.015 | 0.9923 |
+| bench/40-objects.php 20 5000 | 592.722 | 605.682 | 1.0219 |
+| bench/20-strings.php | 54.891 | 58.148 | 1.0593 |
+| bench/20-strings.php 100 | 230.609 | 236.439 | 1.0253 |
+| bench/11-sieve.php | 62.739 | 63.871 | 1.0180 |
+| bench/30-arrays.php | 80.963 | 77.623 | 0.9587 |
+| bench/60-json.php | 530.877 | 536.562 | 1.0107 |
+| bench/10-fib.php | 9.374 | 8.233 | 0.8783 |
+| bench/50-regex.php | 39.409 | 38.975 | 0.9890 |
+| bench/70-db.php | 107.090 | 105.510 | 0.9852 |
+| bench/app/cli.php 100 20 | 32.793 | 32.674 | 0.9964 |
+| examples/composer/run.php | 7.885 | 7.796 | 0.9887 |
+
+Currentmain7b74 paired7 profiler-off,byte-gated:objects153.195→152.015ms(−.8%),long592.722→605.682(+2.2%),strings54.891→58.148(+5.9%),long230.609→236.439(+2.5%),sieve+1.8%,arrays−4.1%,JSON+1.1%,fib−12.2%,regex−1.1%,DB−1.5%,app−.4%,Composer−1.1%. These include negatives/no broad speedup claim; fib is not attributed to GC hashing. Separate7pairs 200000-node cycle workload12742.765→8936.068ms(−29.9%),everyrep nativePHP-byte-gated. Full3406parent2729pass/candidate2730pass601fail,onlyGC77345timeout→pass; range maps identical in integration. Physicalobjects5 requests1663202 identical;gcgraph35122 identical; byte differences recorded not allocator-elision. Pre305 full raw31strings+6.3%,arrays−1.3%,longobjects−1.2% retained above; pre305serializedGC parenttimeout10007ms/candidatepass9508ms retained separately. PHP parity remains unmet; no multiplying step gains or mixing host ratios.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1663202→1663202; bytes 69796932→69796960.
+- gcgraph: requests 35122→35122; bytes 6196203→6192007.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing fixture nativePHP parent-output verified;typed/shared/callable cycles pass. Serialized GC threshold rechecks and whole3406raw status maps retained.
+All3406PHPT:onlybug77345_gc_1 timeout→pass (200000-node cycle performance,not a semantic repair);no new failures.2730pass/601fail;existing parity gaps remain.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/gc-pointer-tables-main-*.
