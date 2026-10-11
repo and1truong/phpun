@@ -4022,7 +4022,6 @@ impl<'a> Interp<'a> {
         self.mem_limit_ck.0
     }
 
-
     /// zend's memory_limit check runs inside the allocator where a
     /// request forces newly committed memory: a huge alloc needs its
     /// own segment (real_size + aligned request vs limit), anything
