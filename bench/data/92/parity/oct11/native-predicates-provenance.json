@@ -1,0 +1,19 @@
+{
+  "runtime": "cce95bdc88a457b34fe0e10199530b9c6b215ba3",
+  "source": "ac24fdb2a9937b25bc0825d350d0cb3700e58efd",
+  "tracked_clean": "vendor untracked symlink only",
+  "phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "guards": "explicit bool roots: immediate comparison Return; reject jumps to Return and all calls; integer graph rejects bool callees; remainder 0/-1 replay",
+  "hash": "d58b492f28a00d3a2d1e8947b77bd10e750a6d8b62a3e2bb17b263707b6187ba"
+}

@@ -3697,6 +3697,71 @@ DivisionByZeroError:Division by zero
         assert_eq!(it.vm_stack[0].used, 32 + super::super::VM_FRAME_SLOTS * 16);
         drop(callable);
         assert!(weak.upgrade().is_none(), "single callback owner retained");
+
+        let mut it = Interp::new("native-predicates.php");
+        it.run_source("<?php function predicateOwned(int $x): bool { return $x % 7 === 0; }");
+        let callable = it
+            .eval(&crate::ast::Expr::Closure(crate::ast::ClosureExpr {
+                decl: (*it.functions["predicateowned"]).clone(),
+                uses: Vec::new(),
+                arrow: false,
+                is_static: false,
+            }))
+            .unwrap();
+        for _ in 0..70 {
+            assert!(matches!(
+                it.call_values(&callable, [super::Value::Int(7)], false)
+                    .unwrap(),
+                super::Value::Bool(true)
+            ));
+        }
+        assert!(matches!(
+            it.call_values(&callable, [super::Value::Int(8)], false)
+                .unwrap(),
+            super::Value::Bool(false)
+        ));
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let super::Value::Callable(c) = &callable else {
+                panic!("closure")
+            };
+            let super::CallableKind::Closure(decl) = &c.kind else {
+                panic!("closure")
+            };
+            match &it.compiled_fns[&(Rc::as_ptr(decl) as usize)].3 {
+                super::native::State::Ready(p) => assert!(p.executions.get() > 0),
+                _ => panic!("predicate did not enter native"),
+            }
+        }
+        let mut it = Interp::new("native-remainder.php");
+        let result = it.run_source(
+            r#"<?php declare(strict_types=1);
+function rem_edge(int $n,int $d): int { return $n % $d; }
+function rem_zero(int $n,int $d): int { return $n % $d; }
+function bool_child(int $n): bool { return $n === 0; }
+function integer_parent(int $n): int { return bool_child($n) === 0 ? 7 : 9; }
+function bad_bool_return(int $n): bool { return $n; }
+for ($i=0;$i<70;$i++) {
+    rem_edge(9,7); rem_zero(9,7);
+    if (integer_parent(0) !== 9) throw new Exception('bool entered integer stack');
+    try { bad_bool_return(1); } catch (TypeError $e) { continue; }
+    throw new Exception('bool return check bypassed');
+}
+echo rem_edge(PHP_INT_MIN,7), ' ', rem_edge(PHP_INT_MIN,-3), ' ', rem_edge(PHP_INT_MIN,-1), "\n";
+try { rem_zero(9,0); } catch (DivisionByZeroError $e) { echo $e->getMessage(), "\n"; }
+"#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.err_buf, "");
+        assert_eq!(it.out, b"-1 -2 0\nModulo by zero\n");
+        assert!(it.call_trace.is_empty());
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        for name in ["rem_edge", "rem_zero"] {
+            assert!(matches!(
+                it.compiled_fns[&(Rc::as_ptr(&it.functions[name]) as usize)].3,
+                super::native::State::Disabled
+            ));
+        }
     }
 
     #[test]
@@ -3724,6 +3789,35 @@ DivisionByZeroError:Division by zero
         it.frame_recycle(frame);
         let frame = it.frame_new("second");
         assert_eq!(&*frame as *const super::super::Frame, ptr);
+
+        let mut scan = super::super::GcScan::default();
+        let mut out = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        for value in [
+            super::Value::Null,
+            super::Value::Bool(true),
+            super::Value::Int(7),
+            super::Value::Float(1.5),
+            super::Value::str("leaf"),
+        ] {
+            Interp::gc_scan_cell(
+                &super::cell(value),
+                &mut scan,
+                &mut out,
+                16,
+                &mut visited,
+                false,
+            );
+        }
+        assert!(scan.cells.is_empty() && scan.cell_slots.is_empty() && out.is_empty());
+        let array = std::rc::Rc::new(std::cell::RefCell::new(super::PhpArray::new()));
+        let c = super::cell(super::Value::Array(array));
+        Interp::gc_scan_cell(&c, &mut scan, &mut out, 16, &mut visited, false);
+        Interp::gc_scan_cell(&c, &mut scan, &mut out, 16, &mut visited, false);
+        let cp = std::rc::Rc::as_ptr(&c) as usize;
+        assert_eq!(scan.cell_slots[&cp], 2);
+        assert_eq!(out.len(), 2);
+        assert!(std::rc::Rc::ptr_eq(&scan.cells[&cp], &c));
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

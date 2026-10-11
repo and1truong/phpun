@@ -1405,3 +1405,69 @@ PHPTstatuses identical to parent2727pass603fail25skip38unsupported6crash
 7timeout. Explicit release clean/rebuild;externalCI not assertedgreen.
 Next #263 checked remainder/proven bool native roots; #264 no-target scalar
 GC cells; #266 Weak liveness; #267 shared scalar builtin kernels.
+
+## #263: checked remainder and proven native boolean predicates (2026-10-11)
+
+Stack branch64 after ordinary-method dispatch #269. Extend shared pure Ops
+emitter with signed remainder, guarding denominator0/-1 before idiv and
+replaying canonical VM. Explicit bool roots require comparison immediately
+before Return, reject jumps to Return and every child call; integer graphs
+reject bool callees. Existing purity/type/span/init/overflow/deadline/profiler
+proofs remain. ONE existing callback check proves actual native bool entry,
+MIN/-1 and zero fallback, invalid bool returns and bool-callee rejection.
+
+Seven isolated alternating profiler-off PHP8.5.11 -n byte-gated pairs:
+filter20k34.388→27.494ms (−20.0%), arrays−2.5%, usort−4.2%.
+Initial sieve+5.3% and fib+3.5% retained;31 followup sieve74.767→75.086
+(+0.4%),fib8.137→8.064(−0.9%), filter33.287→28.471(−14.5%).
+Physical filter requests275254→255332 (−19922/~7.2%),bytes11968967→11172646
+(−6.7%). Arrays requests655877→635955 (−19922/~3.0%). These separate
+allocation runs are not timings; trace events do not substitute allocations.
+
+Workspace8core/22runtime/19format,fm/clippy,25script+19workload+extended
+modulo byte gate and VM-profile pass. All3406individual PHPT statuses have
+only known range71132/71197 crash↔timeout swaps:2727pass603fail25skip
+38unsupported6crash7timeout; no new fail/pass/skip. Explicit release core
+clean/rebuild and binary hash recorded. External CI not asserted green.
+Raw/source/hashes in bench/data/92/parity/oct11/native-predicates-*.
+No object/suite parity claim. Next #264 scalar GC cells, #266 Weak liveness,
+#267 shared exact scalar builtin calls, keeping GC/memory/error fallback.
+
+## #264: perf(gc): omit scalar cells from cycle graph bookkeeping (2026-10-11)
+
+The shared GC cell scanner now proves gc_val_ptr==0 before inserting cell-slot/count/pin metadata. Scalar cells cannot point to a cycle graph node; arrays/objects/closures retain the same accounting. Depth-zero short circuit stays before RefCell borrow.
+
+Collection thresholds, candidates, roots, edges, external holders, typed pins, destructor order and every cycle-target cell remain canonical. Existing ONE frame-owner check extended proves no-target scalar exclusion and repeated array-cell accounting.
+
+Runtime dce4f08f3a5821c31aa7f632fd0805c47553950f; measured source 1eb1af2a5f6fe0df006bce0ba676a9d1f1f15ac4.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 194.929 | 192.833 | 0.9892 |
+| bench/40-objects.php 20 5000 | 781.967 | 782.040 | 1.0001 |
+| bench/60-json.php | 506.135 | 508.687 | 1.0050 |
+| bench/30-arrays.php | 80.167 | 81.113 | 1.0118 |
+| bench/20-strings.php | 117.684 | 115.289 | 0.9797 |
+| bench/11-sieve.php | 76.322 | 75.508 | 0.9893 |
+| bench/10-fib.php | 7.923 | 7.935 | 1.0015 |
+| bench/app/cli.php 100 20 | 34.152 | 33.136 | 0.9703 |
+| examples/composer/run.php | 7.867 | 7.418 | 0.9429 |
+
+Objects−1.1%/long flat and JSON+0.5% do not establish a speed gain. Retain arrays+1.2% and all other negative medians. The measured benefit is reduced GC scratch allocation bytes (~10MB/~3.5% on100kobjects), not suite performance.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects: requests 8763259→8763025; bytes 285087536→275058000.
+- json: requests 4540348→4540348; bytes 315892020→315892012.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing runnable checks reused; no redundant test fixtures.
+All3406individualPHPT compared; 0 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/gc-scalar-cells-*.

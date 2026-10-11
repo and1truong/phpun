@@ -6712,10 +6712,14 @@ impl<'a> Interp<'a> {
         if depth == 0 {
             return;
         }
+        let value = c.borrow();
+        if Self::gc_val_ptr(&value) == 0 {
+            return;
+        }
         let cp = Rc::as_ptr(c) as usize;
         *scan.cell_slots.entry(cp).or_insert(0) += 1;
         scan.cells.entry(cp).or_insert_with(|| c.clone());
-        Self::gc_scan_held(&c.borrow(), Some(cp), scan, out, depth, visited, internal);
+        Self::gc_scan_held(&value, Some(cp), scan, out, depth, visited, internal);
     }
 
     /// The refcounted target a held `v` points at. A cell-held clone
