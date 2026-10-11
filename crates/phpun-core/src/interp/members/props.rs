@@ -72,50 +72,33 @@ impl<'a> Interp<'a> {
         let direct = match (dc, p) {
             (Some(dc), Some(p)) if p.hooks.is_none() && !p.readonly => {
                 self.hooked_prop(obj, pname).is_none()
-                    && self.decl_prop_site(obj, pname).is_some_and(|(index, ec)| {
-                        let ep = &ec.decl.props[index];
-                        ep.visibility == p.visibility
-                            && !ep.readonly
+                    && matches!(self.decl_prop(obj, pname), Some((ep, ref ec))
+                        if ep.visibility == p.visibility && !ep.readonly
                             && (ep.visibility != crate::ast::Visibility::Private
-                                || ec.name() == dc.name())
-                    })
+                                || ec.name() == dc.name()))
             }
             _ => false,
         };
         match (dc, p) {
             (Some(dc), Some(p)) if direct => {
-                let class = obj.borrow().class.clone();
                 let key = if p.visibility == crate::ast::Visibility::Private {
-                    class
-                        .flat_props
-                        .get()
-                        .and_then(|flat| {
-                            flat.iter().find(|fp| {
-                                Rc::ptr_eq(&fp.declaring, dc)
-                                    && std::ptr::eq(&dc.decl.props[fp.prop_idx], p)
-                            })
-                        })
-                        .map(|fp| std::borrow::Cow::Borrowed(fp.key.as_str()))
-                        .unwrap_or_else(|| {
-                            std::borrow::Cow::Owned(format!("\0{}\0{}", dc.name(), pname))
-                        })
+                    format!("\0{}\0{}", dc.name(), pname)
                 } else {
-                    std::borrow::Cow::Borrowed(pname)
+                    pname.to_string()
                 };
-                let key = key.as_ref();
                 let mut o = obj.borrow_mut();
-                match o.prop_get(key) {
+                match o.prop_get(&key) {
                     Some(c) => *c.borrow_mut() = v,
                     None => {
                         // Typed-uninit slot: order was reserved at
                         // instantiate, the cell lands now.
-                        o.prop_insert(key, cell(v));
-                        if !o.prop_order.iter().any(|k| k == key) {
-                            o.prop_order.push(key.to_string());
+                        o.prop_insert(key.clone(), cell(v));
+                        if !o.prop_order.contains(&key) {
+                            o.prop_order.push(key.clone());
                         }
                     }
                 }
-                o.unset_props.remove(key);
+                o.unset_props.remove(&key);
                 Ok(())
             }
             _ => self
