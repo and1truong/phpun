@@ -3210,6 +3210,41 @@ Freshworkspace/fmt/clippy,ONEreceiver/GC/alias/arenachecks,native25+19/profile/p
 |examples/composer/run.php|8.279|8.343|1.0077|
 
 7rotating profiler-off freshwhole geomean {"main_php_ratio": 3.921363216139543, "candidate_php_ratio": 2.722234418625982, "candidate_main_ratio": 0.6942061391869572, "candidate_parent_ratio": 0.9785116771110516}. Objects12.051×PHP/long20.430×,strings3.594×/long4.480×. Wholeobjects+3.4%/long+.8%,app+6.2%/DB+1.4% negatives retained;31app+.6%/Composer+.8%flat. Whole unrelated improvements not attributed to withdrawnstorage. No CPU attribution/cohortmultiplication/parity claim. Physicalobjects833119→883121requests(+50002)/51671479→52871527bytes(+1200048),arraysidentical:cost of restoring compact canonical cells. No phantom speedup from report-onlychild.
+
+## #358: perf(objects): avoid destructor tally allocation for surviving direct objects (2026-10-11)
+
+After existing gc_note_purple/gc_note_dying callbacks, direct Object with currentRcstrong>1 cannot satisfy original destructor tally n+1 ownership test. Return before building held HashMap. Both GC calls/order preserved,final-owner/callable/capture/destructor/unwind paths unchanged. Four-line shared guard,no new storage/cache/pool/dependency/unsafe.
+
+Guard checks current count after GC callbacks can release owners. All non-object/final-owner paths retain existing tally and lifetime handling. ONEexisting receiver unit includes alias surviving owner thenfinal destructor S/D order;canonical nativecycle/destructor probe and previousGC/unwind/memory/alias checks reused.
+
+Runtime 6e5a05e26691747ef9c942119815e6b1feae41e4; timing source 6b6339d2051665d3bd453be9fd61271d05c6e78c; report/integration source 6b6339d2051665d3bd453be9fd61271d05c6e78c.
+
+31alternating profiler-off nativePHP8.5.11-n byte-gatedpairs,target+negativeconfirmation,separatefreshwhole7rotatingPHP/main/parent/candidate. Physical/profiler diagnostics separate.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 94.878 | 92.606 | 0.9761 |
+| bench/40-objects.php 20 5000 | 369.739 | 356.679 | 0.9647 |
+| bench/20-strings.php 100 | 226.148 | 219.768 | 0.9718 |
+| bench/app/cli.php 100 20 | 33.688 | 32.448 | 0.9632 |
+| bench/30-arrays.php | 86.809 | 83.579 | 0.9628 |
+
+31objects94.878→92.606ms(−2.4%),long369.739→356.679(−3.5%);strings100−2.8%,app−3.7%,arrays−3.7% not attributed. Whole7 main3.89047→candidate2.77083×PHP,parent−.3%;objects−3.8%/11.884×PHP,long−.2%flat/19.456×PHP. Whole unrelated negativesComposer+9.1%,sieve+6.2%,JSON+3.5%,app+1.2%,fib+1.8%,DB+.6% retained;confirm31Composer−1.2%,JSON−2.1%,sieve−3.5%,app−2.3%,large negatives notconfirmed. Whole strings−5.7%/long−8.9% not attributed. Physicalobjects883122→858127requests(−24995),52873857→49974441bytes(−2899416);arrayssamerequests/+4B. Retained boundedtargetwin+allocatorreduction,not parity/CPUprofile/cohortmultiplication.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 883122→858127; bytes 52873857→49974441.
+- arrays: requests 616041→616041; bytes 26545498→26545502.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONEexistingreceiveralias/final-owner check andnativecyclegatesPASS. Existingcanonicalrootbuffer/callback/ref/arena/OOM gates retained.
+All3406only2knownrange crash/timeout swaps andGCpass→timeout;serializedsame10s parent8440/candidate8493ms bothPASS.599knownfails unchanged;fullcandidate2731pass599fail25skip38unsupported6crash7timeout retained. AfterGCisolation only2knownrange swaps remain,not compatibility improvement.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/surviving-object-dtor-*.
 ## PR357 P1 review: full-range source identity (2026-10-11)
 
 P1review: full normalized substr reuses source zend_string. Shared borrowed range preserves source Rc/charge when input is string;canonical bytes conversion stays before integer reads,non-string conversion/new partialresults retain originalcharge/trace. mb_strcut trims borrowed boundary before originalValuebytes producer. ONEexistingarena check proves0/negative/oversizedfullranges preservepointer/nocharge. Release54b28f/ELF58266af: original4MB fullrange native/candidateexit0(stdout/stderrbyteexact),oldparentfalseOOM255;canonicalprofilematchesstdout/exit. Originalpartial4MBOOMremainsnativebyteexactinclframe. Workspace/fmt/clippy/native25+19/profilePASS. Full3406onlygenerator timeout→fail;serializedsame10s parent9265/candidate9068ms bothFAIL;full2732pass600fail25skip38unsupported6crash5timeout retained,notcompatgain. No newtimingclaim;oldcohortsretainoriginalfrozenhashes. Complete priorissue92body archivedverbatim beforeconsolidation,withhash/update_at;latestbodygovernsroadmap.
