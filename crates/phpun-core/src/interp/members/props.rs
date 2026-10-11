@@ -757,20 +757,6 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<Value, PhpError> {
         let Some(tys) = &p.ty else { return Ok(v) };
-        // Exact primitive values need no class-name resolution or coercion.
-        // Int -> float widening and every union/nullable/class/error case
-        // retain the canonical check below.
-        if tys.len() == 1
-            && match &v {
-                Value::Float(_) => tys[0].eq_ignore_ascii_case("float"),
-                Value::Int(_) => tys[0].eq_ignore_ascii_case("int"),
-                Value::Bool(_) => tys[0].eq_ignore_ascii_case("bool"),
-                Value::Str(_) => tys[0].eq_ignore_ascii_case("string"),
-                _ => false,
-            }
-        {
-            return Ok(v);
-        }
         // self/parent/static in a prop type resolve against the
         // DECLARING class (typed_properties_043); keep the literal
         // members for error display.
@@ -1062,6 +1048,20 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<Value, PhpError> {
         let Some(tys) = &p.ty else { return Ok(v) };
+        // Exact primitive values need no class-name resolution or coercion.
+        // Int -> float widening and every union/nullable/class/error case
+        // retain the canonical check below.
+        if tys.len() == 1
+            && match &v {
+                Value::Float(_) => tys[0].eq_ignore_ascii_case("float"),
+                Value::Int(_) => tys[0].eq_ignore_ascii_case("int"),
+                Value::Bool(_) => tys[0].eq_ignore_ascii_case("bool"),
+                Value::Str(_) => tys[0].eq_ignore_ascii_case("string"),
+                _ => false,
+            }
+        {
+            return Ok(v);
+        }
         // self/parent/static in a prop type resolve against the
         // DECLARING class (typed_properties_043); keep the literal
         // members for error display.
