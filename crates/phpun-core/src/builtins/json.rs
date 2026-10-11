@@ -912,7 +912,7 @@ fn json_value(
                 return Err(J_STATE);
             }
             if cx.assoc {
-                let mut a = PhpArray::new();
+                let mut a = PhpArray::keyed_map();
                 loop {
                     json_ws(b, pos)?;
                     if b.get(*pos) != Some(&b'"') {
