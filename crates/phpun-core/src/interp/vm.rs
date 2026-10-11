@@ -3442,7 +3442,7 @@ bool(false)
 int(0)
 int(0)
 [false] [true]
-Cannot modify readonly property WriteTyped::$a
+Cannot indirectly modify readonly property WriteTyped::$a
 set:3:false
 1
 5

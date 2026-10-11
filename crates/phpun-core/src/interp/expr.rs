@@ -3518,8 +3518,8 @@ impl<'a> Interp<'a> {
                         newv = self.prop_typed_write_check(&pd, &dcls, newv)?;
                     }
                 }
-                let nv = self.typed_slot_store(&c, newv.clone())?;
-                self.cell_store(&c, nv)?;
+                newv = self.typed_slot_store(&c, newv)?;
+                self.cell_store(&c, newv.clone())?;
             }
             Late::Keyed { base, keys } => {
                 // A `??=` detached root re-resolves AFTER the RHS — the
@@ -3684,8 +3684,8 @@ impl<'a> Interp<'a> {
             }
             Late::None => match target_cell {
                 Some(c) => {
-                    let nv = self.typed_slot_store(&c, newv.clone())?;
-                    self.cell_store(&c, nv)?;
+                    newv = self.typed_slot_store(&c, newv)?;
+                    self.cell_store(&c, newv.clone())?;
                 }
                 None => {
                     // `list()`/`[]` destructure: zend's first FETCH_LIST
@@ -6299,12 +6299,12 @@ impl<'a> Interp<'a> {
                         // a typed prop stays type-gated (064). The store
                         // goes through cell_store so the displaced zval's
                         // destructor runs (a shared cell can alias vars).
-                        let nv = self.typed_slot_store(&nc, v.clone())?;
+                        let v = self.typed_slot_store(&nc, v)?;
                         // Never panic on a re-entrant borrow — a live
                         // upstream borrow (a handler's write reaching
                         // this slot) drops the write invisibly (B1).
                         if let Ok(mut nb) = nc.try_borrow_mut() {
-                            let old = std::mem::replace(&mut *nb, nv);
+                            let old = std::mem::replace(&mut *nb, v.clone());
                             drop(nb);
                             // The displaced zval's destructor runs
                             // (cell_store semantics) — a shared cell can
