@@ -81,6 +81,29 @@ impl<'a> Interp<'a> {
         };
         match (dc, p) {
             (Some(dc), Some(p)) if direct => {
+                // The flat table already stores the mangled key + slot
+                // index — a private promote skips its per-write format!
+                // and hash lookup. Missing table → canonical key path.
+                let flat_i = dc.flat_props.get().and_then(|flat| {
+                    flat.iter().position(|fp| {
+                        std::rc::Rc::ptr_eq(&fp.declaring, dc)
+                            && dc.decl.props[fp.prop_idx].name == pname
+                    })
+                });
+                if let Some(i) = flat_i {
+                    let mut o = obj.borrow_mut();
+                    if let Some(s) = o.slots.get_mut(i) {
+                        match s.take() {
+                            Some(c) => {
+                                *c.borrow_mut() = v;
+                                *s = Some(c);
+                            }
+                            None => *s = Some(super::cell(v)),
+                        }
+                        o.unset_props.remove(&dc.flat_props.get().unwrap()[i].key);
+                        return Ok(());
+                    }
+                }
                 let key = if p.visibility == crate::ast::Visibility::Private {
                     format!("\0{}\0{}", dc.name(), pname)
                 } else {

@@ -1148,6 +1148,23 @@ impl<'a> Interp<'a> {
                     cls = s.classes.get(&name.to_lowercase()).cloned();
                 }
                 if cls.is_none() {
+                    // Trait/interface names miss the class map — zend
+                    // still knows the kind and errors it, not "not found".
+                    let t = name.trim_start_matches('\\');
+                    if lkey_get(&s.traits, t).is_some() {
+                        return s.fail(PhpError::uncaught(
+                            "Error",
+                            format!("Cannot instantiate trait {t}"),
+                            *site,
+                        ));
+                    }
+                    if lkey_get(&s.interfaces, t).is_some() {
+                        return s.fail(PhpError::uncaught(
+                            "Error",
+                            format!("Cannot instantiate interface {t}"),
+                            *site,
+                        ));
+                    }
                     return s.fail(PhpError::uncaught(
                         "Error",
                         format!("Class \"{name}\" not found"),
