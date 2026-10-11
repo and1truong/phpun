@@ -4121,10 +4121,13 @@ unset($e); unset($h); var_dump($wh->get());
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
         let mut it = Interp::new("arena.php");
-        for limit in ["128M", "64M", "-1", " 256K ", "128M"] {
-            it.ini.insert("memory_limit".into(), limit.into());
-            assert!(it.statement_boundary().is_none());
-            assert_eq!(it.mem_limit_ck.0, it.ini_bytes("memory_limit"));
+        {
+            let mut limits = Interp::new("limit.php");
+            limits.ini.insert("memory_limit".into(), "128M".into());
+            assert!(limits.statement_boundary().is_none());
+            limits.ini.insert("memory_limit".into(), "1K".into());
+            assert!(limits.statement_boundary().is_some());
+            assert!(limits.mem_exceeded);
         }
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let frame = it.frame_new("direct");
