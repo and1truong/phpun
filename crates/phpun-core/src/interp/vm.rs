@@ -1590,7 +1590,14 @@ impl<'a> Interp<'a> {
                 self.vm_refresh(comp, &mut slots);
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            if let Some(value) = native::execute(self, decl, &slots) {
+            if let Some(value) = if self.cur().this_obj.is_none() && self.cur().closure_rc.is_none()
+            {
+                // Tier one accepts globals only; do not pay an outlined native
+                // entry on every method/callback that must keep the VM.
+                native::execute(self, decl, &slots)
+            } else {
+                None
+            } {
                 return Ok(Flow::Return(value));
             }
             self.vm_exec(comp, &mut slots, temps_base)
