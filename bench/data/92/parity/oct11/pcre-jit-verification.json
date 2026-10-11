@@ -1,0 +1,46 @@
+{
+  "binary_sha256": "03345b01e95d867042a782eb1a6fd7d8408d00d03ec6d0a9c8ebeb1dfb0f6a21",
+  "source": "2f1e67167c1357ada8cf245eebf4d2aeef2e953f",
+  "parent": "pcre-pattern-cache",
+  "summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/errors05.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/pcre/tests/preg_match_error3.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ]
+}

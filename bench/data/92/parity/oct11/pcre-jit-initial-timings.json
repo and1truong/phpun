@@ -1,0 +1,102 @@
+{
+  "host": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "metric": "cold CLI ms; 7 alternating reps; profilers off",
+  "source": "2f1e67167c1357ada8cf245eebf4d2aeef2e953f",
+  "dirty": true,
+  "build": "rustc 1.99.0; cargo build --offline --release; LTO=true/codegen-units=1",
+  "binaries": {
+    "/workspace/parity92/oct11/pcre-pattern-cache": "70620800e96d3365251603fa902a2751e08e2c86e4490e373ddb35c675263790",
+    "/workspace/parity92/oct11/pcre-jit": "03345b01e95d867042a782eb1a6fd7d8408d00d03ec6d0a9c8ebeb1dfb0f6a21",
+    "/workspace/php85": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f"
+  },
+  "php_args": [
+    "-n"
+  ],
+  "cases": [
+    {
+      "argv": [
+        "bench/50-regex.php"
+      ],
+      "before_ms": [
+        42.866262,
+        41.964545,
+        37.621891,
+        42.246534,
+        39.313396,
+        44.304981,
+        38.31587
+      ],
+      "after_ms": [
+        18.323035,
+        18.079423,
+        21.647541,
+        18.116443,
+        17.752907,
+        18.226135,
+        21.824402
+      ],
+      "before_median": 41.964545,
+      "after_median": 18.226135,
+      "ratio": 0.4343222355919741,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "bench/profile/pcre-patterns.php",
+        "10000",
+        "4"
+      ],
+      "before_ms": [
+        83.715954,
+        89.689475,
+        83.56701,
+        79.603142,
+        90.20744,
+        91.125756,
+        74.926988
+      ],
+      "after_ms": [
+        101.012309,
+        86.638431,
+        88.134075,
+        84.293297,
+        102.396762,
+        80.065328,
+        99.558237
+      ],
+      "before_median": 83.715954,
+      "after_median": 88.134075,
+      "ratio": 1.0527751376995595,
+      "gate": "exit/stdout/stderr == PHP"
+    },
+    {
+      "argv": [
+        "bench/profile/pcre-patterns.php",
+        "10000",
+        "300"
+      ],
+      "before_ms": [
+        88.807729,
+        85.897851,
+        88.233335,
+        82.385167,
+        84.851197,
+        84.815703,
+        87.840755
+      ],
+      "after_ms": [
+        117.082084,
+        115.705363,
+        108.701086,
+        107.912038,
+        106.483169,
+        107.132356,
+        122.39069
+      ],
+      "before_median": 85.897851,
+      "after_median": 108.701086,
+      "ratio": 1.2654692141250425,
+      "gate": "exit/stdout/stderr == PHP"
+    }
+  ]
+}

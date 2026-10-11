@@ -1,0 +1,18 @@
+phpun PHPT report — binary under test: /workspace/parity92/oct11/pcre-pattern-cache-review
+========================================================================
+FAIL           errors05.phpt                                      Test preg_match() function : error conditions - jit stacklimit exhausted
+FAIL           preg_match_error3.phpt                             Test preg_match() function : error conditions - jit stacklimit exhausted
+========================================================================
+Total:           2
+Passed:          0
+Failed:          2
+Expected-fail:   0
+Warned (xpass):  0
+Skipped:         0
+Unsupported:     0
+Borked:          0
+Crashed:         0
+Timed out:       0
+Applicable:      2
+Compatibility:   0.0%  (0/2)
+wrote /workspace/parity92/oct11/pcre-pattern-cache-review-jit-errors-isolated.json

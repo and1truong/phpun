@@ -2713,3 +2713,40 @@ Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/pcre-pattern-cache-review-*.
+
+## #332: perf(pcre): enable cached native JIT with PHP-sized working sets (2026-10-11)
+
+Enable native PCRE2 JIT through the existing vendored engine. Compile once on successful cache misses with PHP pcre.jit default enabled;cached patterns retain their initial JIT choice across INI toggles. Expose native PCRE_JIT_SUPPORT;owned interpreter stack uses PHP32–192KiB bounds.
+
+UTF validation,offset/global-empty matching,limits and JIT stacklimit errors remain native. NO_JIT/unsupported targets keep canonical PCRE2. Allocation/compilation warnings propagate through PHP error handlers. Worker pattern reset correction from333included. Measured300-pattern thrash required PHP4096capacity;rawkeys>64KiB are not retained. Ceiling/byte-budgeted LRU upgrade documented. No dependency/benchmark recognition.
+
+Runtime 0938d8f8818180ac925cb7b5a67c05ec72fd7634; timing source 0938d8f8818180ac925cb7b5a67c05ec72fd7634; report/integration source 3ae60dfe57fde751d53464242b620f7e631df0e5.
+
+Thirty-one isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/50-regex.php | 41.400 | 19.262 | 0.4653 |
+| bench/profile/pcre-patterns.php 10000 4 | 80.742 | 80.378 | 0.9955 |
+| bench/profile/pcre-patterns.php 10000 300 | 91.034 | 80.270 | 0.8818 |
+| bench/profile/pcre-patterns.php 10000 5000 | 90.120 | 124.881 | 1.3857 |
+| bench/40-objects.php | 99.954 | 100.771 | 1.0082 |
+
+Final0938d8f/0b0445c:31corpus41.400→19.262ms(−53.5%),four-pattern80.742→80.378(−.5%,flat),300patterns91.034→80.270(−11.8%),5000patterns90.120→124.881(+38.6%negative),objects99.954→100.771(+.8%,flat). Sevenrotating wholePHP/main4e6/parentcache0217/final:geo3.77709→3.50124×PHP(−7.30%main,−7.52%parent),regex2.476×PHP,objects13.686×/long21.787×,sieve8.888×. Negatives:wholeobjects+9.5%parent,31+.8%;fib+4.3%,app+3.0% kept. EarlierJIT256case31patterns300+31.3% andwholegeo3.6305×PHP are separate historical records;do not combine. Final all3406:2731pass599fail,onlytwoJITfail→pass+2knownranges relativeparentcache. GCfulltimeout unchanged,parent/candidate serializedPASS. TwoJITerrorcases isolatedparentFAIL/candidatePASS,exactrawretained. No fullcompatibility/parity claim. CPUprofile attempt not successful:perf unavailable,gprofng timer denied;no CPUattribution inferred.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- regex: requests 327812→327940; bytes 29923534→29923679.
+- patterns4: requests 1122104→1142112; bytes 59725153→59745178.
+- patterns300: requests 1152098→1143302; bytes 60810763→59952014.
+- patterns5000: requests 1152098→1182106; bytes 60925966→61462931.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONEexistingcachecheck extends actualnativeJIT/INI/toggles/NO_JIT/worker reset/4096eviction and >64KiBnonretention;nativedefault-JIT gap now byte-matches PHP. Workspace/fmt/clippy,25+19/profile/probesPASS.
+All3406PHPT:2731pass599fail;only2JITfail→pass+2knownrangecrash/timeout swaps vs correctedparentcache. GCfulltimeout retained,parent/candidate serialized10sPASS;bothJITcases serializedparentFAIL/candidatePASS.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/pcre-jit-working-set-*.
