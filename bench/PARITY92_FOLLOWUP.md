@@ -1114,3 +1114,46 @@ comparator/extended dimension byte/exit/error gates,VM-profile pass. All3406
 individual PHPT statuses identical to scalar-write parent:2727pass603fail25skip
 38unsupported6crash7timeout. External CI not asserted green. Next #251 extends
 pure integer native control-flow validation to backward/nested loops.
+
+## #251: validate pure integer backward/nested control flow (2026-10-11)
+
+Replace the existing forward-only depth scan with a worklist over reachable
+Ops. Every merge/backedge must agree on stack depth and every destination is
+bounds-checked. Reuse the existing integer emitter/jump patching and all purity/
+local-init/overflow/depth/current-page/dependency guards. No loop recognizer,
+new dependency or bypassed deadline; deadline/profiler runs retain the VM.
+Guard failure restores spans and replays the complete pure root. Scalar loops
+own no PHP objects/effects; this does not compile arrays/objects/builtins.
+
+Existing native runnable check now proves actual nested-loop execution,
+break/continue, overflow/uninit replay exactly once, deadline exclusion and
+trace/arena cleanup. Runtime2919eda,36add/19delete.
+
+Seven isolated alternating profiler-off PHP-byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| /workspace/parity92/oct11/native-loops.php 100000 | 35.410/7.060 | 0.199 |
+| /workspace/parity92/oct11/native-loops.php 1000000 | 270.325/11.569 | 0.043 |
+| bench/10-fib.php | 8.808/8.679 | 0.985 |
+| bench/11-sieve.php | 83.384/78.517 | 0.942 |
+| bench/30-arrays.php | 91.898/100.500 | 1.094 |
+| bench/40-objects.php | 210.830/210.557 | 0.999 |
+| bench/20-strings.php | 160.912/157.591 | 0.979 |
+| bench/app/cli.php 100 20 | 33.395/32.852 | 0.984 |
+| examples/composer/run.php | 7.821/7.966 | 1.019 |
+
+Separate seven rotating native PHP/parent/candidate loop workload:100k
+5.013/33.878/7.404ms (candidate1.477×PHP);1M15.730/275.901/11.312ms
+(candidate0.719×PHP). Includes parsing/startup/warmup, not isolated kernel
+execution; fixture contains generic sum/nested/while loops, no cached result
+or algorithm recognizer. These are additional scalar workloads, **not an
+original-ninebench geomean or suite parity claim**. Initial arrays+9.4% and
+Composer+1.9% negatives retained;31followuparrays95.917→93.887(−2.1%),
+Composer7.820→7.650(−2.2%). No nontarget speed attribution.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload and extended
+loop/warm-comparator/dimension nativePHP8.5.11 -n byte/exit/stderr gates,
+VM-profile pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout;
+individual changes vs parent: {"/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": ["timeout", "crash"], "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": ["crash", "timeout"]}. External CI not asserted green.
+Next #253 replaces scalar first-byte scanning in shared bfind with libc memchr.
