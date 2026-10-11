@@ -541,7 +541,6 @@ impl<'a> Interp<'a> {
             }
         }
         let mut out = CallArgs::empty();
-        out.cells = self.vm_cell_pool.pop().unwrap_or_default();
         // zend's INIT_FCALL pushes the frame's arena span before args
         // evaluate. Reserve the whole call span now (VM_FRAME_SLOTS +
         // one slot per arg): the end-of-args catch-up then no-ops for
