@@ -1,0 +1,31 @@
+{
+  "binary_sha256": "f4993d4c25275a5d8a06ae633e6b9260ca466a8110352b756ea23b80dc24eaac",
+  "source": "df67afdc76a19f0983c15956b37ebded3a7f6a37",
+  "parent": "memory-limit-boundaries",
+  "summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/exceptions/exception_005.phpt",
+      "before": "fail",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/traits/error_007.phpt",
+      "before": "fail",
+      "after": "pass"
+    }
+  ]
+}
