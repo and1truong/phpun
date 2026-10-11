@@ -7039,7 +7039,7 @@ impl<'a> Interp<'a> {
                 } else {
                     // Scalar properties cannot buffer a graph target or run
                     // a callback in this walk, like scalar-only arrays above.
-                    if {
+                    let scalar_only = {
                         let b = o.borrow();
                         b.prop_order
                             .iter()
@@ -7054,7 +7054,8 @@ impl<'a> Interp<'a> {
                                         | Value::Str(_)
                                 )
                             })
-                    } {
+                    };
+                    if scalar_only {
                         return;
                     }
                     let dying = {
