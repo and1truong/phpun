@@ -6279,6 +6279,26 @@ impl<'a> Interp<'a> {
                 }
                 continue;
             }
+            // An existing packed scalar has no exported Cell or typed-slot
+            // owner. Keep the validated final write inline; deferred RHS,
+            // detached operands and compound writes use the canonical fetch.
+            if n == last && rhs_late.is_none() && !compound && !self.detached_dim {
+                if let Some(k) = k.as_ref().and_then(|k| match &*k.borrow() {
+                    Value::Int(i) => Some(*i),
+                    _ => None,
+                }) {
+                    if matches!(&*c.borrow(), Value::Array(a) if a.borrow().entries.is_scalar_packed())
+                    {
+                        let mut b = c.borrow_mut();
+                        self.cow_split(&mut b);
+                        if let Value::Array(a) = &*b {
+                            if a.borrow_mut().entries.store_packed_scalar(k, &v) {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+            }
             // OP_DATA belongs to the last dim — intermediate levels
             // never see the deferred RHS.
             let rr = self.index_into_key_last(
@@ -7195,7 +7215,7 @@ impl<'a> Interp<'a> {
                     let mut arr = rc.borrow_mut();
                     let grew = match ak {
                         Some(ak) => {
-                            let grew = arr.get_cell(&ak).is_none();
+                            let grew = arr.get(&ak).is_none();
                             arr.set(ak, v);
                             grew
                         }
@@ -7580,8 +7600,13 @@ impl<'a> Interp<'a> {
     /// The separated copy for CoW / array-copy contexts (`=`, exchange
     /// values): ref-marked cells are re-bound, the rest duplicated.
     pub fn dup_array(&self, a: &PhpArray) -> PhpArray {
+        if a.entries.is_scalar_packed() {
+            let mut copy = a.clone();
+            copy.is_ref = a.is_ref;
+            return copy;
+        }
         let mut copy = PhpArray {
-            entries: Vec::with_capacity(a.entries.len()),
+            entries: Vec::with_capacity(a.entries.len()).into(),
             next: a.next,
             is_ref: a.is_ref,
             iter_pos: a.iter_pos,

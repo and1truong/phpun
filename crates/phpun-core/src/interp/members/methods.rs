@@ -744,7 +744,7 @@ impl<'a> Interp<'a> {
                 );
                 self.internal_cb -= 1;
                 Self::ao_set_sorting(obj, false);
-                arr.borrow_mut().entries = sorted;
+                arr.borrow_mut().entries = sorted.into();
                 // Notices queued inside the sort's compares (object→
                 // number casts) must drain at THIS call site — the
                 // builtin-boundary flush in call_builtin never runs on
@@ -814,7 +814,7 @@ impl<'a> Interp<'a> {
                 );
                 self.internal_cb -= 1;
                 Self::ao_set_sorting(obj, false);
-                arr.borrow_mut().entries = sorted;
+                arr.borrow_mut().entries = sorted.into();
                 let nr = self.emit_cmp_notices();
                 if let Some(e) = cb_err {
                     self.trace_pop();
