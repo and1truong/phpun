@@ -1846,3 +1846,46 @@ Final compactSHA256 0feb20789ce1b0b97028950ac31e2612431884ebc03c996aa53d1923e8d8
 Fresh clean real main0ddef51 binarya8d427b:3406map equal integrated reference, native ctor-ref pass but two globals-reference probes fail on main and pass in #297. PHP8.5.11-n hash32fa863; OPcache loaded CLI0/JITdisable, no mbstring extension.
 
 Seven rotating PHP/main0ddef/parent/final byte-gated profiler-off runs:9bench main4.265840→final4.037589×PHP, final/main0.946493,final/parent0.963475. FinalPHP ratios startup1.556,fib0.799,sieve8.212,strings4.712,arrays4.476,objects18.991,regex5.607,JSON3.494,DB3.558. Longstrings6.034,longobjects33.234,app6.889,Composer1.757.31followupfib8.502→8.820(+3.7%);JSON516.901→530.245(+2.6%) retained. This host/main0ddef/candidate snapshot is not user2.71× or a later moving main. Full raw compact-packed-four-timings.json; no multiplication of stage gains/parity claim.
+
+## #296: bench(vm): retain the rejected empty-method dispatch experiment (2026-10-11)
+
+Report-only: tested removing body.is_empty from existing vm_method_target, then ordinary-reverted the complete prototype and added unit. Final crates/Cargo runtime diff versus #299 is EMPTY; final executable/behavior is the exact frozen compact-packed parent, not the rejected empty-method-dispatch binary.
+
+Rejected prototype remains in commit6691796 and frozen4b15cda/f3afeac; no retained method/ctor runtime optimization, value ABI extension or claim that #296 is delivered. Existing native/global/arena/readonly/error/reference guard suite remains on parent.
+
+Runtime 6691796308cccc558a22cf0f39314945dd7e8740; timing source 4b15cdaf6fa35026f3a3992a7e8b9202b71caa2f; report/integration source 32d11959721b838ffa87729c513384bfce7c6c6f.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 143.845 | 145.914 | 1.0144 |
+| bench/40-objects.php 20 5000 | 603.776 | 599.932 | 0.9936 |
+| bench/profile/objects.php ctor 5000 | 33.825 | 34.054 | 1.0068 |
+| bench/profile/objects.php norm 5000 | 43.007 | 40.860 | 0.9501 |
+| bench/11-sieve.php | 61.880 | 62.753 | 1.0141 |
+| bench/30-arrays.php | 79.061 | 76.559 | 0.9684 |
+| bench/20-strings.php | 62.776 | 62.807 | 1.0005 |
+| bench/60-json.php | 519.746 | 517.052 | 0.9948 |
+| bench/10-fib.php | 8.166 | 8.178 | 1.0014 |
+| bench/app/cli.php 100 20 | 33.351 | 32.466 | 0.9734 |
+| examples/composer/run.php | 7.850 | 7.922 | 1.0092 |
+
+7pairs objects+1.4%,longobjects−.6%,ctor+.7%,norm−5%,sieve+1.4%,arrays−3.2%,stringsflat,JSON−.5%,fibflat,app−2.7%,Composer+.9%. No demonstrated target ctor/object benefit. Physical ctor5000 and actual objects1 requests identical before/after; tiny byte delta is argv path length. ctor diagnostic has switch and uses AST root (pre/cells phase timers both0), so its unchanging event count is not proof of the compiled path; actual objects1 physical is unchanged too. Profiling totals are inclusive/not speed evidence. Reject rather than attribute unrelated norm/array variation to the guard.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- ctor5000: requests 382646→382646; bytes 18582830→18582858.
+- objects1: requests 352870→352870; bytes 21023574→21023602.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Rejected ONE existing receiver unit covered inherited/default/promoted/error/no-op behavior and eligibility; revert restores parent unit. No added framework/fixtures. Existing native main/parent globals probes remain in report.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Parent summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/empty-method-dispatch-*.
+
+Final #296 decision: revert6691796 through ordinary commit; runtime crates/Cargo diff with #299 is empty (checked). The empty-method-dispatch ELF is the REJECTED prototype, not final PR runtime. Physical/core/native comparisons and inclusive profiles remain separate. Final uses exact compact-packed source/binary0feb207 and verified parent map, including its existing failing/unsupported/resource statuses; no new test/rebuild required for a metadata-only identical runtime. Perf goal #92 continues in #298.

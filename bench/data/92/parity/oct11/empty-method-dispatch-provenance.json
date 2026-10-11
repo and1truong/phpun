@@ -1,0 +1,61 @@
+{
+  "source": "32d11959721b838ffa87729c513384bfce7c6c6f",
+  "runtime": "6691796308cccc558a22cf0f39314945dd7e8740",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "ctor5000",
+      "before": {
+        "requests": 382646,
+        "bytes": 18582830
+      },
+      "after": {
+        "requests": 382646,
+        "bytes": 18582858
+      }
+    },
+    {
+      "label": "objects1",
+      "before": {
+        "requests": 352870,
+        "bytes": 21023574
+      },
+      "after": {
+        "requests": 352870,
+        "bytes": 21023602
+      }
+    }
+  ],
+  "binary_sha256": "f3afeacb336b7a459c4c08d27d6f0e118542d3ffacb83ed90510265afce4803e",
+  "scope": "Report-only: tested removing body.is_empty from existing vm_method_target, then ordinary-reverted the complete prototype and added unit. Final crates/Cargo runtime diff versus #299 is EMPTY; final executable/behavior is the exact frozen compact-packed parent, not the rejected empty-method-dispatch binary.",
+  "fallbacks": "Rejected prototype remains in commit6691796 and frozen4b15cda/f3afeac; no retained method/ctor runtime optimization, value ABI extension or claim that #296 is delivered. Existing native/global/arena/readonly/error/reference guard suite remains on parent."
+}
