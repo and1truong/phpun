@@ -1,0 +1,17 @@
+phpun PHPT report — binary under test: /workspace/parity92/oct11/stack-compact-review
+========================================================================
+FAIL           send_returns_current.phpt                          $generator->send() returns the yielded value
+========================================================================
+Total:           1
+Passed:          0
+Failed:          1
+Expected-fail:   0
+Warned (xpass):  0
+Skipped:         0
+Unsupported:     0
+Borked:          0
+Crashed:         0
+Timed out:       0
+Applicable:      1
+Compatibility:   0.0%  (0/1)
+wrote /workspace/parity92/oct11/stack-compact-review-generator-send-isolated.json

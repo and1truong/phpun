@@ -1,0 +1,82 @@
+{
+  "source": "54b28f0432f52f463646d7bb8ec0786ce898bfe3",
+  "runtime": "54b28f0432f52f463646d7bb8ec0786ce898bfe3",
+  "binary_sha256": "58266af8714573e6f1b055a7699447ad2f048c6d5a698c19a7d392794ee91d72",
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+      "before": "timeout",
+      "after": "fail"
+    }
+  ],
+  "phpt_changes_after_generator_isolation": [],
+  "generator_rechecks": [
+    {
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+          "name": "$generator->send() returns the yielded value",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 9265
+        }
+      ]
+    },
+    {
+      "summary": {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "xfailed": 0,
+        "xpassed": 0,
+        "skipped": 0,
+        "unsupported": 0,
+        "borked": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "applicable": 1,
+        "compatibility_pct": 0.0
+      },
+      "results": [
+        {
+          "file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt",
+          "name": "$generator->send() returns the yielded value",
+          "status": "fail",
+          "reason": "",
+          "duration_ms": 9068
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 600,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 5,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "review_thread": "PRRT_kwDOU4oR3M6rPtRw",
+  "gates": "fullrange4MB oldparent255/native+candidate0 exactstdio;canonicalstdout/exitmatch;partial4MB nativefatalbyteexact;workspace/fmt/clippy/native25+19/profile/ONEsourceidentitycheckPASS",
+  "timings": "no new timing claim;previous352cost and360prototype cohorts remain pre-review evidence"
+}
