@@ -1,8 +1,8 @@
 //! A bounded, W^X integer tier. Only proven pure graphs may restart in the VM.
 use super::{CachedFn, Compiled, FunctionDecl, Interp, Op, Rc, Slot, Value};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
-pub(super) enum State {
+pub(in crate::interp) enum State {
     Cold(u32),
     Disabled,
     Ready(Rc<Program>),
@@ -16,7 +16,7 @@ struct Context {
     calls: u64,
 }
 
-pub(super) struct Program {
+pub(in crate::interp) struct Program {
     code: *mut libc::c_void,
     len: usize,
     // Keep declarations alive, not compiled bodies: recursive caches must not
@@ -470,7 +470,14 @@ impl Program {
         if e.bytes.len() > 131072 || e.bytes.len() > it.native_code_budget {
             return None;
         }
-        let len = e.bytes.len();
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        if page == 0 {
+            return None;
+        }
+        let len = e.bytes.len().checked_add(page - 1)? / page * page;
+        if len > it.native_code_budget {
+            return None;
+        }
         // SAFETY: anonymous private RW mapping, initialized completely before
         // publishing RX. No writable executable page or external code bytes.
         let code = unsafe {
@@ -493,7 +500,7 @@ impl Program {
                 return None;
             }
         }
-        // ponytail: cumulative request budget, never refunded on a guard exit;
+        // ponytail: cumulative interpreter budget, never refunded on a guard exit;
         // bounded to8MiB even if a request cycles many failing declarations.
         it.native_code_budget -= len;
         Some(Self {
@@ -505,10 +512,10 @@ impl Program {
     }
 }
 
+#[inline(never)]
 pub(super) fn execute(
     it: &mut Interp<'_>,
     decl: &Rc<FunctionDecl>,
-    comp: &Compiled,
     slots: &[Slot],
 ) -> Option<Value> {
     if it.deadline.is_some()
@@ -519,13 +526,17 @@ pub(super) fn execute(
     {
         return None;
     }
+    let key = Rc::as_ptr(decl) as usize;
+    if it.native_fns.len() >= 4096 && !it.native_fns.contains_key(&key) {
+        return None;
+    }
     let program = {
-        let mut state = comp.native.borrow_mut();
-        match &mut *state {
+        let state = it.native_fns.entry(key).or_insert(State::Cold(0));
+        match state {
             State::Disabled => return None,
             State::Ready(p) => Some(p.clone()),
             State::Cold(n) => {
-                *n += 1;
+                *n = n.saturating_add(1);
                 if *n < 64 {
                     return None;
                 }
@@ -554,11 +565,11 @@ pub(super) fn execute(
         None => match Program::build(it, decl) {
             Some(p) => {
                 let p = Rc::new(p);
-                *comp.native.borrow_mut() = State::Ready(p.clone());
+                it.native_fns.insert(key, State::Ready(p.clone()));
                 p
             }
             None => {
-                *comp.native.borrow_mut() = State::Disabled;
+                it.native_fns.insert(key, State::Disabled);
                 return None;
             }
         },
@@ -568,7 +579,7 @@ pub(super) fn execute(
             .get(name.as_ref())
             .is_some_and(|current| Rc::ptr_eq(current, d))
     }) {
-        *comp.native.borrow_mut() = State::Disabled;
+        it.native_fns.insert(key, State::Disabled);
         return None;
     }
     let top = it.vm_stack.last_mut()?;
@@ -592,11 +603,7 @@ pub(super) fn execute(
         program.executions.set(program.executions.get() + 1);
         Some(Value::Int(out))
     } else {
-        *comp.native.borrow_mut() = State::Disabled;
+        it.native_fns.insert(key, State::Disabled);
         None
     }
-}
-
-pub(super) fn cold() -> RefCell<State> {
-    RefCell::new(State::Cold(0))
 }

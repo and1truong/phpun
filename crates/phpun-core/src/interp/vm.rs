@@ -4,7 +4,7 @@
 //! Oracle probes and regression gates are required for each extension.
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-mod native;
+pub(in crate::interp) mod native;
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -42,8 +42,6 @@ pub(in crate::interp) type CompileCacheEntry =
 type ScalarGate = fn(&Value) -> bool;
 
 pub(crate) struct Compiled {
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    native: std::cell::RefCell<native::State>,
     ops: Vec<Op>,
     /// Canonical expression operations retain AST semantics inside VM control flow.
     hybrid: bool,
@@ -459,8 +457,6 @@ impl Compiled {
         // already — and promoted params keep their early publish pass.
         let value_abi = !hybrid && !needs_bind && !decl.params.iter().any(|p| p.promoted);
         Ok(Rc::new(Compiled {
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            native: native::cold(),
             hybrid,
             top_level,
             loop_body: false,
@@ -505,8 +501,6 @@ impl Compiled {
             return None;
         }
         Some(Rc::new(Self {
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            native: native::cold(),
             nslots: c.slots.len(),
             names: c.slots,
             ops: c.ops,
@@ -1585,7 +1579,7 @@ impl<'a> Interp<'a> {
                 self.vm_refresh(comp, &mut slots);
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            if let Some(value) = native::execute(self, decl, comp, &slots) {
+            if let Some(value) = native::execute(self, decl, &slots) {
                 return Ok(Flow::Return(value));
             }
             self.vm_exec(comp, &mut slots, temps_base)
@@ -3268,6 +3262,8 @@ impl<'a> Interp<'a> {
 #[cfg(test)]
 mod tests {
     use super::Interp;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    use std::rc::Rc;
 
     #[test]
     fn scalar_dimension_slots_preserve_mutation_refs_views_and_fallbacks() {
@@ -3478,12 +3474,16 @@ function nt_fib(int $n): int { return $n < 2 ? $n : nt_fib($n-1) + nt_fib($n-2);
 function nt_add($n) { return $n + 1; }
 function nt_depth(int $n): int { return $n < 1 ? 0 : nt_depth($n-1) + 1; }
 function nt_bad(int $n): int { return $n + 1; }
+function nt_local($n) { if ($n) { $x=9; } return $x; }
 function nt_effect($n) { echo "effect\n"; return $n + 1; }
 echo nt_fib(16), "\n";
-for ($i=0;$i<70;$i++) { nt_add(1); nt_depth(1); nt_bad(1); }
+for ($i=0;$i<70;$i++) { nt_add(1); nt_depth(1); nt_bad(1); nt_local(1); }
 var_dump(nt_add(PHP_INT_MAX));
 echo nt_depth(100), "\n";
 try { nt_bad(PHP_INT_MAX); } catch (TypeError $e) { echo get_class($e), "\n"; }
+set_error_handler(function () { echo "uninit\n"; return true; });
+var_dump(nt_local(0));
+restore_error_handler();
 echo nt_effect(2), "\n";
 "#,
                 );
@@ -3491,11 +3491,10 @@ echo nt_effect(2), "\n";
                 assert_eq!(it.err_buf, "");
                 assert_eq!(
                     it.out,
-                    b"987\nfloat(9.223372036854776E+18)\n100\nTypeError\neffect\n3\n"
+                    b"987\nfloat(9.223372036854776E+18)\n100\nTypeError\nuninit\nNULL\neffect\n3\n"
                 );
                 let decl = it.functions["nt_fib"].clone();
-                let comp = it.vm_compiled(&decl).unwrap();
-                match &*comp.native.borrow() {
+                match &it.native_fns[&(Rc::as_ptr(&decl) as usize)] {
                     super::native::State::Ready(p) => assert!(p.executions.get() > 0),
                     _ => panic!("pure recursive graph did not execute native code"),
                 }
@@ -3507,18 +3506,19 @@ echo nt_effect(2), "\n";
                 assert!(super::native::execute(
                     &mut it,
                     &decl,
-                    &comp,
                     &[super::Slot::V(super::Value::Int(6))]
                 )
                 .is_none());
                 assert_eq!(it.vm_stack[0].used, it.vm_stack[0].size);
                 assert_eq!(it.mem_tracked.len(), charges);
                 it.vm_stack[0].used = original;
-                for name in ["nt_add", "nt_depth", "nt_bad"] {
+                for name in ["nt_add", "nt_depth", "nt_bad", "nt_local"] {
                     let decl = it.functions[name].clone();
-                    let comp = it.vm_compiled(&decl).unwrap();
                     assert!(
-                        matches!(&*comp.native.borrow(), super::native::State::Disabled),
+                        matches!(
+                            &it.native_fns[&(Rc::as_ptr(&decl) as usize)],
+                            super::native::State::Disabled
+                        ),
                         "guard did not replay {name}"
                     );
                 }
