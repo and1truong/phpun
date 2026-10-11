@@ -1,0 +1,17 @@
+phpun PHPT report — binary under test: /workspace/parity92/oct11/pure-root-builtins
+========================================================================
+TIMEOUT        bug77345_gc_1.phpt                                 Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)
+========================================================================
+Total:           1
+Passed:          0
+Failed:          0
+Expected-fail:   0
+Warned (xpass):  0
+Skipped:         0
+Unsupported:     0
+Borked:          0
+Crashed:         0
+Timed out:       1
+Applicable:      1
+Compatibility:   0.0%  (0/1)
+wrote /workspace/parity92/oct11/pure-root-builtins-gc77345-isolated.json

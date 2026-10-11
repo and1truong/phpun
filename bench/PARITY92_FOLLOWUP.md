@@ -1972,3 +1972,44 @@ External CI not asserted green. No suite parity claim or multiplication of step 
 Raw/source/hashes in bench/data/92/parity/oct11/optional-builtin-ref-args-*.
 
 Final #301 decision: ordinary revert restores exact #302 runtime (crates/Cargo diff empty, checked). Frozen optional-builtin-ref-args ELF is rejected; final uses verified parent pure-root-builtins ELF d193a8f and parent status map. No source rebuild needed for unchanged runtime.
+
+## #303: perf(gc): use existing Fx tables for pointer scratch identities (2026-10-11)
+
+Historical pre-#305 candidate: use existing FxMap/FxSet for GcScan and temporary pointer-only visited/reach/dead sets. Persistent purple/dying state, traversal, root counts, callbacks and destructor order unchanged; no new abstraction/dependency. Frozen sourceb0a02f2/binaryfccfcdc and timingdb6adbe. Main#305 was merged afterward; final integration is rebuilt/gated/measured separately, never attribute these old pairs to final current main.
+
+Canonical graph discovery, depth/refcount accounting, typed pins, duplicate Cell identities, generator/closure/internal storage and buffer-overflow paths all retained. ONE existing registered/plain-cell fixture extended for live typed root,40deadtyped pairs and callable cycle; existing scanner check adopts visited-set type.
+
+Runtime b0a02f2105ef3591a33db1cfc00bb61bb5ae5eab; timing source db6adbea7cafa41ae6cd6cd4c5312245b2172349; report/integration source c44f9ea9e26b13bd2888cf57147c0eaa7fc6e69e.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 149.908 | 148.603 | 0.9913 |
+| bench/40-objects.php 20 5000 | 606.164 | 608.406 | 1.0037 |
+| bench/20-strings.php | 56.942 | 59.400 | 1.0432 |
+| bench/11-sieve.php | 66.147 | 65.318 | 0.9875 |
+| bench/30-arrays.php | 79.073 | 85.124 | 1.0765 |
+| bench/60-json.php | 536.640 | 537.399 | 1.0014 |
+| bench/10-fib.php | 8.528 | 8.603 | 1.0088 |
+| bench/50-regex.php | 41.480 | 41.478 | 0.9999 |
+| bench/70-db.php | 107.104 | 109.686 | 1.0241 |
+| bench/app/cli.php 100 20 | 35.225 | 34.439 | 0.9777 |
+| examples/composer/run.php | 9.178 | 8.475 | 0.9234 |
+
+7pairs objects149.908→148.603ms(−.9%),long606.164→608.406(+.4%),strings+4.3%,arrays+7.7%,JSON+.1%,fib+.9%,regexflat,DB+2.4%,app−2.2%,Composer−7.7%.31followup arrays−1.3%,strings+6.3%,longobjects−1.2%,DB−.9%; strings regression retained, no normal-objects or overall speedup claim. Independent7pairs extracted200000-node cyclic linked-list PHPT workload13274.766→9281.903ms(−30.1%), everyexit/stdout/stderr==nativePHP8.5.11-n. Fullsuite GC testparenttimeout10s/candidatepass9085ms;serializedparenttimeout10007ms/candidatepass9508ms confirms timeout boundary. This is performance admission at10s,not a repaired semantic failure. Physicalobjects5 requests1663202 identical;gcgraph35122 identical. Hashing-work gain,not allocator-elision.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1663202→1663202; bytes 69796944→69796940.
+- gcgraph: requests 35122→35122; bytes 6196215→6191987.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing fixture nativePHP parent-output verified;typed/shared/callable cycles pass. Serialized GC threshold rechecks and whole3406raw status maps retained.
+All3406PHPT:bug77345_gc_1 timeout→pass (serialized10s parenttimeout/candidatepass confirmed),plus2knownrangecrash/timeout swaps;no new failures.2730pass/601fail;existing compatibility gaps remain.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/gc-pointer-tables-*.

@@ -1,0 +1,2 @@
+[ perf record: Woken up 73 times to write data ]
+[ perf record: Captured and wrote 18.166 MB /workspace/parity92/oct11/current-objects-78.data (2228 samples) ]
