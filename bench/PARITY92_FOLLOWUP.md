@@ -3456,3 +3456,41 @@ Frozen source `c5de3bfa04e41348d75aa27e005e717029a277d7`; binary SHA256 `17c5dfb
 Guarded independent31: ordinary strings +0.9%, long strings +3.9%, repeated replacement +2.2%, adversarial repeated-prefix search −50.9%; long objects −0.4% (flat). Forced-inline31: ordinary strings +3.1%, long −1.4%, replacement −1.6%, adversarial −51.3%; whole ordinary strings +3.9% and long +6.4%. The adversarial win is repeatable but normal workload costs remain. Reject all three rather than trade ordinary performance for one probe.
 
 Ordinary reverts f09ebf2,ea42edf,7d7d246 remove all prototype production changes and tests; all crates are byte-identical to PR #369. Retirement/integration source `4b57cd2318b694b3df0d5f308ccbdc97bb9b67a4`. Frozen prototype results are not retirement timings. No general performance/parity gain is claimed.
+
+## #370: perf(storage): retain dense scalar append in existing packed storage (2026-10-11)
+
+Reuse existing ArrayEntries packed scalar/lazy Cell storage for empty or still-unboxed dense scalar appends (next==length); PhpArray push/set share the same helper and original memory bookkeeping. Root-variable AST append enters only after existing container/detach/read-only/diagnostic checks and no reference binding. Closed scalar and append-key guards run first so graph values retain the original path promptly. No new layout, representation backend, allocator, cache, dependency or unsafe.
+
+Exported Cells, references, graph values, mixed/sparse keys, compound/deferred/detached writes, properties, superglobals and handlers keep the original path. CoW, next-key overflow, logical array footprint, foreach positions and Cell identities stay canonical. Sequential packed integer keys make mem_note_key a no-op; the shared mem_note_append charge remains. ONE existing packed storage check proves activation,CoW,reference export,mixed fallback and native output.
+
+Runtime b261dfcd47b426092bd20fe3360926577d2b7139; timing source b261dfcd47b426092bd20fe3360926577d2b7139; report/integration source b261dfcd47b426092bd20fe3360926577d2b7139.
+
+Initial two independent31 alternating profiler-off PHP8.5.11 -n byte-gated cohorts plus whole7 and negative31; refinement gets fresh31/whole7 on the exact final production parent. Physical diagnostics separate. Refined independent31 repeats append/map and whole-suite negatives. The contaminated cancelled fragment is explicitly INVALID.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/profile/arrays.php append 100000 | 103.619 | 90.201 | 0.8705 |
+| bench/profile/arrays.php map 50000 | 59.401 | 53.740 | 0.9047 |
+| bench/30-arrays.php | 78.678 | 77.416 | 0.9840 |
+| bench/40-objects.php | 97.169 | 96.965 | 0.9979 |
+| bench/40-objects.php 20 5000 | 357.617 | 354.150 | 0.9903 |
+| bench/11-sieve.php | 9.229 | 9.146 | 0.9910 |
+| bench/60-json.php | 424.894 | 417.300 | 0.9821 |
+| bench/app/cli.php 100 20 | 34.407 | 34.120 | 0.9917 |
+
+Initial v1: first31append −7.8%,map −9.6%, arrays flat; repeatappend −9.1%,map −7.4%,arrays −1.8%,JSON −0.9%flat. Initial wholegeo +2.1%,sieve +22.5% and objects +7.9%; isolated negative31sieve −0.6%flat/defaultobjects +0.4%flat, longobjects +2.3%,strings −1.6%,Composer +0.8%. Refinement moves the closed scalar/key proof ahead of reference/container metadata for graph fallbacks, with the same canonical eligibility/storage/ledger. Refined31append −12.9%,map −9.5%,arrays −1.6%,defaultobjects −0.2%flat,long −1.0%,sieve −0.9%flat,JSON −1.8%,app −0.8%. Independent refined31append −8.6%,map −8.8%,Composer −2.5%,app −0.6%flat,longobjects −0.4%flat,strings +0.5%flat. Refined whole7geo2.60758×PHP/main3.83243×PHP,parent −2.55%; wholearrays +4.1%,longobjects +1.2%,app +1.4%,Composer +6.9% retained; Composer/app negatives not confirmed in independent31. No cross-cohort averaging or attribution of unrelated changes. Arrays physical requests +4/bytes −817008; objects requests unchanged/96-byte diagnostic delta. Retain existing-storage scalar throughput benefit repeated across cohorts, with mixed whole-suite costs explicit. No overall parity or CPU claim. One earlier negative timing fragment overlapped a build, was cancelled and marked build-overlap-invalid; its numbers are excluded from decisions. Initial 2deb13a/ELF09449778 gated a now-retired search parent and has no timing claim; refined runtime b261dfc/ELF03dce959 is on the exact final #371 production parent.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 808127→808127; bytes 49724078→49723982.
+- arrays: requests 616041→616045; bytes 26545106→25728098.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Original partial-result4MB native/canonical OOM PASS. Dense array append at4MB is byte-identical PHP/parent/initial/refined exit255, including2097160-byte failed allocation and frame.
+All3406 individual PHPT compared: only known GC timeout→pass plus one range crash→timeout. Serialized same10s parent/candidate GC bothPASS (7933/8530ms); no new status after that boundary recheck besides known range swap. Full2732pass599fail25skip38unsupported5crash7timeout retained; partial compatibility, not a suite pass.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/packed-scalar-append-guard-first-*.

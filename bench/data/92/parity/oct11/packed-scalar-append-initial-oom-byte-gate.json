@@ -1,0 +1,14 @@
+[
+  {
+    "name": "php",
+    "exit": 255,
+    "stdout": "1300000\n\nFatal error: Allowed memory size of 4194304 bytes exhausted (tried to allocate 1302528 bytes) in /workspace/parity92/oct11/scalar-builtin-span-limit.php on line 4\nStack trace:\n#0 /workspace/parity92/oct11/scalar-builtin-span-limit.php(4): substr('aaaaaaaaaaaaaaa...', 0, 1300000)\n#1 {main}\n",
+    "stderr": ""
+  },
+  {
+    "name": "candidate",
+    "exit": 255,
+    "stdout": "1300000\n\nFatal error: Allowed memory size of 4194304 bytes exhausted (tried to allocate 1302528 bytes) in /workspace/parity92/oct11/scalar-builtin-span-limit.php on line 4\nStack trace:\n#0 /workspace/parity92/oct11/scalar-builtin-span-limit.php(4): substr('aaaaaaaaaaaaaaa...', 0, 1300000)\n#1 {main}\n",
+    "stderr": ""
+  }
+]
