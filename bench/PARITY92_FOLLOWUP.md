@@ -1197,3 +1197,43 @@ shared-string unit passes AddressSanitizer (leak check disabled); not whole
 interpreter sanitizer coverage. External CI not asserted green. Next #255
 removes temporary display-binding buffers for positional builtin calls;
 #256 keeps strict builtin signature metadata borrowed during type checks.
+
+## #255: positional builtin display args without named-slot scratch (2026-10-11)
+
+With no named arguments, original positional Cells are the exact bound display
+args, including extras/variadics. Clone that vector once and keep an empty named
+tail. Named slots/holes/defaults/errors/by-ref/coercion/trace/ZPP/frame accounting
+remain canonical. Runtimec5bc8d9,3add; existing checks reused. #237 full lazy
+trace remains open.
+
+Seven isolated alternating profiler-off PHP byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/20-strings.php | 142.871/137.697 | 0.964 |
+| bench/20-strings.php 100 | 665.441/647.624 | 0.973 |
+| bench/40-objects.php | 239.285/242.496 | 1.013 |
+| bench/40-objects.php 20 5000 | 970.942/887.612 | 0.914 |
+| bench/30-arrays.php | 100.225/95.795 | 0.956 |
+| bench/11-sieve.php | 80.176/82.989 | 1.035 |
+| bench/10-fib.php | 9.195/8.615 | 0.937 |
+| bench/app/cli.php 100 20 | 37.173/37.870 | 1.019 |
+| examples/composer/run.php | 8.388/8.144 | 0.971 |
+
+31-pair follow-up to inspect target noise and regressions:
+
+- bench/20-strings.php: 144.583/141.860ms (0.981).
+- bench/40-objects.php: 215.256/215.925ms (1.003).
+- bench/app/cli.php 100 20: 34.058/34.813ms (1.022).
+
+Strings physical requests2,225,333→2,144,433 (−80,900/~3.6%);
+bytes67,752,290→65,156,826 (−3.8%). Object requests unchanged
+10,963,249/10,963,250: sqrt has no known signature table entry, so this
+change does not remove its binding buffer. No targeted object attribution.
+App+1.9% initial/+2.2% follow-up negative retained, strings follow-up−1.9%;
+not suite parity or a large CPU gain. Next #256 removes per-call signature
+String/Vec allocations from shared type checks, then fresh whole-suite comparison.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass.
+All3406individualPHPTstatuses identical to byte-search parent:2727pass603fail
+25skip38unsupported6crash7timeout. External CI not asserted green.
