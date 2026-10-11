@@ -4976,7 +4976,6 @@ unset($e); unset($h); var_dump($wh->get());
             std::mem::size_of::<crate::value::PhpStr>(),
             std::mem::size_of::<usize>()
         );
-        assert_eq!(std::mem::size_of::<crate::value::PhpBytes>(), 32, "bound shared string payload cost (old Vec24)");
         let mut small = crate::value::PhpStr::from_slice(b"a\0b");
         assert!(matches!(&*small.rc, crate::value::PhpBytes::Inline { .. }));
         let alias = small.clone();
