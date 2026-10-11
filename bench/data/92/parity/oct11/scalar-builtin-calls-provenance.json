@@ -1,0 +1,77 @@
+{
+  "source": "569248f2e26ea0972498cd19e9955731b6a1d981",
+  "runtime": "85144a9071432a89c80feae86b3baad964dadc36",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug63635.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "weak-liveness",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug63635.phpt",
+        "name": "Bug #63635 (Segfault in gc_collect_cycles)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 4130
+      }
+    }
+  ],
+  "physical_allocations": [
+    {
+      "label": "objects",
+      "before": {
+        "requests": 8763026,
+        "bytes": 275059963
+      },
+      "after": {
+        "requests": 8369363,
+        "bytes": 264885143
+      }
+    },
+    {
+      "label": "strings",
+      "before": {
+        "requests": 1337503,
+        "bytes": 46016453
+      },
+      "after": {
+        "requests": 617503,
+        "bytes": 29056481
+      }
+    }
+  ],
+  "binary_sha256": "d4b63b6efab92bc25ee2e6527c6123af017d75465145e73040baeba2da0fba02",
+  "scope": "For already resolved builtin targets with exact Float/Int sqrt or Str/Int substr arguments, reuse the original shared math/byte kernels directly from the VM value stack. Preserve canonical arena reservation/free; avoid argument Cells/transient builtin trace/ZPP/family scans for these effect-free kernels only.",
+  "fallbacks": "Page growth, memory-exceeded, profilers, pending conversion/probe/compare diagnostics, named/ref/coercion/type/arity/user override retain canonical path. Missing/null length stays canonical; pre-existing explicit null length bug is recorded with parent/candidate matching and scheduled shared parser fix #278."
+}
