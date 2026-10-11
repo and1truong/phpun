@@ -4538,6 +4538,35 @@ try { rem_zero(9,0); } catch (DivisionByZeroError $e) { echo $e->getMessage(), "
 
     #[test]
     fn canonical_frames_reuse_boxes_and_release_php_owners() {
+        let mut ledger = Interp::new("weak-ledger.php");
+        let owner = super::Rc::new(7u64);
+        let key = super::Rc::as_ptr(&owner) as usize;
+        ledger.mem_track(&owner, 112);
+        assert_eq!(super::Rc::strong_count(&owner), 1);
+        assert_eq!(ledger.mem_tracked[&key].probe.strong_count(), 1);
+        assert!(ledger.mem_tracked[&key]
+            .probe
+            .upgrade()
+            .unwrap()
+            .is::<u64>());
+        let alias = owner.clone();
+        assert_eq!(ledger.mem_tracked[&key].probe.strong_count(), 2);
+        drop(alias);
+        ledger.mem_realloc(&owner, 512);
+        assert_eq!(ledger.mem_tracked[&key].table_req, 512);
+        let charged = ledger.mem_tracked[&key].inner;
+        ledger.mem_credit(&owner, 112);
+        assert!(ledger.mem_tracked[&key].inner < charged);
+        drop(owner);
+        assert_eq!(ledger.mem_tracked[&key].probe.strong_count(), 0);
+        ledger.mem_sweep();
+        assert!(!ledger.mem_tracked.contains_key(&key));
+        let owner = super::Rc::new(std::cell::RefCell::new(super::Value::Int(3)));
+        let key = super::Rc::as_ptr(&owner) as usize;
+        ledger.mem_track(&owner, 64);
+        assert_eq!(super::Rc::strong_count(&owner), 1);
+        ledger.mem_retire(&owner);
+        assert!(!ledger.mem_tracked.contains_key(&key));
         let mut it = Interp::new("pool.php");
         let result = it.run_source(
             r#"<?php

@@ -101,7 +101,7 @@ fn apply_cb_pattern(
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0usize;
     let mut n = 0i64;
-    let mut scratch: (Option<Rc<[u8]>>, usize) = (None, 0);
+    let mut scratch: (Option<Rc<()>>, usize) = (None, 0);
     let (caps, rc) = re.caps(cur, 0, true, None, it);
     if rc != 0 {
         it.last_preg_error = preg_rc_err(rc);
@@ -208,13 +208,13 @@ fn apply_cb_pattern(
 /// figure than the final result. `scratch` is (dummy Rc, sim alloc).
 fn preg_scratch_grow(
     it: &mut Interp,
-    scratch: &mut (Option<Rc<[u8]>>, usize),
+    scratch: &mut (Option<Rc<()>>, usize),
     new_len: usize,
 ) -> Result<(), PhpError> {
     if new_len >= scratch.1 {
         scratch.1 = 2 * new_len;
         let req = scratch.1 as u64 + 25;
-        let fresh: Rc<[u8]> = Rc::from(&b""[..]);
+        let fresh = Rc::new(());
         match &scratch.0 {
             // erealloc — old run stays held until the grow commits.
             Some(old) => it.mem_grow_str(old, &fresh, req),
@@ -236,11 +236,11 @@ fn preg_scratch_grow(
 /// the dummy so it isn't counted twice.
 fn preg_scratch_done(
     it: &mut Interp,
-    scratch: (Option<Rc<[u8]>>, usize),
+    scratch: (Option<Rc<()>>, usize),
     final_len: usize,
 ) -> Result<(), PhpError> {
     if let Some(old) = scratch.0 {
-        let prod: Rc<[u8]> = Rc::from(&b""[..]);
+        let prod = Rc::new(());
         it.mem_grow_str(&old, &prod, final_len as u64 + 25);
         if it.mem_tripped() {
             it.mem_exceeded = true;
@@ -879,7 +879,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         // mid-chain on a smaller scratch figure, not the
                         // final result. Simulate the chain so the trip
                         // site and 'tried to allocate' figure match.
-                        let mut scratch: (Option<Rc<[u8]>>, usize) = (None, 0);
+                        let mut scratch: (Option<Rc<()>>, usize) = (None, 0);
                         let (caps, rc) = re.caps(&src, 0, true, None, it);
                         if rc != 0 {
                             it.last_preg_error = preg_rc_err(rc);

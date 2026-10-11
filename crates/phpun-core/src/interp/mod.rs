@@ -274,9 +274,10 @@ pub(crate) type FilterBinding = (
     Rc<RefCell<PhpResource>>,
 );
 
-/// Liveness probe for a charged allocation: weak ref to the owning
-/// Rc — returns false once every strong handle died (zend's efree).
-pub(crate) type MemProbe = Box<dyn Fn() -> bool>;
+/// Weak ownership alone decides charged-allocation liveness (Zend efree).
+/// All tracked owners are sized; std Any erases their type without a closure
+/// allocation, extra strong handle, or raw refcount/layout assumptions.
+pub(crate) type MemProbe = std::rc::Weak<dyn std::any::Any>;
 
 /// A charge booked against a live Rc. `inner` is footprint inside
 /// committed chunks, `huge` footprint in dedicated huge segments
@@ -4312,7 +4313,7 @@ impl<'a> Interp<'a> {
             return s.hole;
         }
         match self.mem_tracked.get(&s.key) {
-            Some(c) if !(c.probe)() => c.seg_cap,
+            Some(c) if c.probe.strong_count() == 0 => c.seg_cap,
             _ => 0,
         }
     }
@@ -4468,7 +4469,7 @@ impl<'a> Interp<'a> {
 
     /// Charge `req` bytes and tie the footprint to `rc`'s lifetime —
     /// released when every strong ref dies (zend's efree).
-    pub(crate) fn mem_track<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+    pub(crate) fn mem_track<T: 'static>(&mut self, rc: &Rc<T>, req: u64) {
         crate::interp::util::alloc_hit(2);
         let (fp, chunk) = self.mem_commit(req);
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
@@ -4476,7 +4477,7 @@ impl<'a> Interp<'a> {
         let mut stale_cap = 0u64;
         match self.mem_tracked.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                if !(e.get().probe)() {
+                if e.get().probe.strong_count() == 0 {
                     // Allocator recycled a dead owner's pointer —
                     // release the stale charge, then re-register.
                     let dead = e.get();
@@ -4515,8 +4516,8 @@ impl<'a> Interp<'a> {
                             dead_chunk,
                         );
                     }
-                    let weak = Rc::downgrade(rc);
-                    c.probe = Box::new(move || weak.strong_count() > 0);
+                    let weak: MemProbe = Rc::<T>::downgrade(rc);
+                    c.probe = weak;
                 }
                 if inner > 0 {
                     e.get_mut().chunk = chunk;
@@ -4528,7 +4529,7 @@ impl<'a> Interp<'a> {
                 e.get_mut().huge += huge;
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let weak = Rc::downgrade(rc);
+                let weak: MemProbe = Rc::<T>::downgrade(rc);
                 e.insert(MemCharge {
                     inner,
                     huge,
@@ -4540,7 +4541,7 @@ impl<'a> Interp<'a> {
                         0
                     },
                     chunk: if inner > 0 { chunk } else { usize::MAX },
-                    probe: Box::new(move || weak.strong_count() > 0),
+                    probe: weak,
                 });
             }
         }
@@ -4740,14 +4741,14 @@ impl<'a> Interp<'a> {
     /// zend's erealloc transiently holds both, so charge-then-credit.
     /// A same-capacity call is a no-op (zend only reallocs when the
     /// pow2 class advances).
-    pub(crate) fn mem_realloc<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+    pub(crate) fn mem_realloc<T: 'static>(&mut self, rc: &Rc<T>, req: u64) {
         let key = Rc::as_ptr(rc) as *const u8 as usize;
         let mut old_live = None;
         if let Some(c) = self.mem_tracked.get(&key) {
-            if (c.probe)() && c.table_req == req {
+            if c.probe.strong_count() > 0 && c.table_req == req {
                 return;
             }
-            if (c.probe)() {
+            if c.probe.strong_count() > 0 {
                 old_live = Some((c.table_req, c.chunk));
             }
         }
@@ -4944,7 +4945,7 @@ impl<'a> Interp<'a> {
                 e.get_mut().huge += huge;
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let weak = Rc::downgrade(rc);
+                let weak: MemProbe = Rc::<T>::downgrade(rc);
                 e.insert(MemCharge {
                     inner,
                     huge,
@@ -4956,7 +4957,7 @@ impl<'a> Interp<'a> {
                         0
                     },
                     chunk: if inner > 0 { chunk } else { usize::MAX },
-                    probe: Box::new(move || weak.strong_count() > 0),
+                    probe: weak,
                 });
             }
         }
@@ -5077,7 +5078,7 @@ impl<'a> Interp<'a> {
                 return true;
             }
             match tracked.get(&s.key) {
-                Some(c) if (c.probe)() && c.huge > 0 => true,
+                Some(c) if c.probe.strong_count() > 0 && c.huge > 0 => true,
                 Some(c) => {
                     s.key = usize::MAX;
                     s.hole = c.seg_cap;
@@ -5093,7 +5094,7 @@ impl<'a> Interp<'a> {
         let chunks = &mut self.mem_chunks;
         let mut vacate = Vec::new();
         self.mem_tracked.retain(|_, c| {
-            if (c.probe)() {
+            if c.probe.strong_count() > 0 {
                 true
             } else {
                 inner += c.inner;
@@ -5141,7 +5142,7 @@ impl<'a> Interp<'a> {
         let fp = Self::mem_fp(req);
         let key = Rc::as_ptr(rc) as *const u8 as usize;
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.mem_tracked.entry(key) {
-            if !(e.get().probe)() {
+            if e.get().probe.strong_count() == 0 {
                 // Stale entry of a dead owner at a recycled pointer —
                 // release it now; the caller's container was never
                 // charged for it.
@@ -5207,7 +5208,7 @@ impl<'a> Interp<'a> {
     /// zend checks whether the pages immediately after the old run
     /// are free, which needs the real page map PR #88 owns; without
     /// it the boundary can land one growth step off.
-    pub(crate) fn mem_grow_str<T: ?Sized + 'static>(&mut self, old: &Rc<T>, new: &Rc<T>, req: u64) {
+    pub(crate) fn mem_grow_str<T: 'static>(&mut self, old: &Rc<T>, new: &Rc<T>, req: u64) {
         // zend frees dead allocs before sizing the grow — sweep
         // unconditionally so freed runs feed the extend test.
         self.mem_sweep();
@@ -5216,7 +5217,7 @@ impl<'a> Interp<'a> {
 
     // Called after sweeping while the old owner was still live. A unique append
     // may detach its weak handles, so carry the old charge by key across mutation.
-    fn mem_grow_str_key<T: ?Sized + 'static>(&mut self, old_key: usize, new: &Rc<T>, req: u64) {
+    fn mem_grow_str_key<T: 'static>(&mut self, old_key: usize, new: &Rc<T>, req: u64) {
         let fp = Self::mem_fp(req);
         let (old_inner, old_huge, old_chunk) = self
             .mem_tracked
@@ -5353,7 +5354,7 @@ impl<'a> Interp<'a> {
             }
         }
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
-        let weak = Rc::downgrade(new);
+        let weak: MemProbe = Rc::<T>::downgrade(new);
         self.mem_tracked.insert(
             key,
             MemCharge {
@@ -5363,7 +5364,7 @@ impl<'a> Interp<'a> {
                 vm: None,
                 seg_cap: new_seg_cap,
                 chunk: new_chunk,
-                probe: Box::new(move || weak.strong_count() > 0),
+                probe: weak,
             },
         );
     }
