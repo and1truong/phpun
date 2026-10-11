@@ -1659,3 +1659,42 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/null-substr-length-*.
+
+## #280: perf(properties): accept exact primitive writes before allocating type names (2026-10-11)
+
+At the shared prop_typed_write_check, accept exact single primitive Float/Int/Bool/Str values before allocating resolved type-name strings. Actual VM promotion/property-store path, not canonical promoted binder.
+
+Int-to-float widening, nullable/unions/class names/coercion/errors keep the canonical check. Hook/readonly/ref/type-owner/slot/GC/memory behavior stays in existing store. ONE existing primitive property check extends widening, aliases and bad-array errors.
+
+Runtime 91618f6ce934141c2e75d571daf31df312d1b635; measured source 72d0f988c88e2660d7b2b690b9349da8812c1502.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 191.843 | 187.781 | 0.9788 |
+| bench/40-objects.php 20 5000 | 754.075 | 731.008 | 0.9694 |
+| bench/profile/objects.php ctor 5000 | 39.663 | 38.926 | 0.9814 |
+| bench/profile/objects.php norm 5000 | 48.292 | 46.976 | 0.9727 |
+| bench/20-strings.php | 66.291 | 65.697 | 0.9910 |
+| bench/30-arrays.php | 80.005 | 78.626 | 0.9828 |
+| bench/11-sieve.php | 79.116 | 81.176 | 1.0260 |
+| bench/10-fib.php | 8.560 | 8.515 | 0.9948 |
+| bench/app/cli.php 100 20 | 35.458 | 34.628 | 0.9766 |
+| examples/composer/run.php | 7.960 | 8.016 | 1.0070 |
+
+Seven pairs objects−2.1%,long−3.1%,ctor−1.9%,norm−2.7%;sieve+2.6%,Composer+0.7% retained. Physical100kobjects−800000 requests (−9.6%),bytes−2.9%. No whole-suite claim. These timings predate the sibling nullable-length review fix; later inherited fix is correctness-only and must be separately gated.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects: requests 8369363→7569363; bytes 264886938→257086966.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Binary strings, float widening and property aliases/errors pass native PHP probe; full3406individual statuses identical parent. Timing/alloc binary precedes inherited nullable sibling fix, whose gates/hash are recorded separately.
+All3406individualPHPT compared; 0 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/primitive-property-checks-*.

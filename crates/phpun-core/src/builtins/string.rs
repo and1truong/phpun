@@ -269,10 +269,7 @@ pub(crate) fn dispatch(
             let source = arg(args, 0);
             let s = bytes_view(it, &source);
             let start = arg(args, 1).to_int();
-            let len = match args.get(2) {
-                Some(c) if !matches!(*c.borrow(), Value::Null) => Some(c.borrow().to_int()),
-                _ => None,
-            };
+            let len = nullable_int_arg(args, 2);
             substr_value(&s, start, len)
         }
         "substr_count" => {
@@ -296,11 +293,7 @@ pub(crate) fn dispatch(
             let s = arg_bs(it, args, 0);
             let r = arg_bs(it, args, 1);
             let start = arg(args, 2).to_int();
-            let len = if args.len() > 3 {
-                Some(arg(args, 3).to_int())
-            } else {
-                None
-            };
+            let len = nullable_int_arg(args, 3);
             Value::bytes(substr_replace(&s, &r, start, len))
         }
         "strpos" | "stripos" => {
