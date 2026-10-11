@@ -2056,7 +2056,10 @@ impl<'a> Interp<'a> {
     /// A private method owned by the calling scope binds statically:
     /// `$this->m()` inside `S::x` always resolves to `S::m`, bypassing
     /// the object's override (zend private methods are not virtual).
-    fn scope_private_method(&mut self, name: &str) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
+    pub(in crate::interp) fn scope_private_method(
+        &mut self,
+        name: &str,
+    ) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
         let scope = self
             .stack
             .last()
