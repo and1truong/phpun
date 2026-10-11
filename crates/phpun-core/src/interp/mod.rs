@@ -7052,6 +7052,26 @@ impl<'a> Interp<'a> {
                 if Rc::strong_count(o) - 1 > 1 {
                     self.gc_note_purple(Rc::as_ptr(o) as usize);
                 } else {
+                    // Like scalar-only arrays: no graph target or callback can
+                    // appear during this last-owner walk. Internal/nested
+                    // objects keep the canonical dying-cell bookkeeping.
+                    let scalar_only = {
+                        let b = o.borrow();
+                        b.internal.is_none()
+                            && b.slots.iter().flatten().chain(b.props.values()).all(|c| {
+                                matches!(
+                                    &*c.borrow(),
+                                    Value::Null
+                                        | Value::Bool(_)
+                                        | Value::Int(_)
+                                        | Value::Float(_)
+                                        | Value::Str(_)
+                                )
+                            })
+                    };
+                    if scalar_only {
+                        return;
+                    }
                     let dying = {
                         let b = o.borrow();
                         self.gc_dying_acquire(
