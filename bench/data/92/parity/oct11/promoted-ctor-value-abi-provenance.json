@@ -1,0 +1,71 @@
+{
+  "source": "2e4dba83dc47d190c57ee118b41d52d23a42860b",
+  "runtime": "2e4dba83dc47d190c57ee118b41d52d23a42860b",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1633154,
+        "bytes": 68356830
+      },
+      "after": {
+        "requests": 1633154,
+        "bytes": 68356838
+      }
+    },
+    {
+      "label": "ctor-direct",
+      "before": {
+        "requests": 852095,
+        "bytes": 36353259
+      },
+      "after": {
+        "requests": 732090,
+        "bytes": 30929407
+      }
+    }
+  ],
+  "binary_sha256": "13fac09723fce0dc039da5a75eafbb1d844e1ee50d8e0d6d16f0ef9501777cb3",
+  "scope": "Allow existing promoted_slots constructors in the value ABI and remove empty-body method-target veto. Reuse existing Slot::Arg promoted stores/default float widening and early materialization before property hooks. No duplicate binder/storage/backend.",
+  "fallbacks": "Fixed by-value/constant defaults only; retain reference/named/unpacked/type/visibility/private/abstract/native/hook/OOM/page/trace/lifetime canonical guards. Provided-byref InitNew fallback unchanged."
+}
