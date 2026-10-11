@@ -480,8 +480,9 @@ impl Compiled {
         // ponytail: params bind inline (the frame's value_args are the arg
         // slots; slot writes store through so func_get_args reports them).
         // By-ref/canonical bodies keep cells — needs_bind/hybrid exclude them
-        // already — and promoted params keep their early publish pass.
-        let value_abi = !hybrid && !needs_bind && !decl.params.iter().any(|p| p.promoted);
+        // already. Proven promoted constructors use the same value slots;
+        // their early publish pass materializes before observable hooks.
+        let value_abi = !hybrid && !needs_bind && (!has_promoted || promoted_slots);
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -3418,7 +3419,6 @@ impl<'a> Interp<'a> {
                     if m.is_static
                         || m.is_abstract
                         || m.decl.line == 0
-                        || m.decl.body.is_empty()
                         || m.decl.by_ref
                         || m.decl.params.iter().any(|p| p.by_ref)
                         || Self::decl_contains_yield(&m.decl.body)
@@ -4387,6 +4387,41 @@ echo nt_effect(2), "\n";
 
     #[test]
     fn borrowed_receiver_teardown_keeps_argument_and_exception_owners() {
+        let mut constructors = Interp::new("promoted-values.php");
+        let result = constructors.run_source(
+            r#"<?php
+class ValueCtor {
+ function __construct(private float $x=1.5, public int $n=2) {}
+ function values() { return [$this->x, $this->n]; }
+}
+class ValueCtorChild extends ValueCtor {}
+class ValueCtorArgs {
+ function __construct(public float $x, public string $s="d") { echo json_encode(func_get_args()), "\n"; }
+}
+class ValueCtorRef { function __construct(&$x) { $x++; } }
+$a = new ValueCtor(3, 4); $weak = WeakReference::create($a);
+echo json_encode($a->values()), "\n";
+$b = new ValueCtorChild; echo json_encode($b->values()), "\n";
+new ValueCtorArgs(4); new ValueCtorArgs(5, "ok");
+$x=1; new ValueCtorRef($x); echo $x, "\n";
+try { new ValueCtor("bad", 2); } catch (TypeError $e) { echo get_class($e), "\n"; }
+unset($a); var_dump($weak->get());
+"#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", constructors.err_buf);
+        assert_eq!(constructors.err_buf, "");
+        assert_eq!(
+            constructors.out,
+            b"[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\n"
+        );
+        let super::Value::Object(object) = constructors.instantiate("valuector", &[]).unwrap()
+        else {
+            panic!("object")
+        };
+        let target = constructors
+            .vm_method_target(object, "__construct", &std::cell::RefCell::new(None), 1)
+            .expect("empty promoted constructor retains direct target");
+        assert!(target.1.comp.value_abi);
         let mut it = Interp::new("receiver.php");
         let result = it.run_source(
             r#"<?php
