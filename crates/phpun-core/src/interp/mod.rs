@@ -7037,27 +7037,6 @@ impl<'a> Interp<'a> {
                 if Rc::strong_count(o) - 1 > 1 {
                     self.gc_note_purple(Rc::as_ptr(o) as usize);
                 } else {
-                    // Scalar properties cannot buffer a graph target or run
-                    // a callback in this walk, like scalar-only arrays above.
-                    let scalar_only = {
-                        let b = o.borrow();
-                        b.prop_order
-                            .iter()
-                            .filter_map(|name| b.prop_get(name))
-                            .all(|c| {
-                                matches!(
-                                    &*c.borrow(),
-                                    Value::Null
-                                        | Value::Bool(_)
-                                        | Value::Int(_)
-                                        | Value::Float(_)
-                                        | Value::Str(_)
-                                )
-                            })
-                    };
-                    if scalar_only {
-                        return;
-                    }
                     let dying = {
                         let b = o.borrow();
                         self.gc_dying_acquire(
