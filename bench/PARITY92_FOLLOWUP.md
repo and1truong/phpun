@@ -3423,7 +3423,7 @@ Three frozen releases: all needles; needles of at least four bytes; the same len
 | bench/60-json.php | 411.936 | 406.561 | 0.9870 |
 
 Whole-seven geomean/raw: `{"main_php_ratio": 3.9855505831154696, "candidate_php_ratio": 2.8948339807318146, "candidate_main_ratio": 0.7263322646049442, "candidate_parent_ratio": 1.0288526933889026}`.
-Frozen source `87f540d42bacca9556879ff01a5ff4fb5af2df1a`; binary SHA256 `c48fe62177446d6195efc219fd5145161500745cbf75340a16e7ce85b0f2187c`.
+Frozen build source `3fe527cc210a4cb8c8f9229845cbe69b9790a5f3`; timing/integration source `87f540d42bacca9556879ff01a5ff4fb5af2df1a` (production trees identical); binary SHA256 `c48fe62177446d6195efc219fd5145161500745cbf75340a16e7ce85b0f2187c`.
 
 ### native-long-byte-search
 
