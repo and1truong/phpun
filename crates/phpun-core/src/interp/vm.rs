@@ -4740,13 +4740,15 @@ new ValueCtorArgs(4); new ValueCtorArgs(5, "ok");
 $x=1; new ValueCtorRef($x); echo $x, "\n";
 try { new ValueCtor("bad", 2); } catch (TypeError $e) { echo get_class($e), "\n"; }
 unset($a); var_dump($weak->get());
+class ReceiverDtor { function __destruct() { echo "D\n"; } }
+$a = new ReceiverDtor; $b = $a; unset($a); echo "S\n"; unset($b);
 "#,
         );
         assert_eq!(result.exit_code, 0, "{}", constructors.err_buf);
         assert_eq!(constructors.err_buf, "");
         assert_eq!(
             constructors.out,
-            b"[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\n"
+            b"[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\nS\nD\n"
         );
         let super::Value::Object(object) = constructors.instantiate("valuector", &[]).unwrap()
         else {

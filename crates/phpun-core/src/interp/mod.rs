@@ -3212,6 +3212,10 @@ impl<'a> Interp<'a> {
         if matches!(v, Value::Array(_) | Value::Object(_) | Value::Callable(_)) {
             self.gc_note_dying(&v.clone(), 8);
         }
+        // GC above may release owners; only the current count proves no destructor.
+        if matches!(v, Value::Object(o) if Rc::strong_count(o) > 1) {
+            return Ok(());
+        }
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
             held.entry(Rc::as_ptr(o) as usize)
