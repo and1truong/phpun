@@ -4731,6 +4731,10 @@ class ValueCtorArgs {
  function __construct(public float $x, public string $s="d") { echo json_encode(func_get_args()), "\n"; }
 }
 class ValueCtorRef { function __construct(&$x) { $x++; } }
+class ValueCtorRefChild extends ValueCtorRef {}
+try { new ValueCtorRefChild(3); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+try { new class(3) { function __construct(&$x) {} }; } catch (Error $e) { echo $e->getMessage(), "\n"; }
+
 $a = new ValueCtor(3, 4); $weak = WeakReference::create($a);
 echo json_encode($a->values()), "\n";
 $b = new ValueCtorChild; echo json_encode($b->values()), "\n";
@@ -4746,7 +4750,7 @@ $a = new ReceiverDtor; $b = $a; unset($a); echo "S\n"; unset($b);
         assert_eq!(constructors.err_buf, "");
         assert_eq!(
             constructors.out,
-            b"[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\nS\nD\n"
+            b"ValueCtorRef::__construct(): Argument #1 ($x) could not be passed by reference\nclass@anonymous(): Argument #1 ($x) could not be passed by reference\n[3,4]\n[1.5,2]\n[4]\n[5,\"ok\"]\n2\nTypeError\nNULL\nS\nD\n"
         );
         let super::Value::Object(object) = constructors.instantiate("valuector", &[]).unwrap()
         else {
