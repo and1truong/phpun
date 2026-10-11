@@ -3320,4 +3320,6 @@ Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/short-substring-storage-*.
+
+Retirement: ordinary reverts 51b5f7f/e32813c/2b0410c restore ALL crates byte-for-byte to #363. Fresh workspace/fmt/clippy PASS; retired-source proof and logs retained. Prototype samples stay historical, no new release/timing claim.
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.

@@ -1,0 +1,11 @@
+{
+  "source": "2b0410c4a5801eae8412fb884bbd7cb27f182950",
+  "ordinary_reverts": [
+    "51b5f7f",
+    "e32813c",
+    "2b0410c"
+  ],
+  "production_diff_vs_parent": "empty across crates",
+  "fresh_workspace_fmt_clippy": "PASS",
+  "timings": "historical rejected prototype only; no retirement speed claim"
+}
