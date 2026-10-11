@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "97eb65969ad71d48b377c0f1fac4bd68b425c3fe0e0e7de1c2eda1b416bac47e",
+  "source": "7b74c2eaa6682701056adde03628d8de9b804c2e",
+  "parent": "pure-root-builtins",
+  "summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "changes": []
+}
