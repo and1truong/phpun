@@ -3156,6 +3156,41 @@ Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/substr-result-charge-*.
+
+## #356: docs(perf): reject AST argument-vector reuse and retain measured regressions (2026-10-11)
+
+Historical prototype87d5ff1 reused existing empty VM argument-vector pool at AST send creation and drained fresh frame-free ctor retirement. Existing receiver unit proved actual capacity pointer reuse and correct scalar values. No new pool/layout/dependency/unsafe. REJECTED;ordinaryrevert80c2f23 restoresPR357runtime exactly before incomingPR349review correction.
+
+Prototype owners/by-ref/introspection/error guards unchanged;existing scalar pool retirement retained canonical identities. No runtime prototype remains. Initialrelease94e05cf/ELF1221735,not reverted runtime,was tested/timed.
+
+Runtime 87d5ff1544e4de3de3e955d3400004e766e497d7; timing source 94e05cf246d96805555255da705dde646eed2242; report/integration source 80c2f239d76b861f2e6ec1e335a40db52c120fb5.
+
+31alternating profiler-off nativePHP8.5.11-n byte-gated pairs;separate physicalallocator runs. No freshwhole follow-up after rejection.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 87.891 | 89.252 | 1.0155 |
+| bench/40-objects.php 20 5000 | 363.444 | 363.573 | 1.0004 |
+| bench/20-strings.php 100 | 213.281 | 218.046 | 1.0223 |
+| bench/10-fib.php | 8.532 | 8.561 | 1.0034 |
+| examples/composer/run.php | 8.187 | 8.212 | 1.0030 |
+
+31pairs objects87.891→89.252ms(+1.5%),long363.444→363.573(flat),strings100213.281→218.046(+2.2%),fib8.532→8.561(+.3%flat),Composer8.187→8.212(+.3%flat). Physicalobjects saved~25000requests/~.8MB but no target latency gain and longer strings regress. Rejected;no freshwhole after rejection. Preserve initial raw/source/hashes and negative facts. Later incoming349storage withdrawal is a distinct runtime correction and doesnot retroactively change these initial samples.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 833120→808121; bytes 51672708→50872720.
+- arrays: requests 616041→616041; bytes 26544298→26544278.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONEexistingreceiver capacityreuse/value/weak/shared checkPASS;no redundant fixtures.
+Initialcandidateall3406statusesidenticalinitialparent:2731pass599fail25skip38unsupported6crash7timeout. Initialworkspace/fmt/clippy/native25+19/profile/probesPASS;reverted source equalsinitialPR357runtime before separate349reviewpropagation.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/ast-arg-vectors-*.
 ## #347 / PR349 review: withdraw widened declared slots (2026-10-11)
 
 P2 review correctly identifies 8→24 bytes for EVERY declared slot,including ordinary/default/non-float instances receiving no cell savings. Initial default31−3.6%/confirm−3.7%,long−1.6%/confirm−.6%,wholedefaultflat/long+2.8% andphysical−50002requests/−1200004bytes remain historical experimental evidence. Broad common-slot cost was not justified by those limited wins. Ordinary reverts b217672+82c76dc restore Vec<Option<Cell>> and remove lazy ObjectSlot/GC skip paths. Fresh workspace/fmt/clippy PASS;ONEexisting receiver test asserts actual slot sizeof(pointer). Production crates identicalPR345runtime8a77753 except cfg(test) assertion;canonical frozen1042bda reused as production identity evidence,no new release/timing/PHPTclaim. All original raw evidence retained. #347 NOT_PLANNED;PR349 report-only. No new storage abstraction/unsafe. Descendants receive ordinary merges.
