@@ -6995,16 +6995,18 @@ impl<'a> Interp<'a> {
                     // No graph target or PHP callback can appear during this
                     // last-owner walk. Mixed/nested/resource tables retain
                     // the full dying-cell snapshot before callbacks run.
-                    if a.borrow().entries.is_scalar_packed() || a.borrow().entries.iter().all(|(_, c)| {
-                        matches!(
-                            &*c.borrow(),
-                            Value::Null
-                                | Value::Bool(_)
-                                | Value::Int(_)
-                                | Value::Float(_)
-                                | Value::Str(_)
-                        )
-                    }) {
+                    if a.borrow().entries.is_scalar_packed()
+                        || a.borrow().entries.iter().all(|(_, c)| {
+                            matches!(
+                                &*c.borrow(),
+                                Value::Null
+                                    | Value::Bool(_)
+                                    | Value::Int(_)
+                                    | Value::Float(_)
+                                    | Value::Str(_)
+                            )
+                        })
+                    {
                         return;
                     }
                     let dying = {

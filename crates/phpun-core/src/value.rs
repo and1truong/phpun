@@ -87,20 +87,39 @@ pub struct ArrayEntries {
 
 impl ArrayEntries {
     fn packed(values: Vec<Value>) -> Self {
-        debug_assert!(values.iter().all(|v| matches!(v, Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_))));
-        Self { cells: std::cell::OnceCell::new(), scalar: RefCell::new(Some(values)) }
+        debug_assert!(values.iter().all(|v| matches!(
+            v,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        )));
+        Self {
+            cells: std::cell::OnceCell::new(),
+            scalar: RefCell::new(Some(values)),
+        }
     }
 
-    pub(crate) fn is_scalar_packed(&self) -> bool { self.cells.get().is_none() }
+    pub(crate) fn is_scalar_packed(&self) -> bool {
+        self.cells.get().is_none()
+    }
     pub fn len(&self) -> usize {
-        self.cells.get().map_or_else(|| self.scalar.borrow().as_ref().unwrap().len(), Vec::len)
+        self.cells
+            .get()
+            .map_or_else(|| self.scalar.borrow().as_ref().unwrap().len(), Vec::len)
     }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     pub fn capacity(&self) -> usize {
-        self.cells.get().map_or_else(|| self.scalar.borrow().as_ref().unwrap().capacity(), Vec::capacity)
+        self.cells.get().map_or_else(
+            || self.scalar.borrow().as_ref().unwrap().capacity(),
+            Vec::capacity,
+        )
     }
-    pub fn clone(&self) -> Vec<(ArrKey, Cell)> { std::ops::Deref::deref(self).clone() }
-    fn packed_clone(&self) -> Option<Vec<Value>> { self.scalar.borrow().clone() }
+    pub fn clone(&self) -> Vec<(ArrKey, Cell)> {
+        std::ops::Deref::deref(self).clone()
+    }
+    fn packed_clone(&self) -> Option<Vec<Value>> {
+        self.scalar.borrow().clone()
+    }
     fn packed_get(&self, key: &ArrKey) -> Option<Option<Value>> {
         let values = self.scalar.borrow();
         values.as_ref().map(|values| match key {
@@ -109,20 +128,36 @@ impl ArrayEntries {
         })
     }
     pub(crate) fn store_packed_scalar(&mut self, key: i64, value: &Value) -> bool {
-        if key < 0 || !matches!(value, Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)) { return false; }
-        let Some(values) = self.scalar.get_mut().as_mut() else { return false; };
-        let Some(slot) = values.get_mut(key as usize) else { return false; };
+        if key < 0
+            || !matches!(
+                value,
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+            )
+        {
+            return false;
+        }
+        let Some(values) = self.scalar.get_mut().as_mut() else {
+            return false;
+        };
+        let Some(slot) = values.get_mut(key as usize) else {
+            return false;
+        };
         *slot = value.clone();
         true
     }
 }
 
 impl Default for ArrayEntries {
-    fn default() -> Self { Vec::new().into() }
+    fn default() -> Self {
+        Vec::new().into()
+    }
 }
 impl From<Vec<(ArrKey, Cell)>> for ArrayEntries {
     fn from(cells: Vec<(ArrKey, Cell)>) -> Self {
-        Self { cells: std::cell::OnceCell::from(cells), scalar: RefCell::new(None) }
+        Self {
+            cells: std::cell::OnceCell::from(cells),
+            scalar: RefCell::new(None),
+        }
     }
 }
 impl FromIterator<(ArrKey, Cell)> for ArrayEntries {
@@ -133,8 +168,19 @@ impl FromIterator<(ArrKey, Cell)> for ArrayEntries {
 impl std::ops::Deref for ArrayEntries {
     type Target = Vec<(ArrKey, Cell)>;
     fn deref(&self) -> &Self::Target {
-        self.cells.get_or_init(|| self.scalar.borrow_mut().take().unwrap().into_iter().enumerate()
-            .map(|(i, v)| { alloc_hit(9); (ArrKey::Int(i as i64), Rc::new(RefCell::new(v))) }).collect())
+        self.cells.get_or_init(|| {
+            self.scalar
+                .borrow_mut()
+                .take()
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    alloc_hit(9);
+                    (ArrKey::Int(i as i64), Rc::new(RefCell::new(v)))
+                })
+                .collect()
+        })
     }
 }
 impl std::ops::DerefMut for ArrayEntries {
@@ -146,12 +192,16 @@ impl std::ops::DerefMut for ArrayEntries {
 impl<'a> IntoIterator for &'a ArrayEntries {
     type Item = &'a (ArrKey, Cell);
     type IntoIter = std::slice::Iter<'a, (ArrKey, Cell)>;
-    fn into_iter(self) -> Self::IntoIter { self.iter() }
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 impl<'a> IntoIterator for &'a mut ArrayEntries {
     type Item = &'a mut (ArrKey, Cell);
     type IntoIter = std::slice::IterMut<'a, (ArrKey, Cell)>;
-    fn into_iter(self) -> Self::IntoIter { self.iter_mut() }
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
 }
 impl IntoIterator for ArrayEntries {
     type Item = (ArrKey, Cell);
@@ -336,7 +386,11 @@ impl PhpArray {
     /// `packed`/key_bytes reflect the literal's key mix.
     pub fn mem_note_seed(&mut self) {
         if self.mem_elems == 0 && !self.entries.is_empty() {
-            let keys: Vec<ArrKey> = if self.entries.is_scalar_packed() { Vec::new() } else { self.entries.iter().map(|(k, _)| k.clone()).collect() };
+            let keys: Vec<ArrKey> = if self.entries.is_scalar_packed() {
+                Vec::new()
+            } else {
+                self.entries.iter().map(|(k, _)| k.clone()).collect()
+            };
             for (idx, k) in keys.iter().enumerate() {
                 match k {
                     ArrKey::Int(i) => {
@@ -369,7 +423,12 @@ impl PhpArray {
     /// `IDX_MIN`, linear scan below it or when the hint is stale.
     fn pos_of(&self, k: &ArrKey) -> Option<usize> {
         if self.entries.is_scalar_packed() {
-            return match k { ArrKey::Int(i) if *i >= 0 && (*i as usize) < self.entries.len() => Some(*i as usize), _ => None };
+            return match k {
+                ArrKey::Int(i) if *i >= 0 && (*i as usize) < self.entries.len() => {
+                    Some(*i as usize)
+                }
+                _ => None,
+            };
         }
         if let ArrKey::Int(i) = k {
             // The append cursor is above every existing nonnegative int key.
@@ -404,7 +463,9 @@ impl PhpArray {
     }
 
     pub fn get(&self, k: &ArrKey) -> Option<Value> {
-        if let Some(value) = self.entries.packed_get(k) { return value; }
+        if let Some(value) = self.entries.packed_get(k) {
+            return value;
+        }
         self.pos_of(k).map(|p| self.entries[p].1.borrow().clone())
     }
 
@@ -433,7 +494,9 @@ impl PhpArray {
 
     pub fn set(&mut self, k: ArrKey, v: Value) {
         if let ArrKey::Int(i) = &k {
-            if self.entries.store_packed_scalar(*i, &v) { return; }
+            if self.entries.store_packed_scalar(*i, &v) {
+                return;
+            }
         }
         alloc_hit(9);
         self.set_cell(k, Rc::new(RefCell::new(v)));
@@ -670,7 +733,11 @@ impl PhpArray {
 
     /// Number of live elements.
     pub fn len(&self) -> usize {
-        if self.entries.is_scalar_packed() { self.entries.len() } else { self.iter().count() }
+        if self.entries.is_scalar_packed() {
+            self.entries.len()
+        } else {
+            self.iter().count()
+        }
     }
 }
 
@@ -681,10 +748,14 @@ impl Clone for PhpArray {
         let mut a = Self {
             entries: match self.entries.packed_clone() {
                 Some(values) => ArrayEntries::packed(values),
-                None => self.entries.iter().map(|(k, c)| {
-                    alloc_hit(9);
-                    (k.clone(), Rc::new(RefCell::new(c.borrow().clone())))
-                }).collect(),
+                None => self
+                    .entries
+                    .iter()
+                    .map(|(k, c)| {
+                        alloc_hit(9);
+                        (k.clone(), Rc::new(RefCell::new(c.borrow().clone())))
+                    })
+                    .collect(),
             },
             mem_elems: 0,
             next: self.next,

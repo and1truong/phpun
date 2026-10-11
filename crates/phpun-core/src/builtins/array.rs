@@ -413,7 +413,12 @@ pub(crate) fn dispatch(
                 it.mem_exceeded = true;
                 return Err(it.oom_fatal());
             }
-            if start == 0 && matches!(v, Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)) {
+            if start == 0
+                && matches!(
+                    v,
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+                )
+            {
                 let rc = Rc::new(RefCell::new(PhpArray::scalar_fill(n as usize, v)));
                 it.mem_track(&rc, want);
                 return Ok(Some(Value::Array(rc)));
