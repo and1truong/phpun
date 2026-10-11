@@ -931,8 +931,8 @@ or uninstrumented JIT instructions. Raw logs/exits/clean commands retained.
 
 Fresh be0e810 release workspace8core22runtime19format,fm/clippy pass;25script
 plus19workload byte/exit/error PHP-n gates,VM-profile and3406PHPT rerun retain
-2727pass603fail25skip38unsupported6crash7timeout. Known range resource
-crash/timeout changes are in the raw map, no new semantic failure claim.
+2727pass603fail25skip38unsupported6crash7timeout. All3406 individual statuses match the parent receiver map; earlier known
+range resource crash/timeout transitions remain in historical raw maps.
 
 Seven rotating PHP/parent/fixed medians, profiler-off isolated:
 
@@ -956,3 +956,452 @@ JSON+1.4%,app+0.7%,Composer+2.5% retained; other non-target changes are not
 broad wins. Full suite still far from parity, user's2.71× remains separate.
 Exact fixed hash/config/raw samples and P1 before/after sources are in
 native-fixed-*; no pre-fix dataset relabelled as fixed.
+
+## #243: borrow pinned constructor parameter metadata (2026-10-11)
+
+The resolved Rc<Method> keeps its immutable declaration alive during shared
+argument binding. Borrow its parameter slice instead of cloning the complete
+Vec<Param> for every construction; inherited-owner diagnostics and the same
+named/by-reference/default/promoted/type binder remain in place. Runtime ac3d7dd
+(6 additions/4 deletions in expr.rs); fresh release inherits P1 fix be0e810.
+Existing promoted-slot binding test covers the shared constructor path.
+
+Seven isolated profiler-off alternating fixed-parent/candidate PHP byte gates:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/40-objects.php | 249.202/245.316 | 0.984 |
+| bench/40-objects.php 20 5000 | 980.168/989.296 | 1.009 |
+| bench/10-fib.php | 8.809/8.520 | 0.967 |
+| bench/30-arrays.php | 174.942/173.068 | 0.989 |
+| bench/app/cli.php 100 20 | 36.882/36.158 | 0.980 |
+| examples/composer/run.php | 8.719/8.232 | 0.944 |
+
+Objects31 follow-up248.653→242.777ms (−2.4%); long20×5000
+988.904→983.079ms (−0.6%, effectively flat). The preliminary pre-copy-fix
+−6.7%/−5.2% object medians are retained as exploratory evidence, **not current
+speed claims**. This change reduces allocation cost; it does not close the
+large object gap or establish broad application/PHP parity.
+
+Separate instrumented100000-construction probe: physical requests13,463,260
+→12,763,259 (−700,001/~5.2%), requested bytes388,949,018→320,686,734
+(−17.6%); obj_new100000 and cell994898 events unchanged. These are allocation
+requests/bytes, not CPU time; neither timings nor native mmap bytes are counted
+as malloc measurements. Both probe outputs match PHP. Fresh gates below.
+
+Workspace/fmt/clippy and fresh25script+19workload byte/exit/error gates,
+VM-profile pass. Full3406PHPT2727pass603fail25skip38unsupported6crash7timeout;
+individual status changes vs fixed native parent: {"/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": ["crash", "timeout"], "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": ["timeout", "crash"]}.
+Existing failures/resource limits retained. External CI not yet green.
+
+## #244: native pure integer sort callbacks (2026-10-11)
+
+Reuse the complete context-free callback value/type/owner proof, and run
+validated pure integer graphs before creating the callback frame. Extend the
+existing integer emitter with signed `<=>` (MIN/MAX-safe). This still rejects
+captures, bound class/receiver context, bool returns, references, defaults,
+effects, introspection, deadlines and profiler runs. Root callback arena span
+reserves only existing-page capacity; native failure restores it and replays
+the original callback VM. Same scalar return side channels; no callable-owner
+pins or new dependency. P1 initialized-byte copy fix is inherited.
+
+Seven alternating profiler-off fixed-constructor-parent/candidate PHP byte gates:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/30-arrays.php | 173.901/89.369 | 0.514 |
+| bench/30-arrays.php 10 5000 | 88.093/48.486 | 0.550 |
+| bench/profile/arrays.php usort 5000 | 32.082/15.425 | 0.481 |
+| bench/10-fib.php | 8.427/8.316 | 0.987 |
+| bench/11-sieve.php | 212.243/201.741 | 0.951 |
+| bench/40-objects.php | 224.158/223.222 | 0.996 |
+| bench/app/cli.php 100 20 | 32.372/32.406 | 1.001 |
+| examples/composer/run.php | 7.648/7.652 | 1.000 |
+
+Arrays−48.6%, long−45.0%, usort phase−51.9%; app and Composer flat.
+Other row movements are not attributed as wins from this callback-only change.
+Separate PHP-byte-gated instrumented default arrays: physical requests
+1,106,113→795,841 (−28.1%), requested bytes43,268,089→30,857,804 (−28.7%).
+trace_frame350351→40063 are EVENT counts, not physical allocations; executable
+mappings are outside malloc counters. Full suite remains far from PHP parity.
+
+Workspace8core/22runtime/19format,fmt/clippy pass. Existing callback runnable
+check proves actual native entry, guard replay for typed overflow, no trace/
+arena leak and callable Weak owner release.25VM/script+19workload byte/exit/
+stderr gates, warm comparator MIN/MAX/equal/overflow/capture/bool PHP gate and
+VM-profile pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout; only
+two known pathological range crash/timeout swaps vs parent, no new fail/pass.
+External CI is not yet green. Raw/hash/source manifests preserve all samples.
+
+## #247: guarded scalar dimension writes (2026-10-11)
+
+Reuse DimCv for literal null/bool/int assignment to an existing scalar
+integer-key element in a unique array. Fresh current-table get_cell and shared
+cell_store preserve cell aliases, displaced scalar decrefs and memory charges.
+Shared arrays, missing/nonint/uninitialized keys, globals views, typed/owned/
+merged/readonly cells, containers and pending dimension errors/handlers retain
+full canonical assignment. No offset cache, layout/storage layer or dependency.
+
+The enlarged existing dimension check found a preexisting fallback bug: typed
+reference assignment stored coerced int0 but returned raw false. Shared static/
+CV/dimension assignment paths now return the value committed to cell_store;
+parent mismatch and fixed result verified against PHP. New path rejects these
+typed/readonly cells, so the canonical fallback is tested too.
+
+Final51a8401 release; seven isolated profiler-off PHP-byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/11-sieve.php | 205.174/83.200 | 0.406 |
+| bench/11-sieve.php 5 100000 | 1087.643/426.338 | 0.392 |
+| bench/30-arrays.php | 90.816/92.249 | 1.016 |
+| bench/40-objects.php | 251.942/246.727 | 0.979 |
+| bench/20-strings.php | 166.045/165.885 | 0.999 |
+| bench/10-fib.php | 8.059/8.451 | 1.049 |
+| bench/app/cli.php 100 20 | 35.385/35.346 | 0.999 |
+| examples/composer/run.php | 8.869/8.180 | 0.922 |
+
+Sieve−59.4%, long−60.8%. Arrays+1.6%,fib+4.9% initial medians retained;
+31 follow-up arrays89.678→90.788(+1.2%),fib8.034→7.909(−1.6%).
+No speed claim for nontarget movements; preliminary−63% sieve row retained
+and superseded by final ownership-guard artifact. Still no suite parity.
+
+Separate instrumented sieve physical requests/bytes (not speed timing):
+native-comparator: allocs: 1869802 bytes: 33488028
+scalar-dim-writes-fixed: allocs: 132099 bytes: 13214714
+
+Workspace8core/22runtime/19format,fmt/clippy pass; existing opcode/CoW/alias/
+typed/readonly/ArrayAccess check,25script+19workload byte/exit/stderr gates,
+extended dimension PHP probe andVM-profile pass.3406PHPT2727pass603fail25skip
+38unsupported6crash7timeout; only two known range crash/timeout swaps, no
+new fail/pass/skip. External CI not yet green. Packed/mixed storage #187 is
+still unfinished. Next #249 borrows property declarations during shared stores.
+
+## #249: borrow pinned property declarations during stores (2026-10-11)
+
+Move the existing private/public/inherited declaration resolver into
+decl_prop_site, returning immutable Rc<Class>+declaration index. Existing
+decl_prop keeps its owned wrapper for other callers. Shared store_prop borrows
+the declaration while inspecting set visibility, readonly and type gates;
+declaration-existence checks no longer clone metadata. All hooks, owner/ref
+checks, conversion, clone/init diagnostics and actual property writes remain
+shared. No object slot cache, offset pin or new dependency. Runtime e62b948,
+23add/9delete. Existing promoted-slot binding check covers the shared path.
+
+Seven isolated alternating profiler-off PHP byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/40-objects.php | 237.885/228.219 | 0.959 |
+| bench/40-objects.php 20 5000 | 990.289/926.580 | 0.936 |
+| bench/profile/objects.php ctor 5000 | 48.244/45.097 | 0.935 |
+| bench/30-arrays.php | 93.880/91.334 | 0.973 |
+| bench/11-sieve.php | 75.530/73.760 | 0.977 |
+| bench/10-fib.php | 8.535/7.920 | 0.928 |
+| bench/app/cli.php 100 20 | 39.274/35.183 | 0.896 |
+| examples/composer/run.php | 8.625/8.937 | 1.036 |
+
+Objects31 follow-up238.160→222.645ms (−6.5%); Composer8.415→7.992
+(−5.0%), initial+3.6% negative row retained. No causal speed claim for other
+nontarget movements. Full object/suite gap remains far from PHP parity.
+Separate100000-object PHP-byte-gated allocation probe: requests12,763,259
+→10,963,259 (−1,800,000/~14.1%), bytes320,687,560→302,687,528 (−5.6%);
+obj_new100000 and cell994898 events unchanged. Allocation bytes are not CPU
+time; event counters do not count all physical allocations.
+
+Workspace8core/22runtime/19format,fm/clippy pass;25script+19workload and warm
+comparator/extended dimension byte/exit/error gates,VM-profile pass. All3406
+individual PHPT statuses identical to scalar-write parent:2727pass603fail25skip
+38unsupported6crash7timeout. External CI not asserted green. Next #251 extends
+pure integer native control-flow validation to backward/nested loops.
+
+## #251: validate pure integer backward/nested control flow (2026-10-11)
+
+Replace the existing forward-only depth scan with a worklist over reachable
+Ops. Every merge/backedge must agree on stack depth and every destination is
+bounds-checked. Reuse the existing integer emitter/jump patching and all purity/
+local-init/overflow/depth/current-page/dependency guards. No loop recognizer,
+new dependency or bypassed deadline; deadline/profiler runs retain the VM.
+Guard failure restores spans and replays the complete pure root. Scalar loops
+own no PHP objects/effects; this does not compile arrays/objects/builtins.
+
+Existing native runnable check now proves actual nested-loop execution,
+break/continue, overflow/uninit replay exactly once, deadline exclusion and
+trace/arena cleanup. Runtime2919eda,36add/19delete.
+
+Seven isolated alternating profiler-off PHP-byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| /workspace/parity92/oct11/native-loops.php 100000 | 35.410/7.060 | 0.199 |
+| /workspace/parity92/oct11/native-loops.php 1000000 | 270.325/11.569 | 0.043 |
+| bench/10-fib.php | 8.808/8.679 | 0.985 |
+| bench/11-sieve.php | 83.384/78.517 | 0.942 |
+| bench/30-arrays.php | 91.898/100.500 | 1.094 |
+| bench/40-objects.php | 210.830/210.557 | 0.999 |
+| bench/20-strings.php | 160.912/157.591 | 0.979 |
+| bench/app/cli.php 100 20 | 33.395/32.852 | 0.984 |
+| examples/composer/run.php | 7.821/7.966 | 1.019 |
+
+Separate seven rotating native PHP/parent/candidate loop workload:100k
+5.013/33.878/7.404ms (candidate1.477×PHP);1M15.730/275.901/11.312ms
+(candidate0.719×PHP). Includes parsing/startup/warmup, not isolated kernel
+execution; fixture contains generic sum/nested/while loops, no cached result
+or algorithm recognizer. These are additional scalar workloads, **not an
+original-ninebench geomean or suite parity claim**. Initial arrays+9.4% and
+Composer+1.9% negatives retained;31followuparrays95.917→93.887(−2.1%),
+Composer7.820→7.650(−2.2%). No nontarget speed attribution.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload and extended
+loop/warm-comparator/dimension nativePHP8.5.11 -n byte/exit/stderr gates,
+VM-profile pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout;
+individual changes vs parent: {"/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": ["timeout", "crash"], "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": ["crash", "timeout"]}. External CI not asserted green.
+Next #253 replaces scalar first-byte scanning in shared bfind with libc memchr.
+
+## #253: shared byte search through libc memchr (2026-10-11)
+
+Replace scalar first-byte scanning in shared bfind with existing libc memchr,
+then verify the complete needle at the candidate offset. C only reads the
+bounded nonempty live slice; returned pointers belong to that slice. Preserve
+NUL/non-UTF8 bytes, nonoverlap, offsets, conversion/order/error behavior and
+the existing O(n*m) worst-case ceiling. No dependency or algorithm recognizer.
+Runtime1f48ee6,8add/1delete; one existing string check extended for boundary bytes.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/20-strings.php | 180.480/155.416 | 0.861 |
+| bench/20-strings.php 100 | 826.149/714.644 | 0.865 |
+| bench/30-arrays.php | 90.280/91.129 | 1.009 |
+| bench/11-sieve.php | 78.567/79.386 | 1.010 |
+| bench/40-objects.php | 226.341/223.486 | 0.987 |
+| bench/10-fib.php | 8.501/8.322 | 0.979 |
+| bench/app/cli.php 100 20 | 34.512/35.062 | 1.016 |
+| examples/composer/run.php | 8.259/8.069 | 0.977 |
+
+Strings default -13.9%, longer -13.5%; initial app+1.6% negative retained.
+No nontarget attribution or whole-suite PHP parity claim. Physical string
+allocation requests unchanged2,225,342; bytes67,747,514/67,747,510, counters
+unchanged. Separate CPU profiles3149/2704 samples, zero lost; str_replace
+closure self13.24%/0.59% includes more than search. New libc callee unresolved
+in report: do not equate closure share with total replacement CPU cost.
+vm_exec_ops10.21% includes semantic work, not pure dispatch. Raw perf.data
+kept locally; exact symbol reports and raw hashes published. Both sampled
+executions stdout byte-identical to PHP.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload and extended
+string/loop/comparator/dimension gates,VM-profile pass. All3406 PHPT statuses
+identical to parent:2727pass603fail25skip38unsupported6crash7timeout. Existing
+shared-string unit passes AddressSanitizer (leak check disabled); not whole
+interpreter sanitizer coverage. External CI not asserted green. Next #255
+removes temporary display-binding buffers for positional builtin calls;
+#256 keeps strict builtin signature metadata borrowed during type checks.
+
+## #255: positional builtin display args without named-slot scratch (2026-10-11)
+
+With no named arguments, original positional Cells are the exact bound display
+args, including extras/variadics. Clone that vector once and keep an empty named
+tail. Named slots/holes/defaults/errors/by-ref/coercion/trace/ZPP/frame accounting
+remain canonical. Runtimec5bc8d9,3add; existing checks reused. #237 full lazy
+trace remains open.
+
+Seven isolated alternating profiler-off PHP byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/20-strings.php | 142.871/137.697 | 0.964 |
+| bench/20-strings.php 100 | 665.441/647.624 | 0.973 |
+| bench/40-objects.php | 239.285/242.496 | 1.013 |
+| bench/40-objects.php 20 5000 | 970.942/887.612 | 0.914 |
+| bench/30-arrays.php | 100.225/95.795 | 0.956 |
+| bench/11-sieve.php | 80.176/82.989 | 1.035 |
+| bench/10-fib.php | 9.195/8.615 | 0.937 |
+| bench/app/cli.php 100 20 | 37.173/37.870 | 1.019 |
+| examples/composer/run.php | 8.388/8.144 | 0.971 |
+
+31-pair follow-up to inspect target noise and regressions:
+
+- bench/20-strings.php: 144.583/141.860ms (0.981).
+- bench/40-objects.php: 215.256/215.925ms (1.003).
+- bench/app/cli.php 100 20: 34.058/34.813ms (1.022).
+
+Strings physical requests2,225,333→2,144,433 (−80,900/~3.6%);
+bytes67,752,290→65,156,826 (−3.8%). Object requests unchanged
+10,963,249/10,963,250: sqrt has no known signature table entry, so this
+change does not remove its binding buffer. No targeted object attribution.
+App+1.9% initial/+2.2% follow-up negative retained, strings follow-up−1.9%;
+not suite parity or a large CPU gain. Next #256 removes per-call signature
+String/Vec allocations from shared type checks, then fresh whole-suite comparison.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass.
+All3406individualPHPTstatuses identical to byte-search parent:2727pass603fail
+25skip38unsupported6crash7timeout. External CI not asserted green.
+
+## #256: borrow static builtin type metadata (2026-10-11)
+
+Private strict_sig_view borrows existing literal name/type pairs in hot shared
+ZPP checks. Keep public strict_sig returning owned String pairs for existing
+reflection/API consumers. Same names/types/order/coercion/errors, no cache or
+dependency. Runtime556d7e6,15add/9delete. Existing type/reflection checks reused.
+
+Seven rotating profiler-off native PHP/main/parent/candidate coldCLI runs;
+every exit/stdout/stderr byte-gated. NativePHP8.5.11 -n,OPcache module loaded
+but CLI disabled,JIT disabled. Main3ea4df5 runtime matches frozenbe0e810
+(no crates/Cargo delta). Candidate release explicitly cleaned/rebuilt; an
+initial stale-parent artifact was detected before any measurement. Rawsource/
+hashes and command published, tracked runtime clean except vendor symlink.
+
+| Workload | PHP/main/parent/candidate ms | Candidate/PHP | Candidate/parent |
+|---|---:|---:|---:|
+| bench/00-startup.php | 3.495/5.844/5.936/5.788 | 1.656 | 0.975 |
+| bench/10-fib.php | 10.394/7.931/8.272/7.768 | 0.747 | 0.939 |
+| bench/11-sieve.php | 6.807/210.651/74.693/77.275 | 11.352 | 1.035 |
+| bench/20-strings.php | 13.288/158.219/136.570/126.540 | 9.523 | 0.927 |
+| bench/30-arrays.php | 16.129/169.037/92.813/89.025 | 5.520 | 0.959 |
+| bench/40-objects.php | 7.581/233.069/218.588/212.823 | 28.073 | 0.974 |
+| bench/50-regex.php | 7.217/39.974/40.992/39.479 | 5.470 | 0.963 |
+| bench/60-json.php | 146.872/510.426/507.993/515.654 | 3.511 | 1.015 |
+| bench/70-db.php | 28.018/112.178/115.116/113.392 | 4.047 | 0.985 |
+| bench/20-strings.php 100 | 48.321/780.858/656.777/612.489 | 12.675 | 0.933 |
+| bench/40-objects.php 20 5000 | 19.230/919.650/884.422/858.588 | 44.649 | 0.971 |
+| bench/app/cli.php 100 20 | 4.983/34.323/34.631/33.879 | 6.799 | 0.978 |
+| examples/composer/run.php | 4.075/8.131/7.943/7.838 | 1.923 | 0.987 |
+
+Original-ninebench main/candidate geomean **6.0988×/4.8943×PHP**,
+candidate/main0.8025,candidate/parent0.9741.
+This host/config differs from user's2.71×host; no cross-host ratio aggregation
+or product of earlier pair gains. **Still far from suite parity**: objects28.07×,
+sieve11.35×,strings9.52×;fib0.747×PHP only. Retain sieve+3.5%/json+1.5% vs
+parent and other negatives; no causal nontarget attribution. Stringsdefault
+−7.3%,long−6.7% vs immediate parent. Strings physicalrequests2,144,443
+→1,578,563 (−565,880/~26.4%),bytes65,157,144→50,991,224 (−21.7%). Object
+requests unchanged10,963,259/10,963,260; no targeted object allocation claim.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass.
+3406PHPT2727pass603fail25skip38unsupported6crash7timeout; only2knownrange
+crash/timeout swaps,no newfail/pass/skip. ExternalCI not assertedgreen.
+Next #258 reuses existing primitive callback valueABI for one-value arraymap/
+filter; #260 borrows complete positional builtin binding Cells and avoids
+temporary trace-name Strings. FullLazyTrace #237 and packedstorage #187 open.
+
+## #258: reuse primitive value callbacks for one array element (2026-10-11)
+
+Generalize the existing fresh-value callback helper to fixed-size argument
+arrays, using the same exact context-free primitive closure proof and shared
+value ABI. Single-array map/value-filter join sort pairs; no original/reference
+array Cell is treated as fresh. Captures/receiver/scope/default/coercion/by-ref/
+nonprimitive cases keep original canonical Cell fallback. Native integer
+callback supports bounded argument slices/current-page spans; Boolfilter still
+VM here. Runtimecbcbe7c,69add/21delete including ONE existing runnable check
+extension proving actual one-value native entry/typed overflow/owner release.
+
+Seven alternating isolated profiler-off PHP byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/30-arrays.php | 92.276/89.827 | 0.973 |
+| bench/30-arrays.php 10 | 47.739/44.447 | 0.931 |
+| bench/profile/arrays.php map 5000 | 13.412/11.666 | 0.870 |
+| bench/profile/arrays.php filter 5000 | 13.304/12.489 | 0.939 |
+| bench/40-objects.php | 238.606/225.487 | 0.945 |
+| bench/20-strings.php | 127.409/125.766 | 0.987 |
+| bench/11-sieve.php | 76.609/81.515 | 1.064 |
+| bench/10-fib.php | 8.504/8.107 | 0.953 |
+| bench/app/cli.php 100 20 | 35.131/35.768 | 1.018 |
+| examples/composer/run.php | 8.465/8.082 | 0.955 |
+
+31pairs for target noise and negative workloads:
+
+- bench/30-arrays.php: 93.022/87.711ms (0.943).
+- bench/11-sieve.php: 78.283/81.190ms (1.037).
+- bench/app/cli.php 100 20: 33.989/34.517ms (1.016).
+
+Defaultarraysinitial−2.7%/follow-up−5.7%;map5000−13.0%,filter5000−6.1%,
+CLI includes input preparation. Physicalarrayrequests795,809→655,890
+(−139,919/~17.6%),bytes30,856,089→27,496,036 (−10.9%); maprequests−19,923,
+filterrequests−15,001. Retain sieve+6.4%initial/+3.7%followup,app+1.8%/
++1.6% negative; no causal nontarget attribution or suite parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+extended
+callback/comparator/dimension/string/loop nativePHP8.5.11 -n byte gates and
+VM-profile pass. All3406individualPHPTstatuses identical to parent2727pass
+603fail25skip38unsupported6crash7timeout. Explicit release clean/rebuild.
+ExternalCI not assertedgreen. Next #260 borrows fully positional builtin
+binding; #262 bypasses engine-family interception for proven ordinary PHP
+methods; #263 emits checked remainder and proven bool native roots.
+
+## #260: borrow complete positional builtin binding Cells (2026-10-11)
+
+Existing resolver returns Cow<Cell slice>. Borrow only when all fixed params
+are supplied positionally, plus an allowed variadic tail. No missing/default/
+hole/name/excess-error remap is needed; preserve Cell identity/coercion/by-ref.
+Other packs keep the original owned binder/errors. Builtin trace function name
+uses Rc::from(&str), avoiding a temporary String. No new cache/dependency.
+Runtimefd92682,58add/5delete including ONE existing runnable check for borrowed/
+owned selection, pointer identity, variadic acceptance and missing/excess errors.
+
+Seven alternating isolated profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/20-strings.php | 127.854/119.961 | 0.938 |
+| bench/20-strings.php 100 | 626.463/572.071 | 0.913 |
+| bench/40-objects.php | 238.148/235.921 | 0.991 |
+| bench/30-arrays.php | 88.235/85.992 | 0.975 |
+| bench/11-sieve.php | 79.697/75.469 | 0.947 |
+| bench/10-fib.php | 8.118/8.281 | 1.020 |
+| bench/app/cli.php 100 20 | 35.973/35.983 | 1.000 |
+| examples/composer/run.php | 8.261/8.089 | 0.979 |
+
+Stringsdefault−6.2%,long−8.7%. Physicalrequests1,578,563→1,337,503
+(−241,060/~15.3%),bytes50,991,188→46,018,264 (−9.8%);objects100krequests
+10,963,260→10,863,260 (−100,000/~0.9%),bytes−0.2%. Preserve fib+2.0%
+negative, no nontarget speed attribution or new suite parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass;
+all3406individualPHPTstatuses identical to one-value callback parent2727pass
+603fail25skip38unsupported6crash7timeout. Explicit release clean/rebuild.
+ExternalCI not assertedgreen. Next #262 ordinary user-method dispatcher.
+
+## #262: skip engine-family interception for ordinary PHP methods (2026-10-11)
+
+After canonical visibility/private target resolution, a concrete PHP method
+on a declared ordinary root PHP class with no parent/interfaces cannot be a
+native-family method. Invoke the same shared user method/binder directly.
+Internal/inherited/interface/abstract/missing cases keep the old dispatcher.
+No shape cache, changed promotion/write/type/frame/trace/GC protocol.
+Runtime3a206b5,25add/1delete including ONE existing promoted check extended
+for ArrayIterator and Throwable ancestor/override fallback.
+Separate objectCPUprofile1965samples/zero lost: method_invoke_pre34.66%
+inclusive/invoke_method25.29%inclusive; these overlap, never add them.
+Raw perf.data kept locally with published hash/symbol report.
+
+Seven alternating isolated profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/40-objects.php | 216.377/204.803 | 0.947 |
+| bench/40-objects.php 20 5000 | 878.917/776.039 | 0.883 |
+| bench/profile/objects.php ctor 5000 | 46.372/41.161 | 0.888 |
+| bench/profile/objects.php norm 5000 | 64.179/52.910 | 0.824 |
+| bench/30-arrays.php | 85.430/87.929 | 1.029 |
+| bench/20-strings.php | 122.554/119.472 | 0.975 |
+| bench/11-sieve.php | 76.768/74.809 | 0.974 |
+| bench/10-fib.php | 8.066/8.038 | 0.997 |
+| bench/app/cli.php 100 20 | 34.175/34.130 | 0.999 |
+| examples/composer/run.php | 8.458/8.291 | 0.980 |
+
+31pairs for target noise and initial arrays+2.9% negative:
+
+- bench/40-objects.php: 224.207/197.116ms (0.879).
+- bench/30-arrays.php: 88.177/85.875ms (0.974).
+
+Objectsdefault31−12.1%,long7−11.7%,ctorphase−11.2%,normphase−17.6%.
+Physical100kobjectrequests10,863,260→8,763,260 (−2,100,000/~19.3%),
+bytes302,289,539→285,089,519 (−5.7%). Initial arrays+2.9% retained,
+31followup−2.6%; no nontarget attribution or object/suite PHP parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+extended
+promoted/native ancestor PHP byte gates andVM-profile pass. All3406individual
+PHPTstatuses identical to parent2727pass603fail25skip38unsupported6crash
+7timeout. Explicit release clean/rebuild;externalCI not assertedgreen.
+Next #263 checked remainder/proven bool native roots; #264 no-target scalar
+GC cells; #266 Weak liveness; #267 shared scalar builtin kernels.

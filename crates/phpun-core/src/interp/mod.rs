@@ -7582,7 +7582,7 @@ impl<'a> Interp<'a> {
     }
 
     fn check_builtin_types(&mut self, name: &str, cells: &[Cell]) -> Result<(), PhpError> {
-        if let Some(sig) = builtins::strict_sig(name) {
+        if let Some(sig) = builtins::strict_sig_view(name) {
             let zf = matches!(
                 name,
                 "strlen"
@@ -7790,7 +7790,7 @@ impl<'a> Interp<'a> {
         };
         self.call_trace.push(TraceFrame {
             args_frame: None,
-            function: name.to_string().into(),
+            function: Rc::from(name),
             class: None,
             ty: String::new(),
             file: site_file,
@@ -8228,6 +8228,9 @@ impl<'a> Interp<'a> {
         args: &CallArgs,
         params: &[(&'static str, builtins::BDef)],
     ) -> (Vec<Cell>, Vec<(String, Cell)>) {
+        if args.named.is_empty() {
+            return (args.to_vec(), Vec::new());
+        }
         use builtins::BDef;
         let n_fixed = params
             .iter()
@@ -8281,12 +8284,12 @@ impl<'a> Interp<'a> {
     /// By-ref params receive the caller's cell; defaults fill interior
     /// gaps; unknown names are the "Unknown named parameter" Error
     /// (variadic-only stubs reject with a different message).
-    fn resolve_named_builtin(
+    fn resolve_named_builtin<'args>(
         &mut self,
         name: &str,
         params: &[(&'static str, builtins::BDef)],
-        args: &CallArgs,
-    ) -> Result<Vec<Cell>, PhpError> {
+        args: &'args CallArgs,
+    ) -> Result<std::borrow::Cow<'args, [Cell]>, PhpError> {
         use builtins::BDef;
         // Internal functions whose variadic is declared Z_PARAM_VARIADIC
         // ('*') reject every named arg (zend_compile "does not accept
@@ -8332,6 +8335,13 @@ impl<'a> Interp<'a> {
             .iter()
             .take_while(|(_, d)| !matches!(d, BDef::Var))
             .count();
+        // All fixed slots already supplied: no defaults, holes, names or
+        // arity errors can require a remap. Keep original Cell identities.
+        if args.named.is_empty()
+            && (args.cells.len() == n_fixed || variadic && args.cells.len() >= n_fixed)
+        {
+            return Ok(std::borrow::Cow::Borrowed(&args.cells));
+        }
         // `required` counts OptReq params too: arginfo declares them
         // required (reflection/named-arg checks) even though ZPP accepts
         // the call without them (rand/mt_rand).
@@ -8489,7 +8499,7 @@ impl<'a> Interp<'a> {
             ));
         }
         out.extend(extra_pos);
-        Ok(out)
+        Ok(std::borrow::Cow::Owned(out))
     }
 
     #[track_caller]

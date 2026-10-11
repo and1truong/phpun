@@ -179,6 +179,7 @@ enum Op {
         array: u16,
         key_slot: Option<u16>,
         key_int: i64,
+        write: Option<Value>,
         fallback: Box<Expr>,
     },
     ThisProp {
@@ -980,6 +981,41 @@ impl Compiler {
             Expr::Assign {
                 target, op, value, ..
             } => {
+                if *op == "=" && matches!(Interp::unmark_rhs(target), Expr::Index { .. }) {
+                    if let (
+                        Expr::Index {
+                            e: base,
+                            i: Some(key),
+                        },
+                        Some(value),
+                    ) = (Interp::unmark_rhs(target), const_val(value))
+                    {
+                        if matches!(value, Value::Null | Value::Bool(_) | Value::Int(_)) {
+                            if let Expr::Var(name) = Interp::unmark_rhs(base) {
+                                if !Interp::is_superglobal(name) {
+                                    let key = match Interp::unmark_rhs(key) {
+                                        Expr::Var(n) if !Interp::is_superglobal(n) => {
+                                            Some((Some(self.slot(n)), 0))
+                                        }
+                                        Expr::Int(i) => Some((None, *i)),
+                                        _ => None,
+                                    };
+                                    if let Some((key_slot, key_int)) = key {
+                                        let array = self.slot(name);
+                                        self.emit(Op::DimCv {
+                                            array,
+                                            key_slot,
+                                            key_int,
+                                            write: Some(value),
+                                            fallback: Box::new(e.clone()),
+                                        });
+                                        return Some(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let Expr::Var(n) = &**target else {
                     self.emit(Op::Canonical(Box::new(e.clone())));
                     return Some(());
@@ -1250,6 +1286,7 @@ impl Compiler {
                                 array,
                                 key_slot,
                                 key_int,
+                                write: None,
                                 fallback: Box::new(e.clone()),
                             });
                             return Some(());
@@ -2045,12 +2082,25 @@ impl<'a> Interp<'a> {
                     array,
                     key_slot,
                     key_int,
+                    write,
                     fallback,
                 } => {
                     // ponytail: fresh current-table lookup, no offset cache. Global
                     // views, non-scalars and missing/uninitialized keys stay AST;
                     // generation-guarded offsets need a measured storage change.
-                    let plain = if comp.top_level && self.globals_arr.is_some() {
+                    let protected = |c: &Cell| {
+                        let ptr = Rc::as_ptr(c) as usize;
+                        self.typed_slots.contains_key(&ptr)
+                            || self.slot_owners.contains_key(&ptr)
+                            || self.slot_merged.contains_key(&ptr)
+                            || self.readonly_cells.contains_key(&ptr)
+                    };
+                    let plain = if (comp.top_level || write.is_some()) && self.globals_arr.is_some()
+                        || write.is_some()
+                            && (self.in_handler
+                                || self.dim_throw.is_some()
+                                || matches!(&slots[*array as usize], Slot::C(c) if protected(c)))
+                    {
                         None
                     } else {
                         let peek = |index: u16| match &slots[index as usize] {
@@ -2067,16 +2117,43 @@ impl<'a> Interp<'a> {
                         };
                         match (peek(*array), key) {
                             (Some(Value::Array(a)), Some(k)) => {
-                                a.borrow().get(&ArrKey::Int(k)).filter(|v| {
-                                    matches!(
-                                        v,
-                                        Value::Null
-                                            | Value::Bool(_)
-                                            | Value::Int(_)
-                                            | Value::Float(_)
-                                            | Value::Str(_)
-                                    )
-                                })
+                                if let Some(value) = write {
+                                    // Only the CV and this peek own the table. Shared tables
+                                    // keep canonical CoW; existing buckets do not change
+                                    // array layout, iterator positions or memory charges.
+                                    let c = if Rc::strong_count(&a) == 2 {
+                                        a.borrow().get_cell(&ArrKey::Int(k))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(c) = c.filter(|c| {
+                                        !protected(c)
+                                            && matches!(
+                                                &*c.borrow(),
+                                                Value::Null
+                                                    | Value::Bool(_)
+                                                    | Value::Int(_)
+                                                    | Value::Float(_)
+                                                    | Value::Str(_)
+                                            )
+                                    }) {
+                                        self.cell_store(&c, value.clone())?;
+                                        Some(value.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    a.borrow().get(&ArrKey::Int(k)).filter(|v| {
+                                        matches!(
+                                            v,
+                                            Value::Null
+                                                | Value::Bool(_)
+                                                | Value::Int(_)
+                                                | Value::Float(_)
+                                                | Value::Str(_)
+                                        )
+                                    })
+                                }
                             }
                             _ => None,
                         }
@@ -2822,10 +2899,10 @@ impl<'a> Interp<'a> {
 
     /// Fresh positional callback values only: original/reference argument cells
     /// must use call_value. Pool the value vector before invoking the shared ABI.
-    pub(crate) fn call_value_pair(
+    pub(crate) fn call_values<const N: usize>(
         &mut self,
         callable: &Value,
-        values: [Value; 2],
+        values: [Value; N],
         nonref: bool,
     ) -> Result<Value, PhpError> {
         let Some((decl, comp, closure)) = self.vm_callback_values_target(callable, &values) else {
@@ -2833,10 +2910,14 @@ impl<'a> Interp<'a> {
             // value-vector transfer for bound/object/string/captured callbacks.
             let mut args = super::CallArgs::positional(values.into_iter().map(cell).collect());
             if nonref {
-                args.nonref_cells.extend(0..2);
+                args.nonref_cells.extend(0..N);
             }
             return self.call_value(callable, args);
         };
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Some(value) = native::callback(self, decl, &values) {
+            return Ok(value);
+        }
         let mut argv = self.vm_val_pool.pop().unwrap_or_default();
         argv.extend(values);
         let result = self.vm_run_direct(decl, &comp, &mut argv, Some(closure.clone()));
@@ -2850,7 +2931,7 @@ impl<'a> Interp<'a> {
     fn vm_callback_values_target<'cb>(
         &mut self,
         callable: &'cb Value,
-        values: &[Value; 2],
+        values: &[Value],
     ) -> Option<(&'cb Rc<FunctionDecl>, Rc<Compiled>, &'cb Rc<PhpCallable>)> {
         let Value::Callable(c) = callable else {
             return None;
@@ -3312,6 +3393,23 @@ function missing_key($a) { return $a[$unknown]; }
 var_dump(missing_key([0=>2]));
 restore_error_handler();
 echo read_at(k: 0, a: [11]), "\n";
+function clear_at(&$a, $k) { return $a[$k] = false; }
+$a=[true,true]; var_dump(clear_at($a,0)); $copy=$a; clear_at($a,1);
+echo json_encode($a), ' ', json_encode($copy), "\n";
+$r =& $a[1]; $r=true; clear_at($a,1); var_dump($r);
+clear_at($a,7); clear_at($a,'key'); echo json_encode($a), "\n";
+class WriteTyped { public int $v=1; public readonly array $a; function __construct() { $this->a=[true]; } }
+$o=new WriteTyped; $a=[0]; $a[0] =& $o->v;
+var_dump(clear_at($a,0)); var_dump($o->v);
+$a=$o->a; clear_at($a,0); echo json_encode($a), ' ', json_encode($o->a), "\n";
+try { $o->a[0]=false; } catch (Error $e) { echo $e->getMessage(), "\n"; }
+class WriteAccess implements ArrayAccess {
+ function offsetExists(mixed $k):bool { return true; }
+ function offsetGet(mixed $k):mixed { return true; }
+ function offsetSet(mixed $k,mixed $v):void { echo "set:$k:", json_encode($v), "\n"; }
+ function offsetUnset(mixed $k):void {}
+}
+$a=new WriteAccess; clear_at($a,3);
 $g=[1]; for ($i=0; $i<2; $i++) { echo $g[0], "\n"; $GLOBALS['g']=[5]; }
 echo $GLOBALS['g'][0], "\n";
 "#);
@@ -3340,6 +3438,15 @@ warning:Using null as an array offset is deprecated, use an empty string instead
 warning:Undefined array key ""
 NULL
 11
+bool(false)
+[false,false] [false,true]
+bool(false)
+{"0":false,"1":false,"7":false,"key":false}
+int(0)
+int(0)
+[false] [true]
+Cannot indirectly modify readonly property WriteTyped::$a
+set:3:false
 1
 5
 5
@@ -3347,7 +3454,7 @@ NULL
         );
         assert_eq!(it.err_buf, "");
         assert_eq!(result.exit_code, 0);
-        for name in ["read_at", "read_zero"] {
+        for name in ["read_at", "read_zero", "clear_at"] {
             let decl = it.functions[name].clone();
             let compiled = it.vm_compiled(&decl).unwrap();
             assert!(compiled.needs_bind && !compiled.value_abi);
@@ -3355,12 +3462,67 @@ NULL
                 .ops
                 .iter()
                 .any(|op| matches!(op, super::Op::DimCv { .. })));
+            if name == "clear_at" {
+                assert!(compiled.ops.iter().any(|op| matches!(
+                    op,
+                    super::Op::DimCv {
+                        write: Some(super::Value::Bool(false)),
+                        ..
+                    }
+                )));
+            }
         }
     }
 
     #[test]
     fn callback_values_preserve_live_args_fallbacks_sort_errors_and_owners() {
         let mut it = Interp::new("callbacks.php");
+        // Builtin binding borrows complete positional Cells; incomplete or
+        // named packs still run the canonical owned/default/error binder.
+        let exact = super::super::CallArgs::positional(vec![
+            super::cell(super::Value::str("abcd")),
+            super::cell(super::Value::Int(1)),
+            super::cell(super::Value::Int(2)),
+        ]);
+        let params = crate::builtins::builtin_params("substr").unwrap();
+        let bound = it.resolve_named_builtin("substr", params, &exact).unwrap();
+        assert!(matches!(bound, std::borrow::Cow::Borrowed(_)));
+        assert!(std::rc::Rc::ptr_eq(&bound[0], &exact.cells[0]));
+        let partial = super::super::CallArgs::positional(exact.cells[..2].to_vec());
+        assert!(matches!(
+            it.resolve_named_builtin("substr", params, &partial)
+                .unwrap(),
+            std::borrow::Cow::Owned(_)
+        ));
+        let mut named = super::super::CallArgs::positional(exact.cells[..1].to_vec());
+        named
+            .named
+            .push(("offset".into(), exact.cells[1].clone(), false, false));
+        assert!(matches!(
+            it.resolve_named_builtin("substr", params, &named).unwrap(),
+            std::borrow::Cow::Owned(_)
+        ));
+        let excessive = super::super::CallArgs::positional(vec![exact.cells[0].clone(); 4]);
+        assert!(it
+            .resolve_named_builtin("substr", params, &excessive)
+            .is_err());
+        let variadic = super::super::CallArgs::positional(vec![
+            super::cell(super::Value::Int(3)),
+            super::cell(super::Value::Int(1)),
+        ]);
+        assert!(matches!(
+            it.resolve_named_builtin(
+                "min",
+                crate::builtins::builtin_params("min").unwrap(),
+                &variadic
+            )
+            .unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let missing = super::super::CallArgs::empty();
+        assert!(it
+            .resolve_named_builtin("substr", params, &missing)
+            .is_err());
         let result = it.run_source(r#"<?php
 function liveCallbackArg() { return debug_backtrace(0, 2)[1]['args'][0]; }
 var_dump(array_map(function(int $x): int { $x++; echo json_encode(func_get_args()), "\n"; return liveCallbackArg(); }, ['a'=>1,'b'=>2]));
@@ -3433,7 +3595,7 @@ DivisionByZeroError:Division by zero
         };
         let weak = std::rc::Rc::downgrade(c);
         let result = it
-            .call_value_pair(
+            .call_values(
                 &callable,
                 [crate::value::Value::Int(2), crate::value::Value::Int(1)],
                 false,
@@ -3444,11 +3606,97 @@ DivisionByZeroError:Division by zero
             it.vm_frame_pool.iter().any(|f| f.value_args.capacity() > 0),
             "primitive callback did not reach the value ABI"
         );
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            for _ in 0..70 {
+                assert!(matches!(
+                    it.call_values(
+                        &callable,
+                        [super::Value::Int(2), super::Value::Int(1)],
+                        false
+                    )
+                    .unwrap(),
+                    super::Value::Int(3)
+                ));
+            }
+            let super::CallableKind::Closure(decl) = &c.kind else {
+                panic!("closure");
+            };
+            match &it.compiled_fns[&(Rc::as_ptr(decl) as usize)].3 {
+                super::native::State::Ready(p) => assert!(
+                    p.executions.get() > 0,
+                    "callback did not enter native before VM frame"
+                ),
+                _ => panic!("callback graph was not native"),
+            }
+            let error = it
+                .call_values(
+                    &callable,
+                    [super::Value::Int(i64::MAX), super::Value::Int(1)],
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                error.message.contains("Return value must be of type int"),
+                "{}",
+                error.message
+            );
+            assert!(it.call_trace.is_empty());
+            assert_eq!(it.vm_stack.len(), 1);
+            assert_eq!(it.vm_stack[0].used, 32 + super::super::VM_FRAME_SLOTS * 16);
+        }
         drop(callable);
         assert!(
             weak.upgrade().is_none(),
             "pooled callback frame retained callable owner"
         );
+
+        // The same proof must reach native code for one fresh value, without
+        // retaining its callable owner or skipping typed overflow replay.
+        let mut it = Interp::new("single-callback.php");
+        it.run_source("<?php function singleOwned(int $x): int { return $x * 3 + 1; }");
+        let callable = it
+            .eval(&crate::ast::Expr::Closure(crate::ast::ClosureExpr {
+                decl: (*it.functions["singleowned"]).clone(),
+                uses: Vec::new(),
+                arrow: false,
+                is_static: false,
+            }))
+            .unwrap();
+        let super::Value::Callable(c) = &callable else {
+            panic!("closure")
+        };
+        let weak = std::rc::Rc::downgrade(c);
+        for _ in 0..70 {
+            assert!(matches!(
+                it.call_values(&callable, [super::Value::Int(2)], false)
+                    .unwrap(),
+                super::Value::Int(7)
+            ));
+        }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let super::CallableKind::Closure(decl) = &c.kind else {
+                panic!("closure")
+            };
+            match &it.compiled_fns[&(Rc::as_ptr(decl) as usize)].3 {
+                super::native::State::Ready(p) => assert!(p.executions.get() > 0),
+                _ => panic!("single callback did not enter native"),
+            }
+        }
+        let error = it
+            .call_values(&callable, [super::Value::Int(i64::MAX)], false)
+            .unwrap_err();
+        assert!(
+            error.message.contains("Return value must be of type int"),
+            "{}",
+            error.message
+        );
+        assert!(it.call_trace.is_empty());
+        assert_eq!(it.vm_stack.len(), 1);
+        assert_eq!(it.vm_stack[0].used, 32 + super::super::VM_FRAME_SLOTS * 16);
+        drop(callable);
+        assert!(weak.upgrade().is_none(), "single callback owner retained");
     }
 
     #[test]
@@ -3494,13 +3742,19 @@ function nt_depth(int $n): int { return $n < 1 ? 0 : nt_depth($n-1) + 1; }
 function nt_bad(int $n): int { return $n + 1; }
 function nt_local($n) { if ($n) { $x=9; } return $x; }
 function nt_effect($n) { echo "effect\n"; return $n + 1; }
+function nt_loop(int $n): int { $s=0; for ($i=0;$i<$n;$i++) { for ($j=0;$j<3;$j++) { if ($j===1) continue; $s+=$i; } if ($i===4) break; } return $s; }
+function nt_loop_bad(int $n): int { for ($i=0;$i<2;$i++) $n++; return $n; }
+function nt_loop_local($n) { while ($n<0) { $x=1; $n++; } return $x; }
 echo nt_fib(16), "\n";
-for ($i=0;$i<70;$i++) { nt_add(1); nt_depth(1); nt_bad(1); nt_local(1); }
+for ($i=0;$i<70;$i++) { nt_add(1); nt_depth(1); nt_bad(1); nt_local(1); nt_loop(10); nt_loop_bad(1); nt_loop_local(-1); }
+echo nt_loop(10), "\n";
+try { nt_loop_bad(PHP_INT_MAX-1); } catch (TypeError $e) { echo get_class($e), "\n"; }
 var_dump(nt_add(PHP_INT_MAX));
 echo nt_depth(100), "\n";
 try { nt_bad(PHP_INT_MAX); } catch (TypeError $e) { echo get_class($e), "\n"; }
 set_error_handler(function () { echo "uninit\n"; return true; });
 var_dump(nt_local(0));
+var_dump(nt_loop_local(0));
 restore_error_handler();
 echo nt_effect(2), "\n";
 "#,
@@ -3509,8 +3763,16 @@ echo nt_effect(2), "\n";
                 assert_eq!(it.err_buf, "");
                 assert_eq!(
                     it.out,
-                    b"987\nfloat(9.223372036854776E+18)\n100\nTypeError\nuninit\nNULL\neffect\n3\n"
+                    b"987\n20\nTypeError\nfloat(9.223372036854776E+18)\n100\nTypeError\nuninit\nNULL\nuninit\nNULL\neffect\n3\n"
                 );
+                let loop_decl = it.functions["nt_loop"].clone();
+                match &it.compiled_fns[&(Rc::as_ptr(&loop_decl) as usize)].3 {
+                    super::native::State::Ready(p) => assert!(p.executions.get() > 0, "loop stayed in VM"),
+                    _ => panic!("pure nested/backward graph did not execute native code"),
+                }
+                it.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                assert!(super::native::execute(&mut it, &loop_decl, &[super::Slot::V(super::Value::Int(10))]).is_none());
+                it.deadline = None;
                 let decl = it.functions["nt_fib"].clone();
                 match &it.compiled_fns[&(Rc::as_ptr(&decl) as usize)].3 {
                     super::native::State::Ready(p) => assert!(p.executions.get() > 0),
@@ -3530,7 +3792,7 @@ echo nt_effect(2), "\n";
                 assert_eq!(it.vm_stack[0].used, it.vm_stack[0].size);
                 assert_eq!(it.mem_tracked.len(), charges);
                 it.vm_stack[0].used = original;
-                for name in ["nt_add", "nt_depth", "nt_bad", "nt_local"] {
+                for name in ["nt_add", "nt_depth", "nt_bad", "nt_local", "nt_loop_bad", "nt_loop_local"] {
                     let decl = it.functions[name].clone();
                     assert!(
                         matches!(

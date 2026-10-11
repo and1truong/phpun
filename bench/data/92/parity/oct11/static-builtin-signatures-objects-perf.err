@@ -1,0 +1,2 @@
+[ perf record: Woken up 64 times to write data ]
+[ perf record: Captured and wrote 15.977 MB /workspace/parity92/oct11/static-builtin-signatures-objects.data (1965 samples) ]

@@ -80,7 +80,14 @@ fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     // ponytail: first-byte filter avoids a full comparison at every byte;
     // repetitive long needles still have O(n*m) cost (future two-way search).
     while at <= last {
-        let p = at + hay[at..=last].iter().position(|b| *b == first)?;
+        let bytes = &hay[at..=last];
+        // SAFETY: memchr reads this nonempty slice and returns null or a
+        // pointer within it; subtraction uses that same live allocation.
+        let found = unsafe { libc::memchr(bytes.as_ptr().cast(), first.into(), bytes.len()) };
+        if found.is_null() {
+            return None;
+        }
+        let p = at + unsafe { (found as *const u8).offset_from(bytes.as_ptr()) as usize };
         if hay[p..].starts_with(needle) {
             return Some(p);
         }
@@ -1562,10 +1569,20 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
 /// Under strict mode scalar coercion is disabled (int->float widening
 /// is still allowed); a mismatch throws TypeError.
 pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
-    let str_p = ("string", "string");
-    let ps: &[(&str, &str)] = match name {
+    strict_sig_view(name).map(|ps| {
+        ps.iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect()
+    })
+}
+
+/// The same signature metadata for hot checks; ownership is only needed by
+/// reflection/public consumers, not ZPP on every invocation.
+pub(crate) fn strict_sig_view(name: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    const STR_P: (&str, &str) = ("string", "string");
+    let ps = match name {
         "strlen" | "strrev" | "strtoupper" | "strtolower" | "ucfirst" | "lcfirst" | "md5"
-        | "sha1" | "str_rot13" | "nl2br" | "quotemeta" | "soundex" => &[str_p],
+        | "sha1" | "str_rot13" | "nl2br" | "quotemeta" | "soundex" => &[STR_P][..],
         "parse_str" => &[("string", "string"), ("result", "mixed")],
         "getopt" => &[
             ("short_options", "string"),
@@ -1751,11 +1768,7 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
         "strtolower_mb" => &[("string", "string")],
         _ => return None,
     };
-    Some(
-        ps.iter()
-            .map(|(n, t)| (n.to_string(), t.to_string()))
-            .collect(),
-    )
+    Some(ps)
 }
 
 #[cfg(test)]

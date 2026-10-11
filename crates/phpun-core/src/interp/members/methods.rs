@@ -2324,6 +2324,21 @@ impl<'a> Interp<'a> {
         pre: Option<(Rc<MethodDecl>, Rc<PhpClass>)>,
     ) -> Result<Value, PhpError> {
         let mut resolved = pre;
+        let cls = obj.borrow().class.clone();
+        // No native ancestor/interface can intercept a concrete PHP method
+        // on an ordinary root class. Visibility/private resolution already ran.
+        if cls.decl.kind == ClassKind::Class
+            && cls.decl.line > 0
+            && !cls.decl.file.is_empty()
+            && cls.decl.parent.is_none()
+            && cls.decl.implements.is_empty()
+        {
+            if let Some((m, dc)) = &resolved {
+                if !m.is_abstract && m.decl.line > 0 {
+                    return self.invoke_method(obj, m, args, dc.clone());
+                }
+            }
+        }
         // Builtin exception methods implemented natively.
         if let Value::Object(_) = Value::Object(obj.clone()) {}
         let is_throwable = {
@@ -2331,7 +2346,6 @@ impl<'a> Interp<'a> {
             matches!(ob.internal, Some(ObjectInternal::Exception { .. }))
                 || self.is_throwable_cls(&ob.class)
         };
-        let cls = obj.borrow().class.clone();
         // One chain walk feeds the stub-ZPP binder, every stub arm and
         // the final dispatch below (callers that already resolved pass
         // `pre`). Hoisted above the named-args binder — stub methods

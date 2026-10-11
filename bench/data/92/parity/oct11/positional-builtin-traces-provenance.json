@@ -1,0 +1,22 @@
+{
+  "runtime": "c5bc8d9725ab45f4d8ad23f6b494fb8371382dbf",
+  "source": "a05ec4fd6b07a1f3e6d96528ee29d3c07578577b",
+  "tracked_clean": "only untracked vendor symlink",
+  "php": "8.5.11 -n; OPcache CLI off; JIT disabled",
+  "phpt_changes": [],
+  "physical_allocations": {
+    "strings": {
+      "parent_requests": 2225333,
+      "candidate_requests": 2144433,
+      "parent_bytes": 67752290,
+      "candidate_bytes": 65156826
+    },
+    "objects_20x5000": {
+      "parent_requests": 10963249,
+      "candidate_requests": 10963250,
+      "parent_bytes": 299512456,
+      "candidate_bytes": 302691024
+    }
+  },
+  "note": "sqrt has no known builtin_params entry; object allocations unchanged, no targeted object speed attribution; allocator bytes fluctuate in memory registry backing."
+}

@@ -1157,10 +1157,11 @@ impl<'a> Interp<'a> {
                 let found = cls
                     .as_ref()
                     .and_then(|c| s.find_method_in(c, "__construct"));
+                // The resolved Rc pins immutable metadata through argument
+                // evaluation; avoid cloning every parameter/default/type.
                 let params = found
                     .as_ref()
-                    .map(|m| m.0.decl.params.clone())
-                    .unwrap_or_default();
+                    .map_or(&[][..], |m| m.0.decl.params.as_slice());
                 // ctx is the ctor's diagnostic name — arg_cells wraps
                 // it as "{ctx}()" for arg errors. Oracle prints the
                 // ctor's DECLARING class (`P::__construct():` when C
@@ -1171,8 +1172,9 @@ impl<'a> Interp<'a> {
                 // has no arg diagnostics to name, so the fallback is
                 // only for the not-found/unresolved edge.
                 let owner = found
+                    .as_ref()
                     .map(|(_, o)| o.decl.name.clone())
-                    .or_else(|| cls.map(|c| c.decl.name.clone()))
+                    .or_else(|| cls.as_ref().map(|c| c.decl.name.clone()))
                     .unwrap_or_else(|| name.clone());
                 let base = owner.split('\0').next().unwrap_or(&owner).to_string();
                 let ctx = if base.contains("@anonymous") {
@@ -1182,7 +1184,7 @@ impl<'a> Interp<'a> {
                 };
                 let argvals = s.arg_cells(
                     args,
-                    &params,
+                    params,
                     &ctx,
                     false,
                     Some(*site),
@@ -3516,8 +3518,8 @@ impl<'a> Interp<'a> {
                         newv = self.prop_typed_write_check(&pd, &dcls, newv)?;
                     }
                 }
-                let nv = self.typed_slot_store(&c, newv.clone())?;
-                self.cell_store(&c, nv)?;
+                newv = self.typed_slot_store(&c, newv)?;
+                self.cell_store(&c, newv.clone())?;
             }
             Late::Keyed { base, keys } => {
                 // A `??=` detached root re-resolves AFTER the RHS — the
@@ -3682,8 +3684,8 @@ impl<'a> Interp<'a> {
             }
             Late::None => match target_cell {
                 Some(c) => {
-                    let nv = self.typed_slot_store(&c, newv.clone())?;
-                    self.cell_store(&c, nv)?;
+                    newv = self.typed_slot_store(&c, newv)?;
+                    self.cell_store(&c, newv.clone())?;
                 }
                 None => {
                     // `list()`/`[]` destructure: zend's first FETCH_LIST
@@ -5365,7 +5367,8 @@ impl<'a> Interp<'a> {
                             return Ok(v);
                         }
                     }
-                    if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
+                    if let Some((index, dcls)) = self.decl_prop_site(&o, pn) {
+                        let pd = &dcls.decl.props[index];
                         if let Some(sv) = pd.set_vis {
                             if !self.hook_scope_allows(&o, &dcls, pn, sv) {
                                 return self.set_visibility_error(&dcls, &pd.name, sv);
@@ -5373,7 +5376,8 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
+                if let Some((index, dcls)) = self.decl_prop_site(&o, pn) {
+                    let pd = &dcls.decl.props[index];
                     if pd.readonly {
                         // readonly implies protected(set): one-time init
                         // from the declaring scope only; later writes
@@ -5410,7 +5414,7 @@ impl<'a> Interp<'a> {
                             ));
                         }
                     }
-                    v = self.prop_typed_write_check(&pd, &dcls, v)?;
+                    v = self.prop_typed_write_check(pd, &dcls, v)?;
                 }
                 // Declared-prop slot resolution: private decls write
                 // their mangled `\0C\0p` slot even on first write (the
@@ -5418,7 +5422,8 @@ impl<'a> Interp<'a> {
                 // fall through to __set/dynamic.
                 let cls = o.borrow().class.clone();
                 let k = self.obj_prop_key(&o, pn).or_else(|| {
-                    self.decl_prop(&o, pn).map(|(pd, dcls)| {
+                    self.decl_prop_site(&o, pn).map(|(index, dcls)| {
+                        let pd = &dcls.decl.props[index];
                         if pd.visibility == crate::ast::Visibility::Private {
                             format!("\0{}\0{}", dcls.name(), pd.name)
                         } else {
@@ -5438,7 +5443,7 @@ impl<'a> Interp<'a> {
                 // the prop table for names std doesn't know.
                 if k.is_none()
                     && self.aap_active(&o)
-                    && self.decl_prop(&o, pn).is_none()
+                    && self.decl_prop_site(&o, pn).is_none()
                     && !o.borrow().prop_has(pn)
                 {
                     // AAP prop writes route through spl_array_write_
@@ -6297,12 +6302,12 @@ impl<'a> Interp<'a> {
                         // a typed prop stays type-gated (064). The store
                         // goes through cell_store so the displaced zval's
                         // destructor runs (a shared cell can alias vars).
-                        let nv = self.typed_slot_store(&nc, v.clone())?;
+                        let v = self.typed_slot_store(&nc, v)?;
                         // Never panic on a re-entrant borrow — a live
                         // upstream borrow (a handler's write reaching
                         // this slot) drops the write invisibly (B1).
                         if let Ok(mut nb) = nc.try_borrow_mut() {
-                            let old = std::mem::replace(&mut *nb, nv);
+                            let old = std::mem::replace(&mut *nb, v.clone());
                             drop(nb);
                             // The displaced zval's destructor runs
                             // (cell_store semantics) — a shared cell can

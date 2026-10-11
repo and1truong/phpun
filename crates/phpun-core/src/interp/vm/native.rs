@@ -48,6 +48,7 @@ fn eligible(d: &FunctionDecl, c: &Compiled) -> bool {
         && d.ns.is_empty()
         && d.decl_in.is_none()
         && d.params.len() <= 16
+        && c.nslots >= d.params.len()
         && c.nslots <= 256
         && c.ops.len() <= 1024
         && integer_type(&d.ret)
@@ -63,10 +64,11 @@ struct Graph {
 }
 
 impl Graph {
-    fn build(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>) -> Option<Self> {
-        // Anonymous/method declarations never use a global registry guard.
+    fn build(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>, closure: bool) -> Option<Self> {
+        // An unregistered root is allowed only after the shared callback
+        // target proves it is an uncaptured context-free scalar closure.
         let name = decl.name.to_lowercase();
-        if !it.functions.get(&name).is_some_and(|d| Rc::ptr_eq(d, decl)) {
+        if !closure && !it.functions.get(&name).is_some_and(|d| Rc::ptr_eq(d, decl)) {
             return None;
         }
         let root = it.vm_compiled(decl)?;
@@ -128,23 +130,32 @@ impl Graph {
 }
 
 // The accepted value stack contains integers only. Comparisons may create a
-// bool only immediately before its consuming conditional branch. Forward
-// control flow bounds each native activation; backward jumps keep the VM.
+// bool only immediately before its consuming conditional branch. All joins,
+// including backward edges, must have one consistent stack depth.
 fn depths(c: &Compiled) -> Option<Vec<Option<usize>>> {
     let mut depths: Vec<Option<usize>> = vec![None; c.ops.len() + 1];
     depths[0] = Some(0);
-    let set = |depths: &mut Vec<Option<usize>>, pc: usize, depth: usize| -> Option<()> {
+    let mut work = vec![0];
+    let set = |depths: &mut Vec<Option<usize>>,
+               work: &mut Vec<usize>,
+               pc: usize,
+               depth: usize|
+     -> Option<()> {
         let at = depths.get_mut(pc)?;
         if at.is_some_and(|old| old != depth) {
             return None;
         }
-        *at = Some(depth);
+        if at.is_none() {
+            *at = Some(depth);
+            work.push(pc);
+        }
         Some(())
     };
-    for (pc, op) in c.ops.iter().enumerate() {
-        let Some(n) = depths[pc] else {
+    while let Some(pc) = work.pop() {
+        let Some(op) = c.ops.get(pc) else {
             continue;
         };
+        let n = depths[pc]?;
         let (take, give) = match op {
             Op::Const(Value::Int(_))
             | Op::Load(_)
@@ -163,7 +174,7 @@ fn depths(c: &Compiled) -> Option<Vec<Option<usize>>> {
         let next = n.checked_sub(take)? + give;
         match op {
             Op::Binary(op) | Op::BinaryCv(op, _) | Op::BinaryCvConst(op, _, _)
-                if !matches!(*op, "+" | "-" | "*")
+                if !matches!(*op, "+" | "-" | "*" | "<=>")
                     && !(matches!(*op, "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">=")
                         && matches!(
                             c.ops.get(pc + 1),
@@ -177,19 +188,13 @@ fn depths(c: &Compiled) -> Option<Vec<Option<usize>>> {
         match op {
             Op::Return => {}
             Op::Jump(t) => {
-                if *t <= pc {
-                    return None;
-                }
-                set(&mut depths, *t, next)?;
+                set(&mut depths, &mut work, *t, next)?;
             }
             Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => {
-                if *t <= pc {
-                    return None;
-                }
-                set(&mut depths, *t, next)?;
-                set(&mut depths, pc + 1, next)?;
+                set(&mut depths, &mut work, *t, next)?;
+                set(&mut depths, &mut work, pc + 1, next)?;
             }
-            _ => set(&mut depths, pc + 1, next)?,
+            _ => set(&mut depths, &mut work, pc + 1, next)?,
         }
     }
     Some(depths)
@@ -251,6 +256,15 @@ impl Emitter {
             "+" => self.emit(&[0x48, 0x01, 0xd0]),
             "-" => self.emit(&[0x48, 0x29, 0xd0]),
             "*" => self.emit(&[0x48, 0x0f, 0xaf, 0xc2]),
+            "<=>" => {
+                // Signed integer comparison, including MIN/MAX; SETcc leaves
+                // flags intact until both booleans have been captured.
+                self.emit(&[
+                    0x48, 0x39, 0xd0, 0x0f, 0x9f, 0xc0, 0x0f, 0x9c, 0xc2, 0x48, 0x0f, 0xb6, 0xc0,
+                    0x48, 0x0f, 0xb6, 0xd2, 0x48, 0x29, 0xd0,
+                ]);
+                return;
+            }
             _ => {
                 self.emit(&[0x48, 0x39, 0xd0]);
                 let cc = match op {
@@ -454,8 +468,8 @@ impl Emitter {
 }
 
 impl Program {
-    fn build(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>) -> Option<Self> {
-        let graph = Graph::build(it, decl)?;
+    fn build(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>, closure: bool) -> Option<Self> {
+        let graph = Graph::build(it, decl, closure)?;
         let mut e = Emitter {
             bytes: Vec::new(),
             calls: Vec::new(),
@@ -517,24 +531,15 @@ impl Program {
     }
 }
 
-#[inline(never)]
-pub(super) fn execute(
-    it: &mut Interp<'_>,
-    decl: &Rc<FunctionDecl>,
-    slots: &[Slot],
-) -> Option<Value> {
+fn cached(it: &mut Interp<'_>, decl: &Rc<FunctionDecl>, closure: bool) -> Option<Rc<Program>> {
     if it.deadline.is_some()
         || super::Interp::callprof_on()
         || super::coverage_on()
-        || it.cur().this_obj.is_some()
-        || it.cur().closure_rc.is_some()
+        || it.compiled_fns.len() > 4096
     {
         return None;
     }
     let key = Rc::as_ptr(decl) as usize;
-    if it.compiled_fns.len() > 4096 {
-        return None;
-    }
     let program = {
         let state = &mut it.compiled_fns.get_mut(&key)?.3;
         match state {
@@ -549,25 +554,9 @@ pub(super) fn execute(
             }
         }
     };
-    let mut arguments = [0i64; 16];
-    if decl.params.len() > arguments.len() {
-        return None;
-    }
-    for (i, slot) in slots.iter().take(decl.params.len()).enumerate() {
-        let value = match slot {
-            Slot::Arg(i) => it.cur().value_args[*i as usize].clone(),
-            Slot::V(v) => v.clone(),
-            Slot::C(c) => c.borrow().clone(),
-            Slot::Uninit => return None,
-        };
-        let Value::Int(n) = value else {
-            return None;
-        };
-        arguments[i] = n;
-    }
     let program = match program {
         Some(p) => p,
-        None => match Program::build(it, decl) {
+        None => match Program::build(it, decl, closure) {
             Some(p) => {
                 let p = Rc::new(p);
                 it.compiled_fns.get_mut(&key)?.3 = State::Ready(p.clone());
@@ -585,6 +574,18 @@ pub(super) fn execute(
             .is_some_and(|current| Rc::ptr_eq(current, d))
     }) {
         it.compiled_fns.get_mut(&key)?.3 = State::Disabled;
+        return None;
+    }
+    Some(program)
+}
+
+fn run(
+    it: &mut Interp<'_>,
+    decl: &Rc<FunctionDecl>,
+    program: &Program,
+    arguments: &[i64],
+) -> Option<Value> {
+    if decl.params.len() > arguments.len() {
         return None;
     }
     let top = it.vm_stack.last_mut()?;
@@ -608,7 +609,76 @@ pub(super) fn execute(
         program.executions.set(program.executions.get() + 1);
         Some(Value::Int(out))
     } else {
-        it.compiled_fns.get_mut(&key)?.3 = State::Disabled;
+        it.compiled_fns.get_mut(&(Rc::as_ptr(decl) as usize))?.3 = State::Disabled;
         None
     }
+}
+
+#[inline(never)]
+pub(super) fn execute(
+    it: &mut Interp<'_>,
+    decl: &Rc<FunctionDecl>,
+    slots: &[Slot],
+) -> Option<Value> {
+    if it.cur().this_obj.is_some() || it.cur().closure_rc.is_some() {
+        return None;
+    }
+    let mut arguments = [0i64; 16];
+    if decl.params.len() > arguments.len() {
+        return None;
+    }
+    for (i, slot) in slots.iter().take(decl.params.len()).enumerate() {
+        let value = match slot {
+            Slot::Arg(i) => it.cur().value_args[*i as usize].clone(),
+            Slot::V(v) => v.clone(),
+            Slot::C(c) => c.borrow().clone(),
+            Slot::Uninit => return None,
+        };
+        let Value::Int(n) = value else {
+            return None;
+        };
+        arguments[i] = n;
+    }
+    let program = cached(it, decl, false)?;
+    run(it, decl, &program, &arguments)
+}
+
+/// Caller reuses vm_callback_values_target's complete context/argument proof.
+/// The graph adds purity and int-only guards, so no PHP effect precedes replay.
+pub(super) fn callback(
+    it: &mut Interp<'_>,
+    decl: &Rc<FunctionDecl>,
+    values: &[Value],
+) -> Option<Value> {
+    let mut arguments = [0i64; 16];
+    if values.len() > arguments.len() {
+        return None;
+    }
+    for (i, value) in values.iter().enumerate() {
+        let Value::Int(n) = value else {
+            return None;
+        };
+        arguments[i] = *n;
+    }
+    let program = cached(it, decl, true)?;
+    let span = (super::super::VM_FRAME_SLOTS + values.len() as u64) * 16;
+    let top = it.vm_stack.last_mut()?;
+    if top.size.saturating_sub(top.used) < span {
+        return None;
+    }
+    let used = top.used;
+    top.used += span;
+    let result = run(it, decl, &program, &arguments[..values.len()]);
+    let top = it.vm_stack.last_mut().unwrap();
+    assert_eq!(top.used, used + span, "native callback root span leak");
+    top.used = used;
+    if result.is_some() {
+        // Same scalar return side channels as the shared VM teardown. Pure
+        // integer code owns no callback objects/temps needing a destructor pass.
+        it.last_ret_cell = None;
+        it.last_popped_frame = None;
+        it.last_call_by_ref = false;
+        it.send_line = Some(it.cur_line);
+    }
+    result
 }

@@ -1,0 +1,44 @@
+{
+  "host": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "metric": "cold CLI ms; 7 alternating reps; profilers off",
+  "source": "c64241bea2bc586f0586969782d2d4067977161d",
+  "dirty": true,
+  "build": "rustc 1.99.0; cargo build --offline --release; LTO=true/codegen-units=1",
+  "binaries": {
+    "/workspace/parity92/oct11/native-fixed": "6780a3fe1a8e5cfea823849b335b06086fa53cc1f270b03e2f070dfb9e055442",
+    "/workspace/parity92/oct11/ctor-fixed": "78e4b18ef8f4d0c16393fb3a0bed0421ea9764478c2f7e1c35d451c73509eac0",
+    "/workspace/php85": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f"
+  },
+  "php_args": [
+    "-n"
+  ],
+  "cases": [
+    {
+      "argv": [
+        "bench/40-objects.php"
+      ],
+      "before_ms": [
+        284.033055,
+        252.792929,
+        270.450626,
+        248.731768,
+        265.338063,
+        254.467948,
+        276.420098
+      ],
+      "after_ms": [
+        248.603043,
+        234.098651,
+        251.394694,
+        239.089219,
+        251.395125,
+        248.236333,
+        254.020876
+      ],
+      "before_median": 265.338063,
+      "after_median": 248.603043,
+      "ratio": 0.9369294408394021,
+      "gate": "exit/stdout/stderr == PHP"
+    }
+  ]
+}

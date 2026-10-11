@@ -1,0 +1,37 @@
+{
+  "runtime": "2919eda309565260a13bf2f6e5aa0e6d58eaac73",
+  "build_source": "2919eda (5b1bfd1 merges parent report only)",
+  "sha256": {
+    "property-stores": "bfa9c4971800c5251d2cd9879e59c42bfecdf03159e8d465708e7f67f6d2aae9",
+    "native-loops": "c87763f70fdf99f75c7bc2e17231d02828525354f8cbfba9ab2848cc6d8c7fa6"
+  },
+  "build": "Rust1.99 release LTO/codegen-units1; force core clean before worktree switch",
+  "gates": "workspace8core/22runtime/19format,fmt/clippy;existing actual-native nested-loop/break/continue/overflow/uninit/deadline/cleanup check;25script+19workload+native-loop/warm-comparator/dimension byte gates;VM-profile;3406PHPT",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes": {
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": [
+      "timeout",
+      "crash"
+    ],
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": [
+      "crash",
+      "timeout"
+    ]
+  },
+  "timing": "7 alternating isolated profiler-off focused pairs;7 rotating native-PHP/parent/candidate pure-loop pairs;31arrays/Composer follow-up",
+  "scope": "Pure scalar loop fixture is separate from original ninebench suite; 100k coldCLI remains1.477\u00d7PHP,1M0.719\u00d7PHP. Not array-loop JIT or suite parity.",
+  "dirty": "Only untracked vendor symlink; tracked production runtime clean"
+}

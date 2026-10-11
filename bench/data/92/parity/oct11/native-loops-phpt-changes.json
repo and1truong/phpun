@@ -1,0 +1,10 @@
+{
+  "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": [
+    "timeout",
+    "crash"
+  ],
+  "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": [
+    "crash",
+    "timeout"
+  ]
+}
