@@ -61,8 +61,8 @@ enum ObjHandle {
 impl ObjHandle {
     fn alive(&self) -> bool {
         match self {
-            Self::Obj(w) => w.upgrade().is_some(),
-            Self::Callable(w, _) => w.upgrade().is_some(),
+            Self::Obj(w) => w.strong_count() != 0,
+            Self::Callable(w, _) => w.strong_count() != 0,
         }
     }
 }
