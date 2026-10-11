@@ -1142,10 +1142,11 @@ impl<'a> Interp<'a> {
                 // `new X(...)` resolves the class before its args
                 // evaluate — autoload is part of that resolution; a
                 // missing class dies before arg side effects.
-                let mut cls = s.classes.get(&name.to_lowercase()).cloned();
+                let lname = name.to_lowercase();
+                let mut cls = s.classes.get(&lname).cloned();
                 if cls.is_none() {
                     s.run_autoload(name.trim_start_matches('\\'))?;
-                    cls = s.classes.get(&name.to_lowercase()).cloned();
+                    cls = s.classes.get(&lname).cloned();
                 }
                 if cls.is_none() {
                     // Trait/interface names miss the class map — zend
@@ -1208,7 +1209,7 @@ impl<'a> Interp<'a> {
                     true,
                     !params.is_empty(),
                 )?;
-                s.new_instance(&name, argvals)
+                s.new_resolved_instance(&lname, cls.unwrap(), Some(found), argvals)
             }),
             Expr::Prop {
                 obj,

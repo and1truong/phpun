@@ -3703,7 +3703,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn new_instance(
         &mut self,
         name: &str,
-        mut args: CallArgs,
+        args: CallArgs,
     ) -> Result<Value, PhpError> {
         let lname = name.to_lowercase();
         if !self.classes.contains_key(&lname) {
@@ -3727,6 +3727,18 @@ impl<'a> Interp<'a> {
                 ));
             }
         };
+        self.new_resolved_instance(&lname, cls, None, args)
+    }
+
+    /// AST new already pins its class/constructor before argument evaluation.
+    /// Other callers defer ctor lookup until after constant initialization.
+    pub(in crate::interp) fn new_resolved_instance(
+        &mut self,
+        lname: &str,
+        cls: Rc<PhpClass>,
+        resolved_ctor: Option<crate::value::MethodHit>,
+        mut args: CallArgs,
+    ) -> Result<Value, PhpError> {
         if cls.name().eq_ignore_ascii_case("closure") {
             return self.fail(PhpError::uncaught(
                 "Error",
@@ -3770,7 +3782,7 @@ impl<'a> Interp<'a> {
             ));
         }
         self.link_const_inits(&cls)?;
-        let ctor = self.find_method_in(&cls, "__construct");
+        let ctor = resolved_ctor.unwrap_or_else(|| self.find_method_in(&cls, "__construct"));
         if ctor.is_none() {
             if let Some((n, ..)) = args.named.first() {
                 return self.fail(PhpError::uncaught(
@@ -3780,7 +3792,7 @@ impl<'a> Interp<'a> {
                 ));
             }
         }
-        let obj = self.instantiate(&lname, &[])?;
+        let obj = self.instantiate(lname, &[])?;
         // __construct (native for builtins via method_invoke's
         // interception); the ctor may be inherited (property_hooks/foreach).
         if let Some((m, dc)) = ctor {
