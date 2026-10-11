@@ -1,0 +1,50 @@
+{
+  "source": "eb879fadd6570026ce1a4f6be7606652e57dd1ef",
+  "runtime": "df90ccf7a77ab9e25f598991c128da8e388bf388",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 8,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects",
+      "before": {
+        "requests": 8369362,
+        "bytes": 261705889
+      },
+      "after": {
+        "requests": 8369363,
+        "bytes": 264884393
+      }
+    }
+  ],
+  "binary_sha256": "f3c53956c3e7d7cd7a21aade22fd1f57f719476e7ee7081d402da76d74ba9320",
+  "scope": "Prototype branch68 replaced effective promoted PropDecl cloning with the existing borrowed declaration resolver. Branch69 tried borrowed declared promotion storage keys. Both change canonical promoted_prop_write, while VM constructor promotion calls shared store_prop instead.",
+  "fallbacks": "Reject both runtime prototypes via ordinary reverts. Final branch68 crates/Cargo runtime diff versus #279 is empty. Branch69 retains only a useful existing private-collision check; its storage-key prototype was rejected before speed testing. No bypass of canonical type/hook/readonly/ref/destructor protocols."
+}

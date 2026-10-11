@@ -1550,3 +1550,42 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/scalar-builtin-calls-*.
+
+## #271: bench(objects): reject promotion prototypes outside the VM hot path (2026-10-11)
+
+Prototype branch68 replaced effective promoted PropDecl cloning with the existing borrowed declaration resolver. Branch69 tried borrowed declared promotion storage keys. Both change canonical promoted_prop_write, while VM constructor promotion calls shared store_prop instead.
+
+Reject both runtime prototypes via ordinary reverts. Final branch68 crates/Cargo runtime diff versus #279 is empty. Branch69 retains only a useful existing private-collision check; its storage-key prototype was rejected before speed testing. No bypass of canonical type/hook/readonly/ref/destructor protocols.
+
+Runtime df90ccf7a77ab9e25f598991c128da8e388bf388; measured source eb879fadd6570026ce1a4f6be7606652e57dd1ef.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 211.082 | 213.162 | 1.0099 |
+| bench/40-objects.php 20 5000 | 786.589 | 820.296 | 1.0429 |
+| bench/profile/objects.php ctor 5000 | 46.036 | 41.336 | 0.8979 |
+| bench/profile/objects.php norm 5000 | 49.005 | 47.278 | 0.9648 |
+| bench/20-strings.php | 64.193 | 66.737 | 1.0396 |
+| bench/30-arrays.php | 82.073 | 81.113 | 0.9883 |
+| bench/11-sieve.php | 82.373 | 81.736 | 0.9923 |
+| bench/10-fib.php | 8.384 | 8.401 | 1.0020 |
+| bench/app/cli.php 100 20 | 35.009 | 35.395 | 1.0110 |
+| examples/composer/run.php | 8.281 | 7.815 | 0.9437 |
+
+These are prototype timings, not final-head performance. Physical VM objects requests unchanged8369362→8369363 (startup1 request variation), bytes increased3.18MB in separate run; no measured allocation benefit.31pairs objects+0.7%,long+0.7%,strings+4.6% retained. Initial ctor−10.2% cannot be attributed to code outside the actual VM lane. Runtime revert restored exact #279 source. Do not multiply or advertise these medians as gains.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects: requests 8369362→8369363; bytes 261705889→264884393.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Prototype workspace/fmt/clippy,25script+19workload+existing promoted/native ancestor byte gate andVM-profile pass;3406only range71197crash→timeout. Final runtime source is exactly restored to #279; no post-revert speed claim.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/promotion-metadata-*.
