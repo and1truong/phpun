@@ -14,6 +14,6 @@
     "compatibility_pct": 0.00
   },
   "results": [
-    {"file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt", "name": "$generator->send() returns the yielded value", "status": "fail", "reason": "", "duration_ms": 9407}
+    {"file": "/workspace/phpun/vendor/php-tests/Zend/tests/generators/send_returns_current.phpt", "name": "$generator->send() returns the yielded value", "status": "fail", "reason": "", "duration_ms": 9451}
   ]
 }

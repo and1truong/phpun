@@ -3141,7 +3141,7 @@ are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
 | bench/60-json.php | 404.307 | 404.008 | 0.9993 |
 | bench/30-arrays.php | 82.372 | 82.334 | 0.9995 |
 
-Correctness cost is retained:31 strings45.251→49.664ms(+9.8%),long192.450→212.782(+10.6%),objects−1.6%,JSON−.1%,arraysflat. Whole7 main3.81804→candidate2.70013×PHP,parent+0.8%;strings+12.2%/3.740×PHP,long+16.9%/4.256×PHP;objects−.4%/12.305×PHP,long−.9%/17.910×PHP. Whole unrelated negativesfib+8.9%,app+2.6%,Composer+7.9% retained;no extra confirmation/no attribution to substring charge. Physical strings1001298282requests/94539595bytes,objects5833120/51673450,arrays616041/26545106 all identicalparent. This fixes previously unmetered live output,not a speedup;parity unmet.
+Correctness cost is retained:31 strings45.251→49.664ms(+9.8%),long192.450→212.782(+10.6%),objects−1.6%,JSON−.1%,arraysflat. Whole7 main3.81804→candidate2.70013×PHP,parent+0.8%;strings+12.2%/3.740×PHP,long+16.9%/4.256×PHP;objects−.4%/12.305×PHP,long−.9%/17.910×PHP. Whole unrelated negativesfib+8.9%,app+2.6%,Composer+7.9% retained;no extra confirmation/no attribution to substring charge. Physical strings1001298282requests/94539595bytes,objects5=833120/51673450,arrays616041/26545106 all identicalparent. This fixes previously unmetered live output,not a speedup;parity unmet.
 
 Separate physical allocator requests/bytes (not speed runs):
 
