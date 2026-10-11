@@ -2503,16 +2503,17 @@ impl<'a> Interp<'a> {
                     name,
                     fallback,
                 } => {
-                    let target =
-                        crate::interp::util::lkey_get(&self.classes, name).and_then(|cls| {
-                            let ctor = self.find_method_in(cls, "__construct");
+                    let target = crate::interp::util::lkey_get(&self.classes, name)
+                        .cloned()
+                        .and_then(|cls| {
+                            let ctor = self.find_method_in(&cls, "__construct");
                             if ctor
                                 .as_ref()
                                 .is_some_and(|(m, _)| m.decl.params.iter().any(|p| p.by_ref))
                             {
                                 return None;
                             }
-                            Some((cls.clone(), ctor))
+                            Some((cls, ctor))
                         });
                     match target {
                         Some(target) => ntargets.push(target),
