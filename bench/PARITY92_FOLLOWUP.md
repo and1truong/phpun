@@ -2903,3 +2903,43 @@ External CI not asserted green. No suite parity claim or multiplication of step 
 Raw/source/hashes in bench/data/92/parity/oct11/bool-native-*.
 
 Native finalsource32319e5/hash0a1d298 whole7: main4e6geo3.8643→candidate2.7772×PHP,candidate/parent0.8903 (−11.0%). Default/long strings31regressions+4.0/+7.9% retained;no identified CPU cause. Physicalstrings100+1request/unchangedbytes,objects+1request/unchangedbytes,arrays+1request/+24bytes,sieve10+34requests/+7520bytes. BothOp128bytes disprovesopcode-size growth;test-only diagnostics removed before report,releasebinary untouched. GC77345 serialized parent9258ms/candidate9698ms bothPASS;fulltwochanges retained,after-isolationmap onlyknownrange crash→timeout. Broadercompatibility not complete. All whole/negative/provenance files are published.
+
+## #342: perf(memory): use erased standard Weak owners instead of boxed liveness closures (2026-10-11)
+
+The shared MemCharge ledger retains std Weak<dynAny> directly instead of boxing a closure that only checksstrong_count()>0. Four constructors and all readers use the same shared helper/type. Sized trackedowners retain exact weak controlblock identity,no extra strong handle/rawpointer/unsafe/layout assumptions. PCRE onlyunsizedowner was anemptydummy scratch token,now Rcunit with identical explicitbyte/grow/retire accounting;credit/retire APIs retainunsized support.
+
+ONE existing frame/owner check proves live/alias/deadcounts,typeerasure,realloc/credit/sweep/retirement and no new strong owner. All recycledaddress/chunk/huge/VMspan/limit paths preserve their existing logic. No dependency/new allocator/new bookkeeping abstraction.
+
+Runtime 3911b6c6160fd6f195461fb25ee606a6c43be54f; timing source 3911b6c6160fd6f195461fb25ee606a6c43be54f; report/integration source 3911b6c6160fd6f195461fb25ee606a6c43be54f.
+
+31alternating profiler-off nativePHP8.5.11-n byte-gated pairs;separate freshwhole7 rotatingPHP/main/parent/candidate raw retained.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 56.886 | 58.839 | 1.0343 |
+| bench/20-strings.php 100 | 237.206 | 240.898 | 1.0156 |
+| bench/40-objects.php | 98.018 | 93.176 | 0.9506 |
+| bench/40-objects.php 20 5000 | 392.748 | 376.138 | 0.9577 |
+| bench/60-json.php | 519.821 | 405.193 | 0.7795 |
+| bench/11-sieve.php | 10.015 | 10.379 | 1.0364 |
+
+31pairs strings56.886→58.839ms(+3.4%),long237.206→240.898(+1.6%),objects98.018→93.176(−4.9%),long392.748→376.138(−4.2%),JSON519.821→405.193(−22.1%),sieve10.015→10.379(+3.6%). Whole7 main3.8165→candidate2.7538×PHP,parent−3.4%;negativewhole strings+4.5%,sieve+8.1%,regex+4.3%,app+7.3%,Composer+11.4% retained. Longstrings−.7%whole disagrees with31+1.6%;do not averagecohorts. Objects11.3066×PHP/long19.8779×PHP,strings3.9352×PHP/long4.5551×PHP,JSON2.6231×PHP. Physicalstrings100−804605requests/−6436844bytes,objects−50013requests,arrays−20013,JSON−15156. Allocation savings do not imply string timing gains;no CPU attribution/parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings100: requests 2902886→2098281; bytes 120172689→113735845.
+- objects5: requests 983133→933120; bytes 55269712→54869604.
+- arrays: requests 636053→616040; bytes 26701030→26540922.
+- json: requests 4360116→4344960; bytes 296858212→296736960.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing frame/owner check extended;25+19/probes/VM-profile PASS.
+All3406individualPHPT onlyGC77345pass→timeout;599knownfails unchanged. Serializedsame10s parent8951ms/candidate9348ms bothPASS;fullraw retained,after-isolationmap identical. Candidate2731pass599fail25skip38unsupported5crash8timeout;not fullcompatibility.
+Candidate summary retained: {'total': 3406, 'passed': 2731, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 8, 'applicable': 3343, 'compatibility_pct': 81.69};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/weak-owner-*.
+
+Weak-owner source3911b6c/frozen1042bda whole7: main4e6geo3.8165→candidate2.7538×PHP,candidate/parent0.9663(−3.4%). Full raw GCpass→timeout isretained;serializedsame10s parent8951ms/candidate9348ms bothPASS,after-isolationmap identical. String/array/object/JSON request savings above are physicalallocator observations,not speed or CPU attribution. Whole/31negative and mismatched cohorts remain separate.
