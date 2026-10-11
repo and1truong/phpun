@@ -4630,7 +4630,7 @@ unset($a); var_dump($weak->get());
             panic!("values")
         };
         assert!(matches!(
-            *values.borrow().entries.get(0).unwrap().1.borrow(),
+            *values.borrow().entries.first().unwrap().1.borrow(),
             super::Value::Float(3.0)
         ));
         let mut leaf = Interp::new("float-leaf.php");
