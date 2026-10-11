@@ -66,8 +66,21 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<(), PhpError> {
         let p = dc.and_then(|c| c.decl.props.iter().find(|p| p.name == pname));
-        match (dc, p) {
+        // Fast path needs the EFFECTIVE prop to be the same unhooked,
+        // non-readonly decl — a child redeclaring it with a hook (or
+        // different visibility/readonly) goes through store_prop.
+        let direct = match (dc, p) {
             (Some(dc), Some(p)) if p.hooks.is_none() && !p.readonly => {
+                self.hooked_prop(obj, pname).is_none()
+                    && matches!(self.decl_prop(obj, pname), Some((ep, ref ec))
+                        if ep.visibility == p.visibility && !ep.readonly
+                            && (ep.visibility != crate::ast::Visibility::Private
+                                || ec.name() == dc.name()))
+            }
+            _ => false,
+        };
+        match (dc, p) {
+            (Some(dc), Some(p)) if direct => {
                 let key = if p.visibility == crate::ast::Visibility::Private {
                     format!("\0{}\0{}", dc.name(), pname)
                 } else {

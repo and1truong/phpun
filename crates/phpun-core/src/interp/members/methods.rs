@@ -2318,6 +2318,13 @@ impl<'a> Interp<'a> {
                 || self.is_throwable_cls(&ob.class)
         };
         let cls = obj.borrow().class.clone();
+        // One chain walk feeds the stub-ZPP binder, every stub arm and
+        // the final dispatch below (callers that already resolved pass
+        // `pre`). Hoisted above the named-args binder — stub methods
+        // reached via method_invoke (pre=None) need the resolution too.
+        if resolved.is_none() {
+            resolved = self.find_method_in(&cls, name);
+        }
         // Internal-class ctor ZPP: Reflection*/Throwable/DateTime
         // ctors are engine stubs whose decl.params carry the arginfo,
         // so named args bind by param name and over/under arity throws
@@ -2364,11 +2371,6 @@ impl<'a> Interp<'a> {
                     None => Value::Null,
                 });
             }
-        }
-        // One chain walk feeds every stub arm and the final
-        // dispatch below (callers that already resolved pass `pre`).
-        if resolved.is_none() {
-            resolved = self.find_method_in(&cls, name);
         }
         if is_throwable {
             // Native method only when the resolved method is a builtin
