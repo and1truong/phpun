@@ -179,6 +179,7 @@ enum Op {
         array: u16,
         key_slot: Option<u16>,
         key_int: i64,
+        write: Option<Value>,
         fallback: Box<Expr>,
     },
     ThisProp {
@@ -980,6 +981,41 @@ impl Compiler {
             Expr::Assign {
                 target, op, value, ..
             } => {
+                if *op == "=" {
+                    if let (
+                        Expr::Index {
+                            e: base,
+                            i: Some(key),
+                        },
+                        Some(value),
+                    ) = (Interp::unmark_rhs(target), const_val(value))
+                    {
+                        if matches!(value, Value::Null | Value::Bool(_) | Value::Int(_)) {
+                            if let Expr::Var(name) = Interp::unmark_rhs(base) {
+                                if !Interp::is_superglobal(name) {
+                                    let key = match Interp::unmark_rhs(key) {
+                                        Expr::Var(n) if !Interp::is_superglobal(n) => {
+                                            Some((Some(self.slot(n)), 0))
+                                        }
+                                        Expr::Int(i) => Some((None, *i)),
+                                        _ => None,
+                                    };
+                                    if let Some((key_slot, key_int)) = key {
+                                        let array = self.slot(name);
+                                        self.emit(Op::DimCv {
+                                            array,
+                                            key_slot,
+                                            key_int,
+                                            write: Some(value),
+                                            fallback: Box::new(e.clone()),
+                                        });
+                                        return Some(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let Expr::Var(n) = &**target else {
                     self.emit(Op::Canonical(Box::new(e.clone())));
                     return Some(());
@@ -1250,6 +1286,7 @@ impl Compiler {
                                 array,
                                 key_slot,
                                 key_int,
+                                write: None,
                                 fallback: Box::new(e.clone()),
                             });
                             return Some(());
@@ -2045,12 +2082,22 @@ impl<'a> Interp<'a> {
                     array,
                     key_slot,
                     key_int,
+                    write,
                     fallback,
                 } => {
                     // ponytail: fresh current-table lookup, no offset cache. Global
                     // views, non-scalars and missing/uninitialized keys stay AST;
                     // generation-guarded offsets need a measured storage change.
-                    let plain = if comp.top_level && self.globals_arr.is_some() {
+                    let protected = |c: &Cell| {
+                        let ptr = Rc::as_ptr(c) as usize;
+                        self.typed_slots.contains_key(&ptr) || self.slot_owners.contains_key(&ptr)
+                    };
+                    let plain = if (comp.top_level || write.is_some()) && self.globals_arr.is_some()
+                        || write.is_some()
+                            && (self.in_handler
+                                || self.dim_throw.is_some()
+                                || matches!(&slots[*array as usize], Slot::C(c) if protected(c)))
+                    {
                         None
                     } else {
                         let peek = |index: u16| match &slots[index as usize] {
@@ -2067,16 +2114,43 @@ impl<'a> Interp<'a> {
                         };
                         match (peek(*array), key) {
                             (Some(Value::Array(a)), Some(k)) => {
-                                a.borrow().get(&ArrKey::Int(k)).filter(|v| {
-                                    matches!(
-                                        v,
-                                        Value::Null
-                                            | Value::Bool(_)
-                                            | Value::Int(_)
-                                            | Value::Float(_)
-                                            | Value::Str(_)
-                                    )
-                                })
+                                if let Some(value) = write {
+                                    // Only the CV and this peek own the table. Shared tables
+                                    // keep canonical CoW; existing buckets do not change
+                                    // array layout, iterator positions or memory charges.
+                                    let c = if Rc::strong_count(&a) == 2 {
+                                        a.borrow().get_cell(&ArrKey::Int(k))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(c) = c.filter(|c| {
+                                        !protected(c)
+                                            && matches!(
+                                                &*c.borrow(),
+                                                Value::Null
+                                                    | Value::Bool(_)
+                                                    | Value::Int(_)
+                                                    | Value::Float(_)
+                                                    | Value::Str(_)
+                                            )
+                                    }) {
+                                        self.cell_store(&c, value.clone())?;
+                                        Some(value.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    a.borrow().get(&ArrKey::Int(k)).filter(|v| {
+                                        matches!(
+                                            v,
+                                            Value::Null
+                                                | Value::Bool(_)
+                                                | Value::Int(_)
+                                                | Value::Float(_)
+                                                | Value::Str(_)
+                                        )
+                                    })
+                                }
                             }
                             _ => None,
                         }
@@ -3316,6 +3390,23 @@ function missing_key($a) { return $a[$unknown]; }
 var_dump(missing_key([0=>2]));
 restore_error_handler();
 echo read_at(k: 0, a: [11]), "\n";
+function clear_at(&$a, $k) { return $a[$k] = false; }
+$a=[true,true]; var_dump(clear_at($a,0)); $copy=$a; clear_at($a,1);
+echo json_encode($a), ' ', json_encode($copy), "\n";
+$r =& $a[1]; $r=true; clear_at($a,1); var_dump($r);
+clear_at($a,7); clear_at($a,'key'); echo json_encode($a), "\n";
+class WriteTyped { public int $v=1; public readonly array $a; function __construct() { $this->a=[true]; } }
+$o=new WriteTyped; $a=[0]; $a[0] =& $o->v;
+var_dump(clear_at($a,0)); var_dump($o->v);
+$a=$o->a; clear_at($a,0); echo json_encode($a), ' ', json_encode($o->a), "\n";
+try { $o->a[0]=false; } catch (Error $e) { echo $e->getMessage(), "\n"; }
+class WriteAccess implements ArrayAccess {
+ function offsetExists(mixed $k):bool { return true; }
+ function offsetGet(mixed $k):mixed { return true; }
+ function offsetSet(mixed $k,mixed $v):void { echo "set:$k:", json_encode($v), "\n"; }
+ function offsetUnset(mixed $k):void {}
+}
+$a=new WriteAccess; clear_at($a,3);
 $g=[1]; for ($i=0; $i<2; $i++) { echo $g[0], "\n"; $GLOBALS['g']=[5]; }
 echo $GLOBALS['g'][0], "\n";
 "#);
@@ -3344,6 +3435,15 @@ warning:Using null as an array offset is deprecated, use an empty string instead
 warning:Undefined array key ""
 NULL
 11
+bool(false)
+[false,false] [false,true]
+bool(false)
+{"0":false,"1":false,"7":false,"key":false}
+int(0)
+int(0)
+[false] [true]
+Cannot modify readonly property WriteTyped::$a
+set:3:false
 1
 5
 5
@@ -3351,7 +3451,7 @@ NULL
         );
         assert_eq!(it.err_buf, "");
         assert_eq!(result.exit_code, 0);
-        for name in ["read_at", "read_zero"] {
+        for name in ["read_at", "read_zero", "clear_at"] {
             let decl = it.functions[name].clone();
             let compiled = it.vm_compiled(&decl).unwrap();
             assert!(compiled.needs_bind && !compiled.value_abi);
@@ -3359,6 +3459,15 @@ NULL
                 .ops
                 .iter()
                 .any(|op| matches!(op, super::Op::DimCv { .. })));
+            if name == "clear_at" {
+                assert!(compiled.ops.iter().any(|op| matches!(
+                    op,
+                    super::Op::DimCv {
+                        write: Some(super::Value::Bool(false)),
+                        ..
+                    }
+                )));
+            }
         }
     }
 
