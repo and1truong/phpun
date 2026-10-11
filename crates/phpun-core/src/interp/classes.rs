@@ -3930,9 +3930,10 @@ impl<'a> Interp<'a> {
         // are class-fixed, computed once in flat_props_of.
         let flat = self.flat_props_of(&cls);
         let mut slots: Vec<Option<Cell>> = vec![None; flat.len()];
-        let prop_order = cls.prop_order_template.get_or_init(|| {
-            Rc::new(flat.iter().map(|fp| fp.key.clone()).collect())
-        }).clone();
+        let prop_order = cls
+            .prop_order_template
+            .get_or_init(|| Rc::new(flat.iter().map(|fp| fp.key.clone()).collect()))
+            .clone();
         for (fi, fp) in flat.iter().enumerate() {
             if fp.uninit {
                 continue;
