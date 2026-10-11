@@ -877,6 +877,11 @@ foreach (['"' . chr(92), '"ascii' . chr(92), '{"key":"value' . chr(92)] as $brok
     echo json_last_error(), "\n";
     var_dump(json_validate($broken));
 }
+class StreamLiveRef implements JsonSerializable {
+    function jsonSerialize(): mixed { global $next; $next = 7; return 0; }
+}
+$next = 1; $refs = [new StreamLiveRef, &$next];
+echo json_encode($refs), "\n";
 "#,
         &[],
     );
@@ -901,6 +906,7 @@ bool(false)
 NULL
 4
 bool(false)
+[0,7]
 "#
     );
     assert_eq!(err, "");

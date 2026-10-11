@@ -482,33 +482,36 @@ fn json_arr(
     // body can unset an element of this very array (bug77843) — holding
     // the borrow across the loop would double-borrow panic. Tombstones
     // are dead buckets, not elements (009 keeps a list after unset).
-    let (live, is_list) = {
+    let (packed, live, is_list) = {
         let a = a.borrow();
-        // Packed storage has no cells to materialize — snapshot the
-        // scalar values straight out of the packed Vec.
-        let live: Vec<(ArrKey, Value)> = match a.entries.packed_clone() {
-            Some(vals) => vals
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| (ArrKey::Int(i as i64), v))
-                .collect(),
-            None => a
-                .entries
+        // Packed values need no cells. Existing cells remain live snapshots:
+        // an earlier callback may update a later referenced element.
+        let packed = a.entries.packed_clone();
+        let live: Vec<(ArrKey, Cell)> = if packed.is_none() {
+            a.entries
                 .iter()
                 .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
-                .map(|(k, c)| (k.clone(), c.borrow().clone()))
-                .collect(),
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
         };
         let is_list = cx.esc.flags & F_FORCE_OBJECT == 0
-            && live
-                .iter()
-                .enumerate()
-                .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64));
-        (live, is_list)
+            && (packed.is_some()
+                || live.iter().enumerate().all(
+                    |(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64),
+                ));
+        (packed, live, is_list)
     };
     out.push(if is_list { '[' } else { '{' });
     let mut first = true;
-    for (k, v) in live {
+    let len = packed.as_ref().map_or(live.len(), Vec::len);
+    for i in 0..len {
+        let packed_key = ArrKey::Int(i as i64);
+        let (k, v) = match &packed {
+            Some(values) => (&packed_key, values[i].clone()),
+            None => (&live[i].0, live[i].1.borrow().clone()),
+        };
         if !first {
             out.push(',');
         }
@@ -518,7 +521,7 @@ fn json_arr(
             indent(out, lvl);
         }
         if !is_list {
-            json_key(&k, cx.esc, out)?;
+            json_key(k, cx.esc, out)?;
             out.push(':');
             if cx.esc.pretty() {
                 out.push(' ');
