@@ -1589,3 +1589,42 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/promotion-metadata-*.
+
+## #276: perf(builtins): route known names to the shared extension dispatcher (2026-10-11)
+
+For a bounded known list of string/math/JSON/regex names, select the existing original extension dispatcher directly. All other names retain the FAMILIES scan. Same kernel implementation and shared deferred cast-error handling, no duplicate algorithms.
+
+Canonical builtin binder/frame/ZPP/by-ref/diagnostics remain; namespaced/user resolution happens before this builtin root. No argument ABI or memory/GC changes. Existing shared string and private collision runnable checks reused.
+
+Runtime 33876df32ef544eb799b126d0e567793e0a1de3e; measured source 651422f61514b552a6198428d5ff51a03f988464.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 68.206 | 65.511 | 0.9605 |
+| bench/20-strings.php 100 | 317.212 | 304.176 | 0.9589 |
+| bench/40-objects.php | 189.252 | 189.041 | 0.9989 |
+| bench/60-json.php | 515.382 | 519.004 | 1.0070 |
+| bench/50-regex.php | 46.252 | 41.071 | 0.8880 |
+| bench/30-arrays.php | 80.475 | 78.783 | 0.9790 |
+| bench/11-sieve.php | 75.284 | 75.780 | 1.0066 |
+| bench/10-fib.php | 8.053 | 8.090 | 1.0046 |
+| bench/app/cli.php 100 20 | 33.475 | 33.513 | 1.0011 |
+| examples/composer/run.php | 8.580 | 8.070 | 0.9406 |
+
+Seven profiler-off pairs strings−4.0%,long−4.1%,regex−11.2%,objects flat. JSON+0.7%,sieve+0.7%,fib+0.5%,app+0.1% retained. Regex7pairs is a bounded median, not stable broad parity. Physicalrequests/bytes unchanged aside from2 startup requests/18B variation.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings: requests 617503→617501; bytes 29057534→29057516.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing runnable checks reused; no redundant test fixtures.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/builtin-family-dispatch-*.
