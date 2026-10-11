@@ -1,0 +1,26 @@
+{
+  "binary_sha256": "8361bdb46bf6701ea7fb9e114a749f410a6902813ad20d3d877ac083e2adbae3",
+  "source": "32e8353c2c22905cff3dad49ecce4211ae0c20c4",
+  "parent": "memory-limit-review",
+  "summary": {
+    "total": 3406,
+    "passed": 2729,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.63
+  },
+  "changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ]
+}
