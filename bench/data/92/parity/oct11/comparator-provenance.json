@@ -1,0 +1,36 @@
+{
+  "runtime": "7ac90ad + formatting/argument-slot guards 7d8c979",
+  "build_source": "110bde5 (later parent report merge only)",
+  "sha256": {
+    "ctor-fixed": "78e4b18ef8f4d0c16393fb3a0bed0421ea9764478c2f7e1c35d451c73509eac0",
+    "native-comparator": "a6dab1f57b8a66242aa2cc54c388124a841c56924253ea38813692c77e8d8261"
+  },
+  "gates": "workspace8core/22runtime/19format,fmt/clippy;existing actual-native callback+overflow/type-error/owner unit;25script+19workload+warm-MIN/MAX/equal/overflow/capture/bool byte gate;VM-profile;3406PHPT",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes": {
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": [
+      "timeout",
+      "crash"
+    ],
+    "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": [
+      "crash",
+      "timeout"
+    ]
+  },
+  "timing": "7 alternating isolated profiler-off pairs; nativePHP8.5.11 -n; all stdout/stderr/exit equal",
+  "dirty": "Only untracked vendor symlink; tracked runtime source clean",
+  "build": "Rust1.99 release LTO/codegen-units1; forced core clean before worktree switch"
+}

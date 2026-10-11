@@ -993,3 +993,42 @@ Workspace/fmt/clippy and fresh25script+19workload byte/exit/error gates,
 VM-profile pass. Full3406PHPT2727pass603fail25skip38unsupported6crash7timeout;
 individual status changes vs fixed native parent: {"/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": ["crash", "timeout"], "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": ["timeout", "crash"]}.
 Existing failures/resource limits retained. External CI not yet green.
+
+## #244: native pure integer sort callbacks (2026-10-11)
+
+Reuse the complete context-free callback value/type/owner proof, and run
+validated pure integer graphs before creating the callback frame. Extend the
+existing integer emitter with signed `<=>` (MIN/MAX-safe). This still rejects
+captures, bound class/receiver context, bool returns, references, defaults,
+effects, introspection, deadlines and profiler runs. Root callback arena span
+reserves only existing-page capacity; native failure restores it and replays
+the original callback VM. Same scalar return side channels; no callable-owner
+pins or new dependency. P1 initialized-byte copy fix is inherited.
+
+Seven alternating profiler-off fixed-constructor-parent/candidate PHP byte gates:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/30-arrays.php | 173.901/89.369 | 0.514 |
+| bench/30-arrays.php 10 5000 | 88.093/48.486 | 0.550 |
+| bench/profile/arrays.php usort 5000 | 32.082/15.425 | 0.481 |
+| bench/10-fib.php | 8.427/8.316 | 0.987 |
+| bench/11-sieve.php | 212.243/201.741 | 0.951 |
+| bench/40-objects.php | 224.158/223.222 | 0.996 |
+| bench/app/cli.php 100 20 | 32.372/32.406 | 1.001 |
+| examples/composer/run.php | 7.648/7.652 | 1.000 |
+
+Arrays−48.6%, long−45.0%, usort phase−51.9%; app and Composer flat.
+Other row movements are not attributed as wins from this callback-only change.
+Separate PHP-byte-gated instrumented default arrays: physical requests
+1,106,113→795,841 (−28.1%), requested bytes43,268,089→30,857,804 (−28.7%).
+trace_frame350351→40063 are EVENT counts, not physical allocations; executable
+mappings are outside malloc counters. Full suite remains far from PHP parity.
+
+Workspace8core/22runtime/19format,fmt/clippy pass. Existing callback runnable
+check proves actual native entry, guard replay for typed overflow, no trace/
+arena leak and callable Weak owner release.25VM/script+19workload byte/exit/
+stderr gates, warm comparator MIN/MAX/equal/overflow/capture/bool PHP gate and
+VM-profile pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout; only
+two known pathological range crash/timeout swaps vs parent, no new fail/pass.
+External CI is not yet green. Raw/hash/source manifests preserve all samples.
