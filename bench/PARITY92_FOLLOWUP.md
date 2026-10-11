@@ -1157,3 +1157,43 @@ loop/warm-comparator/dimension nativePHP8.5.11 -n byte/exit/stderr gates,
 VM-profile pass.3406PHPT2727pass603fail25skip38unsupported6crash7timeout;
 individual changes vs parent: {"/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt": ["timeout", "crash"], "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71197.phpt": ["crash", "timeout"]}. External CI not asserted green.
 Next #253 replaces scalar first-byte scanning in shared bfind with libc memchr.
+
+## #253: shared byte search through libc memchr (2026-10-11)
+
+Replace scalar first-byte scanning in shared bfind with existing libc memchr,
+then verify the complete needle at the candidate offset. C only reads the
+bounded nonempty live slice; returned pointers belong to that slice. Preserve
+NUL/non-UTF8 bytes, nonoverlap, offsets, conversion/order/error behavior and
+the existing O(n*m) worst-case ceiling. No dependency or algorithm recognizer.
+Runtime1f48ee6,8add/1delete; one existing string check extended for boundary bytes.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/20-strings.php | 180.480/155.416 | 0.861 |
+| bench/20-strings.php 100 | 826.149/714.644 | 0.865 |
+| bench/30-arrays.php | 90.280/91.129 | 1.009 |
+| bench/11-sieve.php | 78.567/79.386 | 1.010 |
+| bench/40-objects.php | 226.341/223.486 | 0.987 |
+| bench/10-fib.php | 8.501/8.322 | 0.979 |
+| bench/app/cli.php 100 20 | 34.512/35.062 | 1.016 |
+| examples/composer/run.php | 8.259/8.069 | 0.977 |
+
+Strings default -13.9%, longer -13.5%; initial app+1.6% negative retained.
+No nontarget attribution or whole-suite PHP parity claim. Physical string
+allocation requests unchanged2,225,342; bytes67,747,514/67,747,510, counters
+unchanged. Separate CPU profiles3149/2704 samples, zero lost; str_replace
+closure self13.24%/0.59% includes more than search. New libc callee unresolved
+in report: do not equate closure share with total replacement CPU cost.
+vm_exec_ops10.21% includes semantic work, not pure dispatch. Raw perf.data
+kept locally; exact symbol reports and raw hashes published. Both sampled
+executions stdout byte-identical to PHP.
+
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload and extended
+string/loop/comparator/dimension gates,VM-profile pass. All3406 PHPT statuses
+identical to parent:2727pass603fail25skip38unsupported6crash7timeout. Existing
+shared-string unit passes AddressSanitizer (leak check disabled); not whole
+interpreter sanitizer coverage. External CI not asserted green. Next #255
+removes temporary display-binding buffers for positional builtin calls;
+#256 keeps strict builtin signature metadata borrowed during type checks.

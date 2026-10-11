@@ -1,0 +1,2 @@
+[ perf record: Woken up 102 times to write data ]
+[ perf record: Captured and wrote 25.357 MB /workspace/parity92/oct11/native-loops-strings.data (3149 samples) ]

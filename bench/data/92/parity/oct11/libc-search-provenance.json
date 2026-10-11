@@ -1,0 +1,16 @@
+{
+  "runtime": "1f48ee6a8c67195d289ca736b2868273b7605d4a",
+  "check": "d89bd002525c7fc27e8e221fcee3d8b4c2e90dd0",
+  "source_ancestors": "13a90c59f836c92d73ed7bbc7bd1543bb43770f1",
+  "dirty_note": "only untracked vendor symlink; tracked runtime clean when frozen",
+  "php": "native 8.5.11 -n; OPcache loaded, enable_cli=0; JIT disabled",
+  "profiler": "cpu-clock 199Hz DWARF8192; no lost samples; separate from speed timings",
+  "profile_raw": "DWARF perf.data kept locally in /workspace/parity92/oct11; symbol reports published",
+  "profiles": {
+    "native-loops-strings.data": "0ddb3278d9f5747149705fce50bfb5a50b0dc4eb17e1dd6b67d0f06b5bec96b0",
+    "libc-search-strings.data": "f08a362318b92d70531904eb98cc90f8cbefd8f419f714f2b266ac26e2348376"
+  },
+  "asan": "RUSTC_BOOTSTRAP=1 RUSTFLAGS=-Zsanitizer=address -Cforce-frame-pointers=yes, ASAN_OPTIONS=detect_leaks=0; existing shared-string unit only",
+  "physical_allocation_note": "requests identical 2225342; bytes differ by 4; event counters unchanged; allocator run not speed measurement",
+  "phpt_changes": []
+}
