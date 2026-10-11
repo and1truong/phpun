@@ -1,0 +1,28 @@
+{
+  "runtime": "fd92682",
+  "source": "8416bbddabe1ff20466dd9ac0e837daf2039d039",
+  "tracked_clean": "only vendor symlink",
+  "phpt_changes": [],
+  "physical_requests": {
+    "strings": [
+      1578563,
+      1337503
+    ],
+    "objects20x5000": [
+      10963260,
+      10863260
+    ]
+  },
+  "physical_bytes": {
+    "strings": [
+      50991188,
+      46018264
+    ],
+    "objects20x5000": [
+      302691306,
+      302152078
+    ]
+  },
+  "proof": "same Cells borrowed only all fixed params present and allowed positional tail; original named/default/missing/excess paths return owned Cow; direct Rc trace-name copy avoids temporary String",
+  "check": "one existing callback unit extended asserts borrowed/owned selection, pointer identity, variadic acceptance and missing/excess errors"
+}

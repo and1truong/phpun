@@ -1284,3 +1284,124 @@ crash/timeout swaps,no newfail/pass/skip. ExternalCI not assertedgreen.
 Next #258 reuses existing primitive callback valueABI for one-value arraymap/
 filter; #260 borrows complete positional builtin binding Cells and avoids
 temporary trace-name Strings. FullLazyTrace #237 and packedstorage #187 open.
+
+## #258: reuse primitive value callbacks for one array element (2026-10-11)
+
+Generalize the existing fresh-value callback helper to fixed-size argument
+arrays, using the same exact context-free primitive closure proof and shared
+value ABI. Single-array map/value-filter join sort pairs; no original/reference
+array Cell is treated as fresh. Captures/receiver/scope/default/coercion/by-ref/
+nonprimitive cases keep original canonical Cell fallback. Native integer
+callback supports bounded argument slices/current-page spans; Boolfilter still
+VM here. Runtimecbcbe7c,69add/21delete including ONE existing runnable check
+extension proving actual one-value native entry/typed overflow/owner release.
+
+Seven alternating isolated profiler-off PHP byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/30-arrays.php | 92.276/89.827 | 0.973 |
+| bench/30-arrays.php 10 | 47.739/44.447 | 0.931 |
+| bench/profile/arrays.php map 5000 | 13.412/11.666 | 0.870 |
+| bench/profile/arrays.php filter 5000 | 13.304/12.489 | 0.939 |
+| bench/40-objects.php | 238.606/225.487 | 0.945 |
+| bench/20-strings.php | 127.409/125.766 | 0.987 |
+| bench/11-sieve.php | 76.609/81.515 | 1.064 |
+| bench/10-fib.php | 8.504/8.107 | 0.953 |
+| bench/app/cli.php 100 20 | 35.131/35.768 | 1.018 |
+| examples/composer/run.php | 8.465/8.082 | 0.955 |
+
+31pairs for target noise and negative workloads:
+
+- bench/30-arrays.php: 93.022/87.711ms (0.943).
+- bench/11-sieve.php: 78.283/81.190ms (1.037).
+- bench/app/cli.php 100 20: 33.989/34.517ms (1.016).
+
+Defaultarraysinitial−2.7%/follow-up−5.7%;map5000−13.0%,filter5000−6.1%,
+CLI includes input preparation. Physicalarrayrequests795,809→655,890
+(−139,919/~17.6%),bytes30,856,089→27,496,036 (−10.9%); maprequests−19,923,
+filterrequests−15,001. Retain sieve+6.4%initial/+3.7%followup,app+1.8%/
++1.6% negative; no causal nontarget attribution or suite parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+extended
+callback/comparator/dimension/string/loop nativePHP8.5.11 -n byte gates and
+VM-profile pass. All3406individualPHPTstatuses identical to parent2727pass
+603fail25skip38unsupported6crash7timeout. Explicit release clean/rebuild.
+ExternalCI not assertedgreen. Next #260 borrows fully positional builtin
+binding; #262 bypasses engine-family interception for proven ordinary PHP
+methods; #263 emits checked remainder and proven bool native roots.
+
+## #260: borrow complete positional builtin binding Cells (2026-10-11)
+
+Existing resolver returns Cow<Cell slice>. Borrow only when all fixed params
+are supplied positionally, plus an allowed variadic tail. No missing/default/
+hole/name/excess-error remap is needed; preserve Cell identity/coercion/by-ref.
+Other packs keep the original owned binder/errors. Builtin trace function name
+uses Rc::from(&str), avoiding a temporary String. No new cache/dependency.
+Runtimefd92682,58add/5delete including ONE existing runnable check for borrowed/
+owned selection, pointer identity, variadic acceptance and missing/excess errors.
+
+Seven alternating isolated profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/20-strings.php | 127.854/119.961 | 0.938 |
+| bench/20-strings.php 100 | 626.463/572.071 | 0.913 |
+| bench/40-objects.php | 238.148/235.921 | 0.991 |
+| bench/30-arrays.php | 88.235/85.992 | 0.975 |
+| bench/11-sieve.php | 79.697/75.469 | 0.947 |
+| bench/10-fib.php | 8.118/8.281 | 1.020 |
+| bench/app/cli.php 100 20 | 35.973/35.983 | 1.000 |
+| examples/composer/run.php | 8.261/8.089 | 0.979 |
+
+Stringsdefault−6.2%,long−8.7%. Physicalrequests1,578,563→1,337,503
+(−241,060/~15.3%),bytes50,991,188→46,018,264 (−9.8%);objects100krequests
+10,963,260→10,863,260 (−100,000/~0.9%),bytes−0.2%. Preserve fib+2.0%
+negative, no nontarget speed attribution or new suite parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+VM-profile pass;
+all3406individualPHPTstatuses identical to one-value callback parent2727pass
+603fail25skip38unsupported6crash7timeout. Explicit release clean/rebuild.
+ExternalCI not assertedgreen. Next #262 ordinary user-method dispatcher.
+
+## #262: skip engine-family interception for ordinary PHP methods (2026-10-11)
+
+After canonical visibility/private target resolution, a concrete PHP method
+on a declared ordinary root PHP class with no parent/interfaces cannot be a
+native-family method. Invoke the same shared user method/binder directly.
+Internal/inherited/interface/abstract/missing cases keep the old dispatcher.
+No shape cache, changed promotion/write/type/frame/trace/GC protocol.
+Runtime3a206b5,25add/1delete including ONE existing promoted check extended
+for ArrayIterator and Throwable ancestor/override fallback.
+Separate objectCPUprofile1965samples/zero lost: method_invoke_pre34.66%
+inclusive/invoke_method25.29%inclusive; these overlap, never add them.
+Raw perf.data kept locally with published hash/symbol report.
+
+Seven alternating isolated profiler-off nativePHP8.5.11 -n byte-gated pairs:
+
+| Workload | Parent/candidate ms | Candidate/parent |
+|---|---:|---:|
+| bench/40-objects.php | 216.377/204.803 | 0.947 |
+| bench/40-objects.php 20 5000 | 878.917/776.039 | 0.883 |
+| bench/profile/objects.php ctor 5000 | 46.372/41.161 | 0.888 |
+| bench/profile/objects.php norm 5000 | 64.179/52.910 | 0.824 |
+| bench/30-arrays.php | 85.430/87.929 | 1.029 |
+| bench/20-strings.php | 122.554/119.472 | 0.975 |
+| bench/11-sieve.php | 76.768/74.809 | 0.974 |
+| bench/10-fib.php | 8.066/8.038 | 0.997 |
+| bench/app/cli.php 100 20 | 34.175/34.130 | 0.999 |
+| examples/composer/run.php | 8.458/8.291 | 0.980 |
+
+31pairs for target noise and initial arrays+2.9% negative:
+
+- bench/40-objects.php: 224.207/197.116ms (0.879).
+- bench/30-arrays.php: 88.177/85.875ms (0.974).
+
+Objectsdefault31−12.1%,long7−11.7%,ctorphase−11.2%,normphase−17.6%.
+Physical100kobjectrequests10,863,260→8,763,260 (−2,100,000/~19.3%),
+bytes302,289,539→285,089,519 (−5.7%). Initial arrays+2.9% retained,
+31followup−2.6%; no nontarget attribution or object/suite PHP parity claim.
+Workspace8core/22runtime/19format,fm/clippy;25script+19workload+extended
+promoted/native ancestor PHP byte gates andVM-profile pass. All3406individual
+PHPTstatuses identical to parent2727pass603fail25skip38unsupported6crash
+7timeout. Explicit release clean/rebuild;externalCI not assertedgreen.
+Next #263 checked remainder/proven bool native roots; #264 no-target scalar
+GC cells; #266 Weak liveness; #267 shared scalar builtin kernels.

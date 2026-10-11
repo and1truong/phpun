@@ -1,0 +1,36 @@
+{
+  "runtime": "cbcbe7cc811d0d336a698228337c8df70aab871f",
+  "source": "56f1b12a411d409c39e4fbeba86d7c457b4e3ac4",
+  "tracked_clean": "only vendor symlink",
+  "phpt_changes": [],
+  "proof": "one existing callback check extended for native one-value actual entry/overflow replay/owner release; existing liveargs, captures/ref/default/coercion/bool warning gates reused",
+  "physical_requests": {
+    "arrays": [
+      795809,
+      655890
+    ],
+    "map5000": [
+      112399,
+      92476
+    ],
+    "filter5000": [
+      108112,
+      93111
+    ]
+  },
+  "physical_bytes": {
+    "arrays": [
+      30856089,
+      27496036
+    ],
+    "map5000": [
+      8457413,
+      7937250
+    ],
+    "filter5000": [
+      7827259,
+      7503406
+    ]
+  },
+  "scope": "native integer one-value map; bool filter shared VM; original array Cells never passed as fresh values"
+}
