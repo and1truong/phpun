@@ -2221,3 +2221,45 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/promoted-ctor-value-abi-*.
+
+## #315: perf(objects): borrow effective promoted property metadata (pre316 dataset) (2026-10-11)
+
+Pre316 dataset only: reuse existing decl_prop_site in shared promoted_prop_write instead of cloning PropDecl solely to read effective visibility/readonly/class. Applies AST and compiled constructors; no new cache/layout/helper/unsafe/dependency. Frozen b7281ad/3001e4c parent2e4dba8/13fac09 excludes newly merged JSON #316. Current main999 integration adds JSON and requires fresh measurement/gates below.
+
+Same pinned scope/private/inheritance resolution and effective hook/readonly/private owner/slot fallback guards. ONE existing promoted-store runtime unit adds child effective set hook, native checked.
+
+Runtime b7281ad7345305d31060b8dea6e2d787e44d9cc8; timing source b7281ad7345305d31060b8dea6e2d787e44d9cc8; report/integration source c3b77583def04ab6ed75a706b820691a67b29191.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 149.430 | 142.633 | 0.9545 |
+| bench/40-objects.php 20 5000 | 644.096 | 601.716 | 0.9342 |
+| bench/20-strings.php | 57.249 | 61.719 | 1.0781 |
+| bench/20-strings.php 100 | 257.849 | 266.267 | 1.0326 |
+| bench/11-sieve.php | 66.020 | 66.184 | 1.0025 |
+| bench/30-arrays.php | 82.160 | 79.829 | 0.9716 |
+| bench/60-json.php | 524.940 | 546.132 | 1.0404 |
+| bench/10-fib.php | 8.132 | 8.832 | 1.0861 |
+| bench/50-regex.php | 41.671 | 40.396 | 0.9694 |
+| bench/70-db.php | 110.915 | 111.101 | 1.0017 |
+| bench/app/cli.php 100 20 | 34.268 | 34.436 | 1.0049 |
+| examples/composer/run.php | 8.405 | 8.426 | 1.0025 |
+
+Pre316 seven objects149.430→142.633ms(−4.5%),long644.096→601.716(−6.6%);31objects158.930→152.275(−4.2%),long606.457→581.340(−4.1%). Physicalobjects1633154→1483154(−150000). Initialstrings+7.8%/long+3.3%,JSON+4.0%,fib+8.6% retained;31strings+2.1%/long+3.8%,JSON+.3%,fib−3.0% not attributed. This is historical pair, not current-main/parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1633154→1483154; bytes 68355761→66855749.
+- arrays: requests 636049→636049; bytes 26704253→26704241.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing promoted-store runtime unit effective child set hook/private collision;native extra complete probe pass.
+All3406individualPHPT compared; 2 known range crash/timeout swaps; no new fail/pass/skip.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/promoted-decl-borrow-*.

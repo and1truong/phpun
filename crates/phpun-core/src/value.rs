@@ -114,10 +114,6 @@ impl PackedEntries {
 
 impl ArrayEntries {
     fn packed(values: Vec<Value>) -> Self {
-        debug_assert!(values.iter().all(|v| matches!(
-            v,
-            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
-        )));
         Self(ArrayStorage::Packed(Box::new(PackedEntries {
             cells: std::cell::OnceCell::new(),
             scalar: RefCell::new(Some(values)),
@@ -148,7 +144,7 @@ impl ArrayEntries {
             ),
         }
     }
-    fn packed_clone(&self) -> Option<Vec<Value>> {
+    pub(crate) fn packed_clone(&self) -> Option<Vec<Value>> {
         match &self.0 {
             ArrayStorage::Cells(_) => None,
             ArrayStorage::Packed(p) => p.scalar.borrow().clone(),
@@ -307,6 +303,16 @@ impl PhpArray {
         array.entries = ArrayEntries::packed(vec![value; count]);
         array.next = count as i64;
         array
+    }
+
+    /// A fresh list from decoded values (int keys 0..n). Packed
+    /// storage keeps the plain `Value`s so decode pays no per-element
+    /// cell; any later cell-level access materializes on demand.
+    pub(crate) fn packed_list(vals: Vec<Value>) -> Self {
+        let mut a = Self::new();
+        a.entries = ArrayEntries::packed(vals);
+        a.next = a.entries.len() as i64;
+        a
     }
 
     pub fn new() -> Self {
