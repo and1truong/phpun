@@ -7779,7 +7779,7 @@ impl<'a> Interp<'a> {
                 "sqrt" | "substr" | "str_replace" | "str_ireplace" | "strtoupper" | "strtolower"
             )
             && !Self::callprof_on()
-            && !coverage_on()
+            && !vm::coverage_on()
             && self.cast_err.is_none()
             && self.callable_probe_err.is_none()
             && !crate::value::cmp_notices_pending()
