@@ -33,8 +33,16 @@ pub(in crate::interp) enum Slot {
     Arg(u16),
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 pub(in crate::interp) type CompileCacheEntry =
     (Rc<FunctionDecl>, Option<Rc<Compiled>>, &'static str);
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(in crate::interp) type CompileCacheEntry = (
+    Rc<FunctionDecl>,
+    Option<Rc<Compiled>>,
+    &'static str,
+    native::State,
+);
 
 /// One compiled function body — op vector + slot layout.
 /// Single-scalar pass-proof (`?T`/union-null handled) — see
@@ -1358,7 +1366,10 @@ impl<'a> Interp<'a> {
                         (None, reason)
                     }
                 };
-                e.insert((decl.clone(), compiled, reason))
+                let entry = (decl.clone(), compiled, reason);
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                let entry = (entry.0, entry.1, entry.2, native::State::Cold(0));
+                e.insert(entry)
             }
         };
         coverage_hit(entry.2);
@@ -3494,7 +3505,7 @@ echo nt_effect(2), "\n";
                     b"987\nfloat(9.223372036854776E+18)\n100\nTypeError\nuninit\nNULL\neffect\n3\n"
                 );
                 let decl = it.functions["nt_fib"].clone();
-                match &it.native_fns[&(Rc::as_ptr(&decl) as usize)] {
+                match &it.compiled_fns[&(Rc::as_ptr(&decl) as usize)].3 {
                     super::native::State::Ready(p) => assert!(p.executions.get() > 0),
                     _ => panic!("pure recursive graph did not execute native code"),
                 }
@@ -3516,7 +3527,7 @@ echo nt_effect(2), "\n";
                     let decl = it.functions[name].clone();
                     assert!(
                         matches!(
-                            &it.native_fns[&(Rc::as_ptr(&decl) as usize)],
+                            &it.compiled_fns[&(Rc::as_ptr(&decl) as usize)].3,
                             super::native::State::Disabled
                         ),
                         "guard did not replay {name}"

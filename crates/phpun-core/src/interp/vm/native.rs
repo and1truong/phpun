@@ -467,7 +467,7 @@ impl Program {
         for (at, index) in std::mem::take(&mut e.calls) {
             e.patch(at, *starts.get(index)?)?;
         }
-        if e.bytes.len() > 131072 || e.bytes.len() > it.native_code_budget {
+        if e.bytes.len() > 131072 {
             return None;
         }
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
@@ -475,7 +475,15 @@ impl Program {
             return None;
         }
         let len = e.bytes.len().checked_add(page - 1)? / page * page;
-        if len > it.native_code_budget {
+        let used: usize = it
+            .compiled_fns
+            .values()
+            .filter_map(|entry| match &entry.3 {
+                State::Ready(p) => Some(p.len),
+                _ => None,
+            })
+            .sum();
+        if len > (8 * 1024 * 1024usize).saturating_sub(used) {
             return None;
         }
         // SAFETY: anonymous private RW mapping, initialized completely before
@@ -500,9 +508,6 @@ impl Program {
                 return None;
             }
         }
-        // ponytail: cumulative interpreter budget, never refunded on a guard exit;
-        // bounded to8MiB even if a request cycles many failing declarations.
-        it.native_code_budget -= len;
         Some(Self {
             code,
             len,
@@ -527,11 +532,11 @@ pub(super) fn execute(
         return None;
     }
     let key = Rc::as_ptr(decl) as usize;
-    if it.native_fns.len() >= 4096 && !it.native_fns.contains_key(&key) {
+    if it.compiled_fns.len() > 4096 {
         return None;
     }
     let program = {
-        let state = it.native_fns.entry(key).or_insert(State::Cold(0));
+        let state = &mut it.compiled_fns.get_mut(&key)?.3;
         match state {
             State::Disabled => return None,
             State::Ready(p) => Some(p.clone()),
@@ -565,11 +570,11 @@ pub(super) fn execute(
         None => match Program::build(it, decl) {
             Some(p) => {
                 let p = Rc::new(p);
-                it.native_fns.insert(key, State::Ready(p.clone()));
+                it.compiled_fns.get_mut(&key)?.3 = State::Ready(p.clone());
                 p
             }
             None => {
-                it.native_fns.insert(key, State::Disabled);
+                it.compiled_fns.get_mut(&key)?.3 = State::Disabled;
                 return None;
             }
         },
@@ -579,7 +584,7 @@ pub(super) fn execute(
             .get(name.as_ref())
             .is_some_and(|current| Rc::ptr_eq(current, d))
     }) {
-        it.native_fns.insert(key, State::Disabled);
+        it.compiled_fns.get_mut(&key)?.3 = State::Disabled;
         return None;
     }
     let top = it.vm_stack.last_mut()?;
@@ -603,7 +608,7 @@ pub(super) fn execute(
         program.executions.set(program.executions.get() + 1);
         Some(Value::Int(out))
     } else {
-        it.native_fns.insert(key, State::Disabled);
+        it.compiled_fns.get_mut(&key)?.3 = State::Disabled;
         None
     }
 }

@@ -375,10 +375,6 @@ pub struct Interp<'a> {
     #[allow(clippy::vec_box)]
     stack: Vec<Box<Frame>>,
     pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    native_code_budget: usize,
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    native_fns: crate::value::FxMap<usize, vm::native::State>,
     /// VM bodies keyed by declaration Rc pointer; the stored Rc keeps the
     /// declaration alive, including native cache keys, so pointers cannot recycle.
     compiled_fns: crate::value::FxMap<usize, vm::CompileCacheEntry>,
@@ -1788,10 +1784,6 @@ impl<'a> Interp<'a> {
             cast_err: None,
             stack: Vec::new(),
             functions: crate::value::FxMap::default(),
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            native_code_budget: 8 * 1024 * 1024,
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            native_fns: crate::value::FxMap::default(),
             compiled_fns: crate::value::FxMap::default(),
             method_functions: crate::value::FxMap::default(),
             vm_val_pool: Vec::new(),
