@@ -1,0 +1,8 @@
+{
+  "PHP_byte_gate": false,
+  "parent_candidate_byte_gate": true,
+  "cause": "pre-existing canonical substr length:null converted to0 rather than omitted length",
+  "parent": "weak-liveness",
+  "candidate": "scalar-builtin-calls",
+  "next_fix": "branch71 shared nullable substr length parser"
+}

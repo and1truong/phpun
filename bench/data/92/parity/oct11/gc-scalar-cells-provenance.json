@@ -1,0 +1,47 @@
+{
+  "source": "1eb1af2a5f6fe0df006bce0ba676a9d1f1f15ac4",
+  "runtime": "dce4f08f3a5821c31aa7f632fd0805c47553950f",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes": [],
+  "physical_allocations": [
+    {
+      "label": "objects",
+      "before": {
+        "requests": 8763259,
+        "bytes": 285087536
+      },
+      "after": {
+        "requests": 8763025,
+        "bytes": 275058000
+      }
+    },
+    {
+      "label": "json",
+      "before": {
+        "requests": 4540348,
+        "bytes": 315892020
+      },
+      "after": {
+        "requests": 4540348,
+        "bytes": 315892012
+      }
+    }
+  ],
+  "binary_sha256": "ae0c1928479d73440f225527b3494862775a5e6f1e4a4f1664a3570c4585e39e",
+  "scope": "The shared GC cell scanner now proves gc_val_ptr==0 before inserting cell-slot/count/pin metadata. Scalar cells cannot point to a cycle graph node; arrays/objects/closures retain the same accounting. Depth-zero short circuit stays before RefCell borrow.",
+  "fallbacks": "Collection thresholds, candidates, roots, edges, external holders, typed pins, destructor order and every cycle-target cell remain canonical. Existing ONE frame-owner check extended proves no-target scalar exclusion and repeated array-cell accounting."
+}
