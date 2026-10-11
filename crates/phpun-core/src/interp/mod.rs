@@ -377,6 +377,8 @@ pub struct Interp<'a> {
     pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
     /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
     /// the stored Rc keeps the decl alive so the pointer can't recycle.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    native_code_budget: usize,
     compiled_fns: crate::value::FxMap<usize, vm::CompileCacheEntry>,
     /// One function declaration per method identity, shared by every dispatch path.
     /// Retain the method metadata so its address cannot recycle into another entry.
@@ -1784,6 +1786,8 @@ impl<'a> Interp<'a> {
             cast_err: None,
             stack: Vec::new(),
             functions: crate::value::FxMap::default(),
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            native_code_budget: 8 * 1024 * 1024,
             compiled_fns: crate::value::FxMap::default(),
             method_functions: crate::value::FxMap::default(),
             vm_val_pool: Vec::new(),
