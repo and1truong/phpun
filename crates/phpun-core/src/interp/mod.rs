@@ -4677,7 +4677,16 @@ impl<'a> Interp<'a> {
     /// Canonical calls reuse the same boxed shells as direct VM calls.
     fn frame_new(&mut self, name: impl Into<Rc<str>>) -> Box<Frame> {
         if let Some(mut f) = self.vm_frame_pool.pop() {
+            // The pool already released PHP owners; reset context while
+            // keeping the cleared buffers canonical calls will refill.
+            let buffers = (
+                std::mem::take(&mut f.vars),
+                std::mem::take(&mut f.args),
+                std::mem::take(&mut f.value_args),
+                std::mem::take(&mut f.vm_sites),
+            );
             *f = Frame::new(name);
+            (f.vars, f.args, f.value_args, f.vm_sites) = buffers;
             f
         } else {
             Box::new(Frame::new(name))
