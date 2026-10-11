@@ -1784,3 +1784,11 @@ Raw/source/hashes in bench/data/92/parity/oct11/memory-limit-boundaries-*.
 ### #286/#292 integration on main026f3e2
 
 Integrated runtime df67afdc76a19f0983c15956b37ebded3a7f6a37. Explicit release clean/rebuild; workspace/fmt/clippy,25script+19workload native byte gates,VM-profile pass. Reference constructor probe: native/fixed2,2,9; original merged #2891,2,1. Fix BEFORE argument evaluation retains canonical caller Cells for by-ref ctor params. Existing vm_canonical_lifetimes check extended, no new fixture.3406PHPT vs pre-main026 candidate:2729pass601fail25skip38unsupported6crash7timeout; only exception_005 and traits/error_007 improve fail→pass from imported main integration, no new failures. Do not attribute these improvements or old timings to the limit cache. Integrated source/hash/gates/maps under memory-limit-integrated-*; original timings stay memory-limit-boundaries-* with their own binary.
+
+## #294 review: restore root global lifetime/bindings (2026-10-11)
+
+Root NewCall and direct MethodCall release caller slot handles before dispatch and refresh canonical globals afterward, including errors, just as Op::Call does. The simple unset/value-write probe was already byte-correct; the reference-rebind probe reproduced native9 versus old2 for both dispatches. ONE existing vm_canonical_lifetimes fixture extends both paths; canonical local-frame calls remain unchanged. Reviewer threads PRRT_kwDOU4oR3M6rLzlh / PRRT_kwDOU4oR3M6rLzln.
+
+Runtime a25f25377261affa86d850b67e7929f39543f86c; binarySHA256 faac63b35b157fc6f26ed69bb7f080cd3967fcdc1a393a784d9b48373ed00d03. Workspace/fmt/clippy/clean release/25script+19workload+VM-profile and four extra probes pass. All3406PHPT compared:2729pass601fail, only range_bug71132 crash→timeout (known resource result), no new fail/pass/skip. Prior CI rust/phpt succeeded at539a156; this new head requires its own CI. Prior cache-only/per-stage timings do not time this global synchronization restoration. Fresh paired/whole-suite measurements will use this exact reviewed binary.
+
+#295 independently duplicates the by-ref ctor correction and adds handle backlog stamping; its separate epoch fix is not included here. No external-host figures mixed into this report. Raw reviewed artifacts in bench/data/92/parity/oct11/memory-limit-review-*.
