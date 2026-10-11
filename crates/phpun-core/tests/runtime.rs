@@ -678,6 +678,16 @@ class PrivatePromotionChild extends PrivatePromotionBase {
 }
 $collision = new PrivatePromotionChild(7);
 echo 'private ', $collision->baseValue(), ' ', $collision->childValue(), "\n";
+class EffectivePromotionBase {
+    function __construct(public int $value) {}
+}
+class EffectivePromotionChild extends EffectivePromotionBase {
+    public int $value {
+        set { echo "effective hook $value\n"; $this->value = $value * 3; }
+    }
+}
+$effective = new EffectivePromotionChild(4);
+echo 'effective ', $effective->value, "\n";
 "#,
         &[],
     );
@@ -726,6 +736,8 @@ default 12
 native 2
 engine
 private 7 99
+effective hook 4
+effective 12
 "#
     );
     assert_eq!(err, "");
