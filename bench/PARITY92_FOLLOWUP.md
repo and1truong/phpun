@@ -2863,3 +2863,43 @@ External CI not asserted green. No suite parity claim or multiplication of step 
 Raw/source/hashes in bench/data/92/parity/oct11/bool-loop-bounded-*.
 
 Final frozen7aa40eb/53a0e08 whole7: main4e6 geomean3.7603→candidate3.0527×PHP;candidate/parent0.8822 (−11.8%). Sieve3.0913×PHP;objects11.5395×/long20.6112×;strings3.8064×/long4.6556×,arrays4.5986×,JSON2.9178×,DB3.6580×,regex2.5799×,fib0.7697×,startup1.7395×,app6.5929×,Composer1.8567×. Whole negatives:startup+3.4%,fib+4.6%,longobjects+.9%,app+4.7%;focused31objects+2.3%,arrays+1.1%,JSON+.5%. All exact rawsamples/cohort hashes are published,not multiplied or averaged into artificial savings. Physicalsieve10 adds380requests/+5250364bytes for privatebuffers (tradeoff,not allocation reduction). Objects/arrays unchangedrequests/+4bytes.
+
+## #340: perf(vm): reuse native emitter for transactional boolean-array regions (2026-10-11)
+
+x86_64Linux executes the existing typed-region integer/boolean whitelist through the existing native emitter and shared W^X mapping path. Private primitive [value,kind] buffers and boolean bytes preserve canonical publication;no Value/Cell layout reinterpretation,new dependency or benchmark-name recognition. Existing function and region mappings share an8MiB interpreter budget,region code≤64KiB.
+
+Compile worklist verifies CV/stack/branch bounds;runtime bounds/type/uninit/overflow/step misses discard private buffers before originalVM retry. Unsupportedarchitecture/compiler/mapping keeps portable execution. ONE existing scalar-dimension check proves native activation,CoW/overflow/bounds/1MiB guards,10mstep miss after a private write,and mapping lifetime/release. Same deadline/profile/ref/typed/readonly/global/memory guards remain.
+
+Runtime 32319e5212c5472ca9a8a59b673fab3c7d2751dc; timing source 32319e5212c5472ca9a8a59b673fab3c7d2751dc; report/integration source 32319e5212c5472ca9a8a59b673fab3c7d2751dc.
+
+31alternating profiler-off nativePHP8.5.11-n byte-gated pairs in table;separate freshwhole7 andnegative31 retained.
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/11-sieve.php | 22.043 | 10.193 | 0.4624 |
+| bench/11-sieve.php 10 100000 | 152.079 | 33.115 | 0.2177 |
+| bench/40-objects.php | 108.463 | 110.101 | 1.0151 |
+| bench/30-arrays.php | 83.440 | 80.795 | 0.9683 |
+| bench/60-json.php | 537.084 | 527.058 | 0.9813 |
+| examples/composer/run.php | 8.968 | 8.807 | 0.9820 |
+
+31parentportable→native:sieve22.043→10.193ms (−53.8%),long152.079→33.115 (−78.2%);objects+1.5%,arrays−3.2%,JSON−1.9%,Composer−1.8% not attributed. Whole7 main3.864→native2.777×PHP,parent−11.0%;sieve1.3365×PHP,objects12.3025×PHP. Whole negativesstrings+4.5%,longstrings+10.9%,longobjects+2.0%,DB+1.4% retained. Independentnegative31strings55.941→58.204ms(+4.0%),long241.655→260.709(+7.9%),longobjects−3.7%,DB+.8%. BothOp layouts128bytes;temporary test-only layout diagnostics removed,not speed runs. Retain measuredtarget/whole improvement with explicit string regression tradeoff;next#342 sharedallocation work remains independent. No parity claim or multiplication of step gains.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- sieve10: requests 32870→32904; bytes 27282789→27290309.
+- strings100: requests 2902885→2902886; bytes 120173064→120173064.
+- objects5: requests 983132→983133; bytes 55270095→55270095.
+- arrays: requests 636052→636053; bytes 26701398→26701422.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing region check extended;25+19workload/probes/VM-profile gatesPASS.
+All3406individualPHPT only one knownrange crash→timeout and GC77345timeout→pass. Serializedsame10s parent9258ms/candidate9698ms bothPASS;fullmaps retained,not a compatibility gain.2732pass599fail candidate,knownfailures retained.
+Candidate summary retained: {'total': 3406, 'passed': 2732, 'failed': 599, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 5, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.72};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/bool-native-*.
+
+Native finalsource32319e5/hash0a1d298 whole7: main4e6geo3.8643→candidate2.7772×PHP,candidate/parent0.8903 (−11.0%). Default/long strings31regressions+4.0/+7.9% retained;no identified CPU cause. Physicalstrings100+1request/unchangedbytes,objects+1request/unchangedbytes,arrays+1request/+24bytes,sieve10+34requests/+7520bytes. BothOp128bytes disprovesopcode-size growth;test-only diagnostics removed before report,releasebinary untouched. GC77345 serialized parent9258ms/candidate9698ms bothPASS;fulltwochanges retained,after-isolationmap onlyknownrange crash→timeout. Broadercompatibility not complete. All whole/negative/provenance files are published.

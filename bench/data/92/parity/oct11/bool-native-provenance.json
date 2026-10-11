@@ -1,0 +1,111 @@
+{
+  "source": "32319e5212c5472ca9a8a59b673fab3c7d2751dc",
+  "runtime": "32319e5212c5472ca9a8a59b673fab3c7d2751dc",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2732,
+    "failed": 599,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 5,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.72
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    },
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "crash",
+      "after": "timeout"
+    }
+  ],
+  "isolated_gc_rechecks": [
+    {
+      "binary": "bool-loop-bounded",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 9258
+      }
+    },
+    {
+      "binary": "bool-native",
+      "result": {
+        "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+        "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+        "status": "pass",
+        "reason": "",
+        "duration_ms": 9698
+      }
+    }
+  ],
+  "physical_allocations": [
+    {
+      "label": "sieve10",
+      "before": {
+        "requests": 32870,
+        "bytes": 27282789
+      },
+      "after": {
+        "requests": 32904,
+        "bytes": 27290309
+      }
+    },
+    {
+      "label": "strings100",
+      "before": {
+        "requests": 2902885,
+        "bytes": 120173064
+      },
+      "after": {
+        "requests": 2902886,
+        "bytes": 120173064
+      }
+    },
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 983132,
+        "bytes": 55270095
+      },
+      "after": {
+        "requests": 983133,
+        "bytes": 55270095
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636052,
+        "bytes": 26701398
+      },
+      "after": {
+        "requests": 636053,
+        "bytes": 26701422
+      }
+    }
+  ],
+  "binary_sha256": "0a1d2988f29b652448ab28a512c1f5595f85d7505b72fe68e482a0292140e649",
+  "scope": "x86_64Linux executes the existing typed-region integer/boolean whitelist through the existing native emitter and shared W^X mapping path. Private primitive [value,kind] buffers and boolean bytes preserve canonical publication;no Value/Cell layout reinterpretation,new dependency or benchmark-name recognition. Existing function and region mappings share an8MiB interpreter budget,region code\u226464KiB.",
+  "fallbacks": "Compile worklist verifies CV/stack/branch bounds;runtime bounds/type/uninit/overflow/step misses discard private buffers before originalVM retry. Unsupportedarchitecture/compiler/mapping keeps portable execution. ONE existing scalar-dimension check proves native activation,CoW/overflow/bounds/1MiB guards,10mstep miss after a private write,and mapping lifetime/release. Same deadline/profile/ref/typed/readonly/global/memory guards remain.",
+  "whole_suite": "bool-native-whole.json",
+  "layout_diagnostics": "test-only temporary size print,removed;bothOp128bytes;not CPU attribution/speed runs"
+}
