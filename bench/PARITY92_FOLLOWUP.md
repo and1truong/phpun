@@ -2055,3 +2055,45 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/gc-pointer-tables-main-*.
+
+## #306: perf(gc): traverse live property Cells without owned snapshots (2026-10-11)
+
+Use existing prop_order/prop_get iterators in shared GC object graph and dying walks. Avoid temporary owned Vec<(String,Cell)> and cloned keys. Each dying step re-reads current live order, preserving callback mutation/tombstones; selected Cell/payload clone and object borrow are released before callbacks.
+
+Graph/root/duplicate-Cell accounting,typed pins,purple buffering,generator/internal fields/destructor order unchanged. Keep owned live_props snapshots for other consumers requiring them. No layout/unsafe/dependencies. Extend ONE existing registered/plain-cell fixture for aliased duplicate props/live roots and unset tombstones; native outputs checked vs PHP/parent.
+
+Runtime a0894ae601329f0f1d93ce207abd65a2d8027543; timing source a0894ae601329f0f1d93ce207abd65a2d8027543; report/integration source c8b23dee0e41ce0535e64aa741d68fa0ca0f13f4.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 145.785 | 151.997 | 1.0426 |
+| bench/40-objects.php 20 5000 | 625.761 | 613.187 | 0.9799 |
+| bench/20-strings.php | 60.922 | 57.810 | 0.9489 |
+| bench/20-strings.php 100 | 272.575 | 245.233 | 0.8997 |
+| bench/11-sieve.php | 61.643 | 60.961 | 0.9889 |
+| bench/30-arrays.php | 75.717 | 78.112 | 1.0316 |
+| bench/60-json.php | 504.470 | 504.531 | 1.0001 |
+| bench/10-fib.php | 8.405 | 8.423 | 1.0021 |
+| bench/50-regex.php | 40.695 | 39.967 | 0.9821 |
+| bench/70-db.php | 107.589 | 107.957 | 1.0034 |
+| bench/app/cli.php 100 20 | 33.091 | 31.684 | 0.9575 |
+| examples/composer/run.php | 7.951 | 7.325 | 0.9212 |
+
+7pairs ordinaryobjects+4.3%,long−2.0%,strings−5.1%/long−10%,sieve−1.1%,arrays+3.2%,JSONflat,fibflat,regex−1.8%,DB+.3%,app−4.3%,Composer−7.9%.31followup ordinaryobjects+.2%,long+.3%,arrays−.7%: normal objects effectivelyflat,not a demonstrated broad object speedup. Independent7pairs200000-nodecycle8798.866→8230.058ms(−6.5%),everyexit/stdout/stderr nativePHP-byte-gated. Physicalobjects5 requests1663202→1633154(−30048/~1.8%),bytes69798420→68356112;gcgraph32245→32236. Eventcell225018 unchanged; physical allocator counts are separate. Not attribute unrelated string/fib/app changes solely to GC. No PHP parity or overall claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1663202→1633154; bytes 69798420→68356112.
+- gcgraph: requests 32245→32236; bytes 5997998→5997583.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing GC fixture extended once;native duplicate-property Cell/keep-root/unset-tombstone probe passes. Existing lifetime/readonly/globals/native-graph/160-arg page-growth checks retained.
+All3406individualPHPT compared; 0 known range crash/timeout swaps; no new fail/pass/skip.
+Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 6, 'applicable': 3343, 'compatibility_pct': 81.66};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/gc-property-traversal-*.
