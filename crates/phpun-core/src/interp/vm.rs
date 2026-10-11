@@ -4584,7 +4584,7 @@ unset($a); var_dump($weak->get());
             .expect("empty promoted constructor retains direct target");
         assert!(target.1.comp.value_abi);
         let mut leaf = Interp::new("float-leaf.php");
-        let result = leaf.run_source(
+        let stmts = crate::parser::parse_source(
             r#"<?php
 class ArithmeticLeaf {
  private float $x=3.0;
@@ -4594,8 +4594,14 @@ class ArithmeticLeaf {
 $o = new ArithmeticLeaf;
 echo $o->length(), "\n";
 "#,
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(leaf.exec_block(&stmts), super::super::Flow::Normal),
+            "{}",
+            leaf.err_buf
         );
-        assert_eq!(result.exit_code, 0, "{}", leaf.err_buf);
         assert_eq!(leaf.out, b"5\n");
         let super::Value::Object(object) = leaf.globals.vars["o"].borrow().clone() else {
             panic!("receiver")
@@ -4617,6 +4623,7 @@ echo $o->length(), "\n";
         assert!(leaf.vm_float_method(&core, &[], &object).is_none());
         leaf.deadline = None;
         drop(pin);
+        leaf.globals.vars.remove("o");
         assert!(leaf.vm_float_method(&core, &[], &object).is_none());
         let mut it = Interp::new("receiver.php");
         let result = it.run_source(
