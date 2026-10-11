@@ -4035,7 +4035,6 @@ impl<'a> Interp<'a> {
     /// per size class; the in-chunk counter conservatively assumes no
     /// reusable runs, so fragmented heaps can trip a bit earlier.
     /// PR #88 owns the canonical page-level model.
-
     pub(crate) fn mem_check(&mut self, req: u64) -> Option<u64> {
         let limit = self.memory_limit_bytes();
         if limit <= 0 {
