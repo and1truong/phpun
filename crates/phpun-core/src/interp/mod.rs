@@ -4013,6 +4013,16 @@ impl<'a> Interp<'a> {
         self.oom_at.is_some()
     }
 
+    fn memory_limit_bytes(&mut self) -> i64 {
+        let raw = self.ini.get("memory_limit").map(String::as_str);
+        if raw != self.mem_limit_ck.1.as_deref() {
+            let v = self.ini_bytes("memory_limit");
+            self.mem_limit_ck = (v, raw.map(str::to_string));
+        }
+        self.mem_limit_ck.0
+    }
+
+
     /// zend's memory_limit check runs inside the allocator where a
     /// request forces newly committed memory: a huge alloc needs its
     /// own segment (real_size + aligned request vs limit), anything
@@ -4026,14 +4036,6 @@ impl<'a> Interp<'a> {
     /// per size class; the in-chunk counter conservatively assumes no
     /// reusable runs, so fragmented heaps can trip a bit earlier.
     /// PR #88 owns the canonical page-level model.
-    fn memory_limit_bytes(&mut self) -> i64 {
-        let raw = self.ini.get("memory_limit").map(String::as_str);
-        if raw != self.mem_limit_ck.1.as_deref() {
-            let v = self.ini_bytes("memory_limit");
-            self.mem_limit_ck = (v, raw.map(str::to_string));
-        }
-        self.mem_limit_ck.0
-    }
 
     pub(crate) fn mem_check(&mut self, req: u64) -> Option<u64> {
         let limit = self.memory_limit_bytes();
