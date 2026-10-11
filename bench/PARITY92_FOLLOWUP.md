@@ -1510,3 +1510,158 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/weak-liveness-*.
+
+## #267: perf(vm): call exact scalar sqrt and substr kernels from values (2026-10-11)
+
+For already resolved builtin targets with exact Float/Int sqrt or Str/Int substr arguments, reuse the original shared math/byte kernels directly from the VM value stack. Preserve canonical arena reservation/free; avoid argument Cells/transient builtin trace/ZPP/family scans for these effect-free kernels only.
+
+Page growth, memory-exceeded, profilers, pending conversion/probe/compare diagnostics, named/ref/coercion/type/arity/user override retain canonical path. Missing/null length stays canonical; pre-existing explicit null length bug is recorded with parent/candidate matching and scheduled shared parser fix #278.
+
+Runtime 85144a9071432a89c80feae86b3baad964dadc36; measured source 569248f2e26ea0972498cd19e9955731b6a1d981.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 194.512 | 182.742 | 0.9395 |
+| bench/40-objects.php 20 5000 | 793.817 | 727.115 | 0.9160 |
+| bench/profile/objects.php norm 5000 | 49.601 | 46.014 | 0.9277 |
+| bench/20-strings.php | 119.200 | 65.649 | 0.5508 |
+| bench/20-strings.php 100 | 574.443 | 308.738 | 0.5375 |
+| bench/30-arrays.php | 81.697 | 80.020 | 0.9795 |
+| bench/11-sieve.php | 79.467 | 77.921 | 0.9805 |
+| bench/10-fib.php | 8.658 | 9.070 | 1.0475 |
+| bench/app/cli.php 100 20 | 36.217 | 34.345 | 0.9483 |
+| examples/composer/run.php | 7.596 | 7.590 | 0.9993 |
+
+Seven pairs strings−44.9%,long−46.3%,objects−6.1%/long−8.4%,norm−7.2%. Retain nontarget fib+4.8%, not attributed or erased. Native-host parent comparisons, not user2.71× dataset or current suite parity.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects: requests 8763026→8369363; bytes 275059963→264885143.
+- strings: requests 1337503→617503; bytes 46016453→29056481.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing VM runnable check proves actual kernel entry using empty trace-pool and balanced arena span; array-argument error and page-growth create canonical trace frames. Extra boundary byte gate passes for binary/Int-extremes/NaN/-0/named/namespace/type/arity/coercion. Full NULL-length probe matches parent but mismatches PHP (pre-existing parser bug); kept separately and queued #278.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/scalar-builtin-calls-*.
+
+## #271: bench(objects): reject promotion prototypes outside the VM hot path (2026-10-11)
+
+Prototype branch68 replaced effective promoted PropDecl cloning with the existing borrowed declaration resolver. Branch69 tried borrowed declared promotion storage keys. Both change canonical promoted_prop_write, while VM constructor promotion calls shared store_prop instead.
+
+Reject both runtime prototypes via ordinary reverts. Final branch68 crates/Cargo runtime diff versus #279 is empty. Branch69 retains only a useful existing private-collision check; its storage-key prototype was rejected before speed testing. No bypass of canonical type/hook/readonly/ref/destructor protocols.
+
+Runtime df90ccf7a77ab9e25f598991c128da8e388bf388; measured source eb879fadd6570026ce1a4f6be7606652e57dd1ef.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 211.082 | 213.162 | 1.0099 |
+| bench/40-objects.php 20 5000 | 786.589 | 820.296 | 1.0429 |
+| bench/profile/objects.php ctor 5000 | 46.036 | 41.336 | 0.8979 |
+| bench/profile/objects.php norm 5000 | 49.005 | 47.278 | 0.9648 |
+| bench/20-strings.php | 64.193 | 66.737 | 1.0396 |
+| bench/30-arrays.php | 82.073 | 81.113 | 0.9883 |
+| bench/11-sieve.php | 82.373 | 81.736 | 0.9923 |
+| bench/10-fib.php | 8.384 | 8.401 | 1.0020 |
+| bench/app/cli.php 100 20 | 35.009 | 35.395 | 1.0110 |
+| examples/composer/run.php | 8.281 | 7.815 | 0.9437 |
+
+These are prototype timings, not final-head performance. Physical VM objects requests unchanged8369362→8369363 (startup1 request variation), bytes increased3.18MB in separate run; no measured allocation benefit.31pairs objects+0.7%,long+0.7%,strings+4.6% retained. Initial ctor−10.2% cannot be attributed to code outside the actual VM lane. Runtime revert restored exact #279 source. Do not multiply or advertise these medians as gains.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects: requests 8369362→8369363; bytes 261705889→264884393.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Prototype workspace/fmt/clippy,25script+19workload+existing promoted/native ancestor byte gate andVM-profile pass;3406only range71197crash→timeout. Final runtime source is exactly restored to #279; no post-revert speed claim.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/promotion-metadata-*.
+
+## #276: perf(builtins): route known names to the shared extension dispatcher (2026-10-11)
+
+For a bounded known list of string/math/JSON/regex names, select the existing original extension dispatcher directly. All other names retain the FAMILIES scan. Same kernel implementation and shared deferred cast-error handling, no duplicate algorithms.
+
+Canonical builtin binder/frame/ZPP/by-ref/diagnostics remain; namespaced/user resolution happens before this builtin root. No argument ABI or memory/GC changes. Existing shared string and private collision runnable checks reused.
+
+Runtime 33876df32ef544eb799b126d0e567793e0a1de3e; measured source 651422f61514b552a6198428d5ff51a03f988464.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 68.206 | 65.511 | 0.9605 |
+| bench/20-strings.php 100 | 317.212 | 304.176 | 0.9589 |
+| bench/40-objects.php | 189.252 | 189.041 | 0.9989 |
+| bench/60-json.php | 515.382 | 519.004 | 1.0070 |
+| bench/50-regex.php | 46.252 | 41.071 | 0.8880 |
+| bench/30-arrays.php | 80.475 | 78.783 | 0.9790 |
+| bench/11-sieve.php | 75.284 | 75.780 | 1.0066 |
+| bench/10-fib.php | 8.053 | 8.090 | 1.0046 |
+| bench/app/cli.php 100 20 | 33.475 | 33.513 | 1.0011 |
+| examples/composer/run.php | 8.580 | 8.070 | 0.9406 |
+
+Seven profiler-off pairs strings−4.0%,long−4.1%,regex−11.2%,objects flat. JSON+0.7%,sieve+0.7%,fib+0.5%,app+0.1% retained. Regex7pairs is a bounded median, not stable broad parity. Physicalrequests/bytes unchanged aside from2 startup requests/18B variation.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings: requests 617503→617501; bytes 29057534→29057516.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Existing runnable checks reused; no redundant test fixtures.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/builtin-family-dispatch-*.
+
+## #278: fix(strings): treat explicit null substring length as omitted (2026-10-11)
+
+The shared canonical substr parser accepted ?int but converted explicit null to0. Preserve None for omitted/null length; explicit0 remains Some(0). Integer fast kernel stays unchanged and null still takes canonical builtin binding/frame.
+
+Keep named/weak coercion/type/arity/namespace/ref behavior and the shared byte substring kernel. ONE existing shared string runnable check extended with binary omitted/null/zero distinction.
+
+Runtime 2bc9b379eb8d0fde6b76a873dc791cd666df0bea; measured source 372b930e62565ebebd3cb22183d0461a5f483eb9.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 65.704 | 64.450 | 0.9809 |
+| bench/40-objects.php | 186.094 | 185.428 | 0.9964 |
+| bench/app/cli.php 100 20 | 33.616 | 33.303 | 0.9907 |
+
+Correctness fix, not an optimization claim. Three seven-pair smoke medians retained without attributing speed: strings−1.9%,objects−0.4%,app−0.9%. Full prior failing null-length probe now matches PHP byte-for-byte, including NUL/nonUTF8,Int MIN/MAX offsets/lengths,named/coercion/error/namespace cases.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Full scalar-builtin-calls-null-length-baseline probe now passes PHP byte gate, including nullable length. Binary omitted/null/zero distinction in ONE existing string check. No new fail/pass/skip in3406PHPT;onlyknownrange71132timeout→crash.
+All3406individualPHPT compared; 1 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/null-substr-length-*.
+
+### #284 review: nullable length root and named replacement offset
+
+Runtime a2dfbd2cf3292acdc39c5de03c230014efc25e19. Shared nullable_int_arg handles omitted/null versus explicit0 for substr,substr_replace,mb_substr,mb_strcut,strspn,strcspn. Correct substr_replace named parameter from start to PHP offset. Existing shared string runnable check covers all siblings, multibyte/binary omitted/null/0 and named replacement. NativePHP8.5.11 -n byte probe passes for core substr/replacement/span cases; native oracle lacks mbstring, so no native mb oracle claim. Workspace/fmt/clippy and explicit release clean/rebuild pass;25+19+VM-profile gates pass. All3406individualPHPT statuses identical original #284, existing2727pass603fail retained. Correctness-only inherited review fix, not a new timing claim. Binary/source/raw verification under nullable-length-review-*; original pre-review timing artifacts remain separate.
+
+#280 inherited #284 review verification: exact reviewed runtime e6ab84b7e4c0c88b0a9219f67e2ebed12e59482e; clean workspace/fmt/clippy/release and25+19+VM-profile/core nullable/property byte probes pass. All3406individualPHPT statuses identical reviewed parent. New binary/hash and raw under primitive-property-reviewed-*. Original primitive-property-checks-* timings/alloc/profile were taken before sibling-null review fixes and remain labeled separately; no invented repeat speedup.

@@ -26,11 +26,7 @@ pub(crate) fn dispatch(
         "mb_substr" => {
             let s = arg_str(it, args, 0);
             let start = arg(args, 1).to_int();
-            let len = if args.len() > 2 {
-                Some(arg(args, 2).to_int())
-            } else {
-                None
-            };
+            let len = nullable_int_arg(args, 2);
             match mb_substr(&s, start, len) {
                 Some(x) => Value::str(x),
                 None => Value::Bool(false),
@@ -165,11 +161,7 @@ pub(crate) fn dispatch(
             // previous character boundary (never splits mid-char).
             let s = arg_bs(it, args, 0);
             let start = arg(args, 1).to_int();
-            let len = if args.len() > 2 {
-                Some(arg(args, 2).to_int())
-            } else {
-                None
-            };
+            let len = nullable_int_arg(args, 2);
             match php_substr(&s, start, len) {
                 Some(mut x) => {
                     while !x.is_empty() && !utf8_boundary(&s, start.max(0) as usize + x.len()) {

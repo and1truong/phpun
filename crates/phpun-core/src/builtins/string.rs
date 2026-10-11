@@ -277,15 +277,8 @@ pub(crate) fn dispatch(
             let source = arg(args, 0);
             let s = bytes_view(it, &source);
             let start = arg(args, 1).to_int();
-            let len = if args.len() > 2 {
-                Some(arg(args, 2).to_int())
-            } else {
-                None
-            };
-            match php_substr(&s, start, len) {
-                Some(x) => Value::bytes(x),
-                None => Value::Bool(false),
-            }
+            let len = nullable_int_arg(args, 2);
+            substr_value(&s, start, len)
         }
         "substr_count" => {
             let source = arg(args, 0);
@@ -308,11 +301,7 @@ pub(crate) fn dispatch(
             let s = arg_bs(it, args, 0);
             let r = arg_bs(it, args, 1);
             let start = arg(args, 2).to_int();
-            let len = if args.len() > 3 {
-                Some(arg(args, 3).to_int())
-            } else {
-                None
-            };
+            let len = nullable_int_arg(args, 3);
             Value::bytes(substr_replace(&s, &r, start, len))
         }
         "strpos" | "stripos" => {
@@ -406,8 +395,7 @@ pub(crate) fn dispatch(
                 off.min(len)
             } as usize;
             let mut end = len as usize;
-            if let Some(l) = args.get(3) {
-                let l = l.borrow().to_int();
+            if let Some(l) = nullable_int_arg(args, 3) {
                 end = if l < 0 {
                     (len + l).max(start as i64) as usize
                 } else {
@@ -1406,6 +1394,13 @@ fn str_replace(
         apply(subj)?
     };
     Ok((result, count))
+}
+
+pub(in crate::builtins) fn substr_value(s: &[u8], start: i64, len: Option<i64>) -> Value {
+    match php_substr(s, start, len) {
+        Some(x) => Value::bytes(x),
+        None => Value::Bool(false),
+    }
 }
 
 pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<Vec<u8>> {

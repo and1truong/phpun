@@ -1,0 +1,20 @@
+{
+  "binary_sha256": "87804c86ab750e5ce13924b44f14cdd91482a021841c668041c87ed6fbbc6c95",
+  "source": "a2dfbd2cf3292acdc39c5de03c230014efc25e19",
+  "parent": "null-substr-length",
+  "summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "changes": []
+}

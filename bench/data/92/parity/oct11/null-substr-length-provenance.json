@@ -1,0 +1,38 @@
+{
+  "source": "372b930e62565ebebd3cb22183d0461a5f483eb9",
+  "runtime": "2bc9b379eb8d0fde6b76a873dc791cd666df0bea",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/ext/standard/tests/array/range/range_bug71132.phpt",
+      "before": "timeout",
+      "after": "crash"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [],
+  "binary_sha256": "a6426ece1f1c2661b827cf6da67bb9ac64ce7596e9da006ac4bfe2e21175f914",
+  "scope": "The shared canonical substr parser accepted ?int but converted explicit null to0. Preserve None for omitted/null length; explicit0 remains Some(0). Integer fast kernel stays unchanged and null still takes canonical builtin binding/frame.",
+  "fallbacks": "Keep named/weak coercion/type/arity/namespace/ref behavior and the shared byte substring kernel. ONE existing shared string runnable check extended with binary omitted/null/zero distinction."
+}

@@ -421,6 +421,13 @@ $r=str_replace(new Text(), new Text(), new Text(),$count); var_dump($r,$count);
 class BadText { public function __toString(): string { throw new Exception('cast-error'); } }
 $count=99;
 try { str_replace('x','y',new BadText(),$count); } catch(Throwable $e) { echo $e->getMessage()," ",$count,"\n"; }
+echo bin2hex(substr("a\0b\xff",1,null)), ' ', bin2hex(substr("a\0b\xff",1)), ' ', bin2hex(substr("a\0b\xff",1,0)), "\n";
+foreach (['mb_substr', 'mb_strcut'] as $fn) {
+    echo $fn('aé中z', 1, null), ' ', $fn('aé中z', 1), ' ', $fn('aé中z', 1, 0), "|\n";
+}
+echo bin2hex(substr_replace("a\0b\xff", 'X', 1, null)), ' ', bin2hex(substr_replace("a\0b\xff", 'X', 1)), ' ', bin2hex(substr_replace("a\0b\xff", 'X', 1, 0)), "\n";
+echo substr_replace(string:'abcd', replace:'X', offset:1, length:null), "\n";
+foreach (['strspn','strcspn'] as $fn) echo $fn('abba!', 'ab', 1, null), ' ', $fn('abba!', 'ab', 1), ' ', $fn('abba!', 'ab', 1, 0), "\n";
 "#,
         &[],
     );
@@ -451,6 +458,13 @@ cast
 string(3) "fox"
 int(1)
 cast-error 99
+0062ff 0062ff 
+é中z é中z |
+é中z é中z |
+6158 6158 61580062ff
+aX
+3 3 0
+0 0 0
 "#
     );
     assert_eq!(err, "");
@@ -471,6 +485,12 @@ try { rejected(); } catch (Throwable $e) { echo get_class($e),"\n"; }
 class OrdinaryName { public function __construct(public int $n) {} }
 $o=new OrdinaryName(3); echo get_class($o),' ',$o->n,"\n";
 $a=new class { public function read() { return 4; } }; echo strpos(get_class($a),'@anonymous') !== false ? 'anonymous' : 'bad', ' ', $a->read(),"\n";
+class PrimitivePropertyProbe { public float $f; public int $i; public bool $b; public string $s; }
+$p = new PrimitivePropertyProbe;
+$p->f = 7; $p->i = 3; $p->b = true; $p->s = "a\0b";
+var_dump($p->f, $p->i, $p->b, bin2hex($p->s));
+$ref =& $p->f; $ref = 9; var_dump($p->f);
+try { $p->i = []; } catch (TypeError $e) { echo "property type\n"; }
 "#,
         &[],
     );
@@ -485,6 +505,12 @@ float(7)
 TypeError
 OrdinaryName 3
 anonymous 4
+float(7)
+int(3)
+bool(true)
+string(6) "610062"
+float(9)
+property type
 "#
     );
     assert_eq!(err, "");
@@ -642,6 +668,16 @@ class ThrowableCtorProbe extends Exception {
     function __construct() { parent::__construct('engine'); echo $this->getMessage(), "\n"; }
 }
 new ThrowableCtorProbe;
+class PrivatePromotionBase {
+    function __construct(private int $x) {}
+    function baseValue() { return $this->x; }
+}
+class PrivatePromotionChild extends PrivatePromotionBase {
+    private int $x = 99;
+    function childValue() { return $this->x; }
+}
+$collision = new PrivatePromotionChild(7);
+echo 'private ', $collision->baseValue(), ' ', $collision->childValue(), "\n";
 "#,
         &[],
     );
@@ -689,6 +725,7 @@ negative
 default 12
 native 2
 engine
+private 7 99
 "#
     );
     assert_eq!(err, "");

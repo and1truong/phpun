@@ -156,7 +156,7 @@ pub(crate) fn dispatch(
                 _ => Value::Float(b.to_float().powf(e.to_float())),
             }
         }
-        "sqrt" => Value::Float(arg(args, 0).to_float().sqrt()),
+        "sqrt" => sqrt_value(arg(args, 0).to_float()),
         "exp" => Value::Float(arg(args, 0).to_float().exp()),
         "log" | "ln" => {
             let v = arg(args, 0).to_float();
@@ -313,4 +313,8 @@ fn intdiv_int(it: &mut Interp, v: &Value, n: usize, name: &str) -> Result<i64, P
         Value::Bool(b) => Ok(*b as i64),
         other => Err(te(&other.operand_type_name())),
     }
+}
+
+pub(in crate::builtins) fn sqrt_value(n: f64) -> Value {
+    Value::Float(n.sqrt())
 }

@@ -42,6 +42,11 @@ fn arg(args: &[Cell], i: usize) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn nullable_int_arg(args: &[Cell], i: usize) -> Option<i64> {
+    let value = args.get(i)?.borrow();
+    (!matches!(*value, Value::Null)).then(|| value.to_int())
+}
+
 fn arg_str(it: &mut Interp, args: &[Cell], i: usize) -> String {
     it.to_string_of(&arg(args, i))
 }
@@ -155,8 +160,32 @@ const FAMILIES: &[Dispatch] = &[
     var::dispatch,
 ];
 
+/// Exact primitive kernels: no coercion, PHP callback, warning or type/arity
+/// failure. Callers retain the canonical arena and deferred-error protocol.
+pub(crate) fn call_scalar(name: &str, args: &[Value]) -> Option<Value> {
+    Some(match (name, args) {
+        ("sqrt", [Value::Float(n)]) => math::sqrt_value(*n),
+        ("sqrt", [Value::Int(n)]) => math::sqrt_value(*n as f64),
+        ("substr", [Value::Str(s), Value::Int(start)]) => string::substr_value(s, *start, None),
+        ("substr", [Value::Str(s), Value::Int(start), Value::Int(len)]) => {
+            string::substr_value(s, *start, Some(*len))
+        }
+        _ => return None,
+    })
+}
+
 pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
-    for f in FAMILIES {
+    // Same family implementation and deferred-error protocol; known names
+    // need not ask every unrelated extension to decline the call.
+    let families: &[Dispatch] = match name {
+        "strlen" | "substr" | "substr_count" | "str_replace" | "str_ireplace" | "str_repeat"
+        | "strpos" | "stripos" | "strtoupper" | "strtolower" => &[string::dispatch],
+        "sqrt" | "abs" => &[math::dispatch],
+        "json_encode" | "json_decode" => &[json::dispatch],
+        "preg_match" | "preg_match_all" => &[pcre::dispatch],
+        _ => FAMILIES,
+    };
+    for f in families {
         match f(it, name, args) {
             Ok(None) => continue,
             r => {
@@ -971,7 +1000,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "substr_replace" => bp!(
             ("string", Req),
             ("replace", Req),
-            ("start", Req),
+            ("offset", Req),
             ("length", Null)
         ),
         "trim" | "ltrim" | "rtrim" => {
