@@ -412,6 +412,7 @@ impl<'a> Interp<'a> {
                         flat_props: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
                         method_ic: std::cell::RefCell::new(None),
+                        short_name: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     }),
@@ -3042,7 +3043,10 @@ impl<'a> Interp<'a> {
     /// Zend link semantics: at a class's first use, every const
     /// initializer is evaluated — eval errors (undefined constant)
     /// propagate as Errors, then typed checks raise TypeErrors.
-    fn link_const_inits(&mut self, cls: &Rc<PhpClass>) -> Result<(), PhpError> {
+    pub(in crate::interp) fn link_const_inits(
+        &mut self,
+        cls: &Rc<PhpClass>,
+    ) -> Result<(), PhpError> {
         let lname = cls.decl.name.to_lowercase();
         if !self.consts_linked.insert(lname) {
             return Ok(());
@@ -3568,7 +3572,12 @@ impl<'a> Interp<'a> {
                 break;
             }
         }
-        if best.is_none() {
+        let drops = crate::value::HANDLE_DROPS.load(std::sync::atomic::Ordering::Relaxed);
+        if best.is_none() && drops != self.handle_scan_drops {
+            // A dead slot can only appear after an owner drop — the
+            // epoch hasn't moved since the last scan, so skip the
+            // tail walk entirely (all-alive churn path).
+            self.handle_scan_drops = drops;
             let n = self.obj_handles.len();
             for i in (0..n).rev().take(256) {
                 if !self.obj_handles[i].alive() {
@@ -3582,7 +3591,11 @@ impl<'a> Interp<'a> {
                 // The dead closure's per-instance statics table dies
                 // with it — the recycled id must not leak stale
                 // entries to an unrelated decl of the same name.
-                self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
+                let mut key = String::with_capacity(name.len() + 6);
+                key.push_str(name);
+                key.push_str("\0c");
+                key.push_str(&(i + 1).to_string());
+                self.statics.remove(&key);
             }
             self.obj_handles[i] = w;
             self.obj_born[i] = self.spawn_seq;
@@ -3808,6 +3821,7 @@ impl<'a> Interp<'a> {
                         flat_props: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
                         method_ic: std::cell::RefCell::new(None),
+                        short_name: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
                     }),

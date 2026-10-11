@@ -122,6 +122,7 @@ impl<'a> Interp<'a> {
                 flat_props: std::cell::OnceCell::new(),
                 prop_slot: std::cell::OnceCell::new(),
                 method_ic: std::cell::RefCell::new(None),
+                short_name: std::cell::OnceCell::new(),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });
@@ -2769,6 +2770,7 @@ impl<'a> Interp<'a> {
                 flat_props: std::cell::OnceCell::new(),
                 prop_slot: std::cell::OnceCell::new(),
                 method_ic: std::cell::RefCell::new(None),
+                short_name: std::cell::OnceCell::new(),
                 statics: RefCell::new(HashMap::new()),
                 statics_init: RefCell::new(true),
             });

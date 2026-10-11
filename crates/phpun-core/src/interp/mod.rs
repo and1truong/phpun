@@ -899,6 +899,8 @@ pub struct Interp<'a> {
     /// Freed handle slots in death order (Zend's LIFO free list) —
     /// `mark_obj_died` pushes, `push_handle` pops the freshest.
     dead_slots: Vec<usize>,
+    /// Last HANDLE_DROPS epoch the tail scan ran at — see push_handle.
+    handle_scan_drops: u64,
     /// Weak registry of arrays that gained a reference (`=&`) element
     /// — only those can join a cycle, so the GC pass scans just them
     /// (Zend roots every refcounted array, this is the cheap subset
@@ -1946,6 +1948,7 @@ impl<'a> Interp<'a> {
             obj_born: Vec::new(),
             obj_died: Vec::new(),
             dead_slots: Vec::new(),
+            handle_scan_drops: 0,
             arr_handles: Vec::new(),
             gc_pending: 0,
             gc_collecting: false,
@@ -3124,12 +3127,23 @@ impl<'a> Interp<'a> {
     /// nested statement's unwind must not free an outer statement's
     /// live temps (bug29368_3).
     fn sweep_expr_temps(&mut self, base: usize) -> Result<(), PhpError> {
+        self.sweep_expr_temps_ret(base, None)
+    }
+
+    /// `keep` = a value the caller is about to receive (this frame's
+    /// return): its temp must outlive this teardown — the enclosing
+    /// statement's discard check finds it by pointer in expr_temps.
+    /// Other survivors already have real owners and drop as before.
+    fn sweep_expr_temps_ret(&mut self, base: usize, keep: Option<usize>) -> Result<(), PhpError> {
         if self.expr_temps.len() == base {
             return Ok(());
         }
         let temps = self.expr_temps.split_off(base);
         for o in temps {
             if Rc::strong_count(&o) != 1 {
+                if keep.is_some_and(|k| Rc::as_ptr(&o) as usize == k) && Rc::strong_count(&o) == 2 {
+                    self.expr_temps.push(o);
+                }
                 continue;
             }
             let key = Rc::as_ptr(&o) as usize;
