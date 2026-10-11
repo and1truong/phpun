@@ -1665,3 +1665,41 @@ Raw/source/hashes in bench/data/92/parity/oct11/null-substr-length-*.
 Runtime a2dfbd2cf3292acdc39c5de03c230014efc25e19. Shared nullable_int_arg handles omitted/null versus explicit0 for substr,substr_replace,mb_substr,mb_strcut,strspn,strcspn. Correct substr_replace named parameter from start to PHP offset. Existing shared string runnable check covers all siblings, multibyte/binary omitted/null/0 and named replacement. NativePHP8.5.11 -n byte probe passes for core substr/replacement/span cases; native oracle lacks mbstring, so no native mb oracle claim. Workspace/fmt/clippy and explicit release clean/rebuild pass;25+19+VM-profile gates pass. All3406individualPHPT statuses identical original #284, existing2727pass603fail retained. Correctness-only inherited review fix, not a new timing claim. Binary/source/raw verification under nullable-length-review-*; original pre-review timing artifacts remain separate.
 
 #280 inherited #284 review verification: exact reviewed runtime e6ab84b7e4c0c88b0a9219f67e2ebed12e59482e; clean workspace/fmt/clippy/release and25+19+VM-profile/core nullable/property byte probes pass. All3406individualPHPT statuses identical reviewed parent. New binary/hash and raw under primitive-property-reviewed-*. Original primitive-property-checks-* timings/alloc/profile were taken before sibling-null review fixes and remain labeled separately; no invented repeat speedup.
+
+## #283: perf(builtins): share guarded scalar string kernels across VM and Cell entry (2026-10-11)
+
+Reuse the original replacement and ASCII case kernels for exact primitive Value-stack calls and canonical Cell-root calls. str_replace_one accepts existing owned vectors and borrowed byte slices through AsRef; unchanged subjects retain their Rc. Scalar Cell-root entry avoids transient trace/binding work; VM entry also avoids arg Cells.
+
+Named/count-ref/array/coercion/type/arity/override/pending diagnostic/error/OOM/profiler/coverage cases retain canonical binding. Arena reserve/free remains canonical; any VmSite owning a grown page rejects the root fast path. ONE existing callback/builtin check proves both entries and grown-page fallback. No duplicated string algorithm.
+
+Runtime e8fea20ada7f7df4c5469942329a829602525335; timing source e8fea20ada7f7df4c5469942329a829602525335; report/integration source 154ac34268e9669625e63a37d2356579ac846b7a.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/20-strings.php | 64.293 | 68.081 | 1.0589 |
+| bench/20-strings.php 100 | 317.747 | 299.465 | 0.9425 |
+| bench/40-objects.php | 184.189 | 184.638 | 1.0024 |
+| bench/11-sieve.php | 79.490 | 78.709 | 0.9902 |
+| bench/10-fib.php | 8.916 | 8.631 | 0.9681 |
+| bench/30-arrays.php | 85.537 | 83.469 | 0.9758 |
+| bench/60-json.php | 539.376 | 558.722 | 1.0359 |
+| bench/app/cli.php 100 20 | 36.161 | 37.721 | 1.0432 |
+| examples/composer/run.php | 7.872 | 8.571 | 1.0888 |
+
+Initial VM-only experiment left original string allocations unchanged and produced mixed medians; retained separately. Final shared-root7pairs strings+5.9%,long−5.8%,JSON+3.6%,app+4.3%,Composer+8.9% retained.31pairs addressing those negatives: strings−4.5%,long flat(+0.1%),JSON−1.3%,app−1.9%,Composer−1.5%. Separate7pairs replacement20000−4.0%,slice20000−9.0%. Physicalstrings−11200 requests(−1.8%),bytes−0.6%. Bounded gains/no suite parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- strings: requests 617501→606301; bytes 29056128→28890096.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Binary/NUL/nonUTF8,ASCII/CI,unchanged Rc identity,count-ref,arrays/coercion/errors/native probes pass. Existing check caught grown-page root bypass; guard corrected before final measurement.3406individualPHPT only2known range crash/timeout swaps. Ordinary main38 merge has no runtime delta.
+All3406individualPHPT compared; 2 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/scalar-string-calls-*.
