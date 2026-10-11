@@ -1,0 +1,22 @@
+[
+  {
+    "binary": "json-live-reference",
+    "result": {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+      "status": "pass",
+      "reason": "",
+      "duration_ms": 8306
+    }
+  },
+  {
+    "binary": "json-live-reference-review",
+    "result": {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "name": "Bug #77345 (Segmentation faults stack overflow in cyclic garbage collector) (Bug #77427)",
+      "status": "pass",
+      "reason": "",
+      "duration_ms": 8593
+    }
+  }
+]

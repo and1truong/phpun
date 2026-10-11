@@ -1,0 +1,27 @@
+{
+  "file": "json-dead-reference-review.php",
+  "corrected_main": "6c107153902dcda3367dfe3eab835e065121ff79",
+  "rows": [
+    {
+      "label": "php",
+      "sha256": "32fa863f672cfe0048b95d08fc1593f78bf97971823207a338f3f82d730e564f",
+      "exit": 0,
+      "stdout": "[0,1]\n[0,7]\n[0,1]\n",
+      "stderr": ""
+    },
+    {
+      "label": "original-fix",
+      "sha256": "857050a011f1074cd4f1bd40dbc62e61bd12844f10a59e8007b061a7e549251b",
+      "exit": 0,
+      "stdout": "[0,7]\n[0,7]\n[0,1]\n",
+      "stderr": ""
+    },
+    {
+      "label": "corrected",
+      "sha256": "cae5751c754d3fe52b3a2c42916e7616d6c5c6a7b542b814744dd36ccec2e55f",
+      "exit": 0,
+      "stdout": "[0,1]\n[0,7]\n[0,1]\n",
+      "stderr": ""
+    }
+  ]
+}

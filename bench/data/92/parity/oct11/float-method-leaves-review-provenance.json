@@ -1,0 +1,61 @@
+{
+  "source": "6f5f75fc505324a3ae352fa2ea8f8e4695c03967",
+  "runtime": "77cd3da0ab5643652f3d2e70510b686958aeb034",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1483154,
+        "bytes": 66855414
+      },
+      "after": {
+        "requests": 1358161,
+        "bytes": 64355538
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636049,
+        "bytes": 26703849
+      },
+      "after": {
+        "requests": 636049,
+        "bytes": 26703849
+      }
+    }
+  ],
+  "binary_sha256": "d6dc53c6c8bb81f7bbc4699315ac2b5e9b54c681552b037829d9548674103626",
+  "scope": "Execute bounded pure float method bodies over existing compiled Ops with a fixed f64 stack, warmed property and sqrt builtin caches. Eligibility uses generic types/ops, never method/benchmark names. Only root callers with pinned receivers and fitting method+builtin arena spans qualify; repay through the existing shared arena path. No code generation, layout change, dependency or public API.",
+  "fallbacks": "Named/default/ref/non-float/uninitialized/hooked/shadowed methods, cold or user-function caches, last-owner receiver, exposed globals, temporary/error/context/profiler/coverage/deadline/OOM/page-growth cases retain the full root materialize/direct-call/refresh bridge. Existing receiver unit proves warm execution and rejected type/deadline/owner guards; complete native probe covers inheritance/hooks/trace/Int-to-Float widening/errors."
+}
