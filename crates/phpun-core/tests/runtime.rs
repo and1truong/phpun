@@ -421,6 +421,7 @@ $r=str_replace(new Text(), new Text(), new Text(),$count); var_dump($r,$count);
 class BadText { public function __toString(): string { throw new Exception('cast-error'); } }
 $count=99;
 try { str_replace('x','y',new BadText(),$count); } catch(Throwable $e) { echo $e->getMessage()," ",$count,"\n"; }
+echo bin2hex(substr("a\0b\xff",1,null)), ' ', bin2hex(substr("a\0b\xff",1)), ' ', bin2hex(substr("a\0b\xff",1,0)), "\n";
 "#,
         &[],
     );
@@ -451,6 +452,7 @@ cast
 string(3) "fox"
 int(1)
 cast-error 99
+0062ff 0062ff 
 "#
     );
     assert_eq!(err, "");

@@ -277,10 +277,9 @@ pub(crate) fn dispatch(
             let source = arg(args, 0);
             let s = bytes_view(it, &source);
             let start = arg(args, 1).to_int();
-            let len = if args.len() > 2 {
-                Some(arg(args, 2).to_int())
-            } else {
-                None
+            let len = match args.get(2) {
+                Some(c) if !matches!(*c.borrow(), Value::Null) => Some(c.borrow().to_int()),
+                _ => None,
             };
             substr_value(&s, start, len)
         }
