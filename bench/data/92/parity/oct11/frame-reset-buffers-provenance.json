@@ -1,0 +1,61 @@
+{
+  "source": "cd81522a80b000a653d52999b4979764cd7a5784",
+  "runtime": "ade0f37ba5fe3682a9d6ad914e23575319b590c8",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2730,
+    "failed": 601,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 6,
+    "applicable": 3343,
+    "compatibility_pct": 81.66
+  },
+  "phpt_changes_after_isolation": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "full_phpt_changes": [
+    {
+      "file": "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_1.phpt",
+      "before": "timeout",
+      "after": "pass"
+    }
+  ],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [
+    {
+      "label": "objects5",
+      "before": {
+        "requests": 1483154,
+        "bytes": 66855410
+      },
+      "after": {
+        "requests": 1433156,
+        "bytes": 62355566
+      }
+    },
+    {
+      "label": "arrays",
+      "before": {
+        "requests": 636049,
+        "bytes": 26703845
+      },
+      "after": {
+        "requests": 636049,
+        "bytes": 26703821
+      }
+    }
+  ],
+  "binary_sha256": "8ce5b19dac930dbf9da5701aabdd5cf4bd73601221e6113a0fd466abb2c376b6",
+  "scope": "Report-only: reject #318 frame_new buffer preservation after actual-target speed measurement. Ordinary revert restores existing canonical frame reset; no production capacity-retention change retained. Keep pre316 unvalidated ELF provenance separate from fully verified current integration ade0f37/8ce5b19.",
+  "fallbacks": "Full Frame::new context reset, owner/destructor/call/namespace semantics restored exactly to parent315. Candidate ONE existing canonical unit extended capacity/no-owner/context assertions and passed; reverts with prototype. Known inherited main JSON live-reference regression unchanged, fixed next#319."
+}
