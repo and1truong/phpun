@@ -1,0 +1,26 @@
+{
+  "source": "df67afdc76a19f0983c15956b37ebded3a7f6a37",
+  "runtime": "81c0d5f7724960515402c66bb62e3a911000f472",
+  "tracked_clean": "only untracked vendor symlink",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes_after_isolation": [],
+  "full_phpt_changes": [],
+  "isolated_gc_rechecks": [],
+  "physical_allocations": [],
+  "binary_sha256": "ce41e557e88b87c378efa7e7f5b074d9fd6a9f9b35b2e6bbc59c3e64b0e71bb2",
+  "scope": "Reuse the existing raw-string-validated allocator memory-limit cache at statement boundaries and mutable resize checks. Keep every raw lookup/check/charge and INI invalidation. Fresh main integration also fixes #292: InitNew routes any by-ref ctor to canonical Expr::New before evaluating argv, retaining caller Cells.",
+  "fallbacks": "No skipped limit check, delayed INI change or changed OOM site/arena accounting. Missing raw limit remains -1. Existing arena check enforces a changed limit at the next boundary. Constructor fallback preserves original alias/type/error/autoload/visibility binding; existing vm_canonical_lifetimes fixture extends compiled-loop promoted refs."
+}
