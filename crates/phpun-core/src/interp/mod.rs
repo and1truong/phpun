@@ -515,6 +515,7 @@ pub struct Interp<'a> {
     pub(crate) json_enc_stack: Vec<usize>,
     /// Set by the preg_* builtins for preg_last_error().
     pub last_preg_error: i64,
+    pub(crate) pcre_patterns: HashMap<Vec<u8>, Rc<crate::builtins::pcre::PhpRe>>,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
     /// pointer) proven fully valid UTF-8 — /u preg calls skip
     /// re-validating it (bug72685). Weak keys drop when the storage
@@ -1857,6 +1858,7 @@ impl<'a> Interp<'a> {
             last_json_error: 0,
             json_enc_stack: Vec::new(),
             last_preg_error: 0,
+            pcre_patterns: HashMap::new(),
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),

@@ -342,7 +342,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 Value::Str(s) => Some(s),
                 _ => None,
             };
-            let re = match php_regex(&pat) {
+            let re = match php_regex(it, &pat) {
                 Ok(r) => r,
                 Err(e) => {
                     regex_err(it, name, &e)?;
@@ -721,7 +721,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         );
                     }
                     let p = pat_elem_str(it, &cell(pv.clone()))?;
-                    let re = match php_regex(&p) {
+                    let re = match php_regex(it, &p) {
                         Ok(r) => r,
                         Err(e) => {
                             regex_err(it, name, &e)?;
@@ -833,7 +833,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             break;
                         }
                     };
-                    let re = match php_regex(&p) {
+                    let re = match php_regex(it, &p) {
                         Ok(r) => r,
                         Err(e) => {
                             // Compile failure = NULL result for this
@@ -1007,7 +1007,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             let subj = arg_bs(it, args, 1);
             let flags = arg(args, 3).to_int();
             let limit = arg(args, 2).to_int();
-            let re = match php_regex(&pat) {
+            let re = match php_regex(it, &pat) {
                 Ok(r) => r,
                 Err(e) => {
                     regex_err(it, name, &e)?;
@@ -1074,7 +1074,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
         "preg_grep" => {
             let pat = preg_pattern_str(it, name, args)?;
             let flags = arg(args, 2).to_int();
-            let re = match php_regex(&pat) {
+            let re = match php_regex(it, &pat) {
                 Ok(r) => r,
                 Err(e) => {
                     regex_err(it, name, &e)?;
@@ -1135,7 +1135,10 @@ pub(in crate::builtins) struct PhpCap {
 /// Translate a PHP `/pat/flags` regex to a `PhpRe`. Err is the full
 /// warning text PHP emits (`Compilation failed: ...`, `Unknown
 /// modifier 'x'`, delimiter problems) — callers prefix `fname(): `.
-pub(in crate::builtins) fn php_regex(pat: &[u8]) -> Result<PhpRe, String> {
+pub(in crate::builtins) fn php_regex(it: &mut Interp, pat: &[u8]) -> Result<Rc<PhpRe>, String> {
+    if let Some(re) = it.pcre_patterns.get(pat) {
+        return Ok(re.clone());
+    }
     // PHP skips leading whitespace before the delimiter; a pattern of
     // only whitespace is the same "Empty regular expression" error.
     let ws = pat.iter().take_while(|c| c.is_ascii_whitespace()).count();
@@ -1252,13 +1255,21 @@ pub(in crate::builtins) fn php_regex(pat: &[u8]) -> Result<PhpRe, String> {
         }
     }
     let _ = (need_pcre, has_backref, pcre_only);
-    crate::pcre::compile(body, opts, extra_opts)
-        .map(PhpRe::Pcre)
-        .map_err(|e| format!("Compilation failed: {}", e))
+    let re = Rc::new(PhpRe::Pcre(
+        crate::pcre::compile(body, opts, extra_opts)
+            .map_err(|e| format!("Compilation failed: {}", e))?,
+    ));
+    // ponytail: at most 256 patterns per interpreter; clear on overflow.
+    // Match contexts/limits stay per invocation, including callback reentry.
+    if it.pcre_patterns.len() == 256 {
+        it.pcre_patterns.clear();
+    }
+    it.pcre_patterns.insert(pat.to_vec(), re.clone());
+    Ok(re)
 }
 
 /// A PHP pattern compiled by PCRE2 — PHP's own engine.
-pub(in crate::builtins) enum PhpRe {
+pub(crate) enum PhpRe {
     Pcre(crate::pcre::PcreRe),
 }
 
@@ -1347,5 +1358,37 @@ impl PhpRe {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pattern_cache_reuses_code_without_caching_errors_or_match_limits() {
+        let mut it = Interp::new("patterns.php");
+        let first = php_regex(&mut it, b"/a/i").unwrap();
+        assert!(Rc::ptr_eq(&first, &php_regex(&mut it, b"/a/i").unwrap()));
+        assert!(!Rc::ptr_eq(&first, &php_regex(&mut it, b"/a/").unwrap()));
+        assert!(php_regex(&mut it, b"/a\0/").is_ok());
+        let size = it.pcre_patterns.len();
+        for _ in 0..2 {
+            assert!(php_regex(&mut it, b"/[/").is_err());
+            assert_eq!(it.pcre_patterns.len(), size);
+        }
+        for i in 0..256 {
+            php_regex(&mut it, format!("/{i}/").as_bytes()).unwrap();
+            assert!(it.pcre_patterns.len() <= 256);
+        }
+        assert!(!Rc::ptr_eq(&first, &php_regex(&mut it, b"/a/i").unwrap()));
+        let re = php_regex(&mut it, b"/a/").unwrap();
+        it.ini.insert("pcre.backtrack_limit".into(), "0".into());
+        assert_eq!(re.caps(b"a", 0, false, None, &mut it).1, -47);
+        it.ini
+            .insert("pcre.backtrack_limit".into(), "1000000".into());
+        let (matches, err) = re.caps(b"a", 0, false, None, &mut it);
+        assert_eq!(err, 0);
+        assert_eq!(matches[0].spans[0], Some((0, 1)));
     }
 }

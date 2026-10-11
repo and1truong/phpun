@@ -23,7 +23,7 @@ mod json;
 mod math;
 mod mbstring;
 mod out;
-mod pcre;
+pub(crate) mod pcre;
 mod proc;
 mod spl;
 mod string;
