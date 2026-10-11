@@ -2055,3 +2055,43 @@ Candidate summary retained: {'total': 3406, 'passed': 2730, 'failed': 601, 'xfai
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/gc-pointer-tables-main-*.
+
+## #307: docs(perf): reject scalar-object GC snapshot guard after measurements (2026-10-11)
+
+Report-only: reject and ordinarily revert #307 scalar-only last-owner object snapshot guard. Actual objects allocator requests fell by only four; no useful ordinary object speed improvement. Preserve candidate source, frozen binary hash, negative measurements and gates.
+
+Final runtime restores the existing GC dying/property traversal, including resource/destructor/callback paths. No production scalar guard retained.
+
+Runtime 207dd613572a5c5fde1dafb7720bd84539c46542; timing source 207dd613572a5c5fde1dafb7720bd84539c46542; report/integration source 207dd613572a5c5fde1dafb7720bd84539c46542.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/40-objects.php | 148.367 | 148.627 | 1.0017 |
+| bench/40-objects.php 20 5000 | 583.609 | 607.759 | 1.0414 |
+| bench/20-strings.php | 57.973 | 57.119 | 0.9853 |
+| bench/20-strings.php 100 | 238.079 | 242.524 | 1.0187 |
+| bench/11-sieve.php | 63.524 | 66.246 | 1.0428 |
+| bench/30-arrays.php | 81.606 | 80.617 | 0.9879 |
+| bench/60-json.php | 535.174 | 533.550 | 0.9970 |
+| bench/10-fib.php | 8.357 | 9.147 | 1.0946 |
+| bench/app/cli.php 100 20 | 33.197 | 32.306 | 0.9732 |
+| examples/composer/run.php | 8.131 | 8.220 | 1.0109 |
+
+Seven pairs: default objects +0.2% (flat), long objects +4.1%, fib +9.5%. Only four allocator requests saved in default objects. Reject rather than retain a guard without demonstrated target benefit. Serialized bug77345 parent 8340ms and candidate 8221ms both pass; concurrent candidate timeout remains in full raw results.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+- objects5: requests 1633154→1633150; bytes 68355753→68355621.
+- scalarleaf: requests 32479→32477; bytes 6010970→6010902.
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+ONE existing GC fixture extended during candidate verification; removed with rejected guard. Native output checked. Serialized GC rechecks retained separately.
+All3406 raw results retain bug77345 pass→timeout and two known range crash/timeout swaps. Serialized10s bug77345 parent/candidate BOTH PASS (8340/8221ms); no new semantic fail. Candidate full summary2729pass601fail is not parity.
+Candidate summary retained: {'total': 3406, 'passed': 2729, 'failed': 601, 'xfailed': 0, 'xpassed': 0, 'skipped': 25, 'unsupported': 38, 'borked': 0, 'crashed': 6, 'timed_out': 7, 'applicable': 3343, 'compatibility_pct': 81.63};
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/gc-scalar-properties-*.
