@@ -1,0 +1,33 @@
+{
+  "runtime": "be0e8103d9eeac7dcfab65f82148a567e0737723",
+  "hash": "6780a3fe1a8e5cfea823849b335b06086fa53cc1f270b03e2f070dfb9e055442",
+  "review": {
+    "pr": 245,
+    "thread": "PRRT_kwDOU4oR3M6rKAA3",
+    "comment": 4240135045,
+    "fix": "Use e.bytes.len() for copy; rounded len only mapping/protection/unmapping."
+  },
+  "asan": {
+    "before": "e51382290a7c2f5d36f0241b9ccb8d99948d3b0d;clean core;READ4096heap-buffer-overflow;exit1",
+    "after": "1b6c12411b05bc8675656350c4c88f36308feb58;tree identical tobe0e810;clean core;existing native unit passes;exit0",
+    "command": "RUSTC_BOOTSTRAP=1 RUSTFLAGS=\"-Zsanitizer=address -Cforce-frame-pointers=yes\" ASAN_OPTIONS=detect_leaks=0 cargo test --offline --target x86_64-unknown-linux-gnu -p phpun-core native_integer_graph_executes_and_replays_guard_failures -- --nocapture",
+    "limitation": "Address-invalid-read check; leak detection disabled, JIT machine instructions are not ASan-instrumented. First cross-worktree attempt reused the fixed artifact and is excluded as stale-target; forced core clean before both actual before/after builds."
+  },
+  "gates": "workspace8core22runtime19format,fm/clippy;25 script+19 workload byte/exit/error PHP-n;VM-profile;full3406PHPT rerun",
+  "phpt_summary": {
+    "total": 3406,
+    "passed": 2727,
+    "failed": 603,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 25,
+    "unsupported": 38,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 7,
+    "applicable": 3343,
+    "compatibility_pct": 81.57
+  },
+  "phpt_changes": {},
+  "timing": "Latest speed evidence native-fixed-triple-timings.json; four earlier experimental datasets are pre-P1-fix and superseded, retained unchanged. Baseline remains receiver75e78c5; all final timing processes isolated, profilers off."
+}
