@@ -1743,3 +1743,52 @@ no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
 this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
 External CI not asserted green. No suite parity claim or multiplication of step gains.
 Raw/source/hashes in bench/data/92/parity/oct11/scalar-array-teardown-*.
+
+## #286: perf(memory): reuse parsed limits and retain reference constructor binding (2026-10-11)
+
+Reuse the existing raw-string-validated allocator memory-limit cache at statement boundaries and mutable resize checks. Keep every raw lookup/check/charge and INI invalidation. Fresh main integration also fixes #292: InitNew routes any by-ref ctor to canonical Expr::New before evaluating argv, retaining caller Cells.
+
+No skipped limit check, delayed INI change or changed OOM site/arena accounting. Missing raw limit remains -1. Existing arena check enforces a changed limit at the next boundary. Constructor fallback preserves original alias/type/error/autoload/visibility binding; existing vm_canonical_lifetimes fixture extends compiled-loop promoted refs.
+
+Runtime 81c0d5f7724960515402c66bb62e3a911000f472; timing source 8b1c8210830f08f7c4160b7f6a7da0c2463f5aed; report/integration source df67afdc76a19f0983c15956b37ebded3a7f6a37.
+
+Seven isolated alternating profiler-off nativePHP8.5.11 -n byte-gated pairs;
+cold CLI including startup/execution. Parent/candidate binary hashes and raw samples
+are in the timing JSON. OPcache loaded, enable_cli=0, JIT disabled.
+
+| argv | parent ms | candidate ms | candidate/parent |
+|---|---:|---:|---:|
+| bench/11-sieve.php | 76.372 | 71.357 | 0.9343 |
+| bench/11-sieve.php 10 100000 | 702.871 | 656.769 | 0.9344 |
+| bench/30-arrays.php | 84.428 | 84.129 | 0.9965 |
+| bench/60-json.php | 563.181 | 514.408 | 0.9134 |
+| bench/40-objects.php | 195.002 | 201.634 | 1.0340 |
+| bench/20-strings.php | 66.474 | 67.562 | 1.0164 |
+| bench/10-fib.php | 9.249 | 8.704 | 0.9411 |
+| bench/app/cli.php 100 20 | 35.953 | 35.258 | 0.9807 |
+| examples/composer/run.php | 8.409 | 8.622 | 1.0253 |
+
+Pre-main026 seven pairs sieve/default and10reps−6.6%,JSON−8.7%,arrays flat,objects+3.4%,strings+1.6%,Composer+2.5% retained. Original timing binary precedes main026 object lane and #292 correctness fix; final integrated head is separately rebuilt/gated, no old timing attributed to it. No whole-suite parity claim.
+
+Separate physical allocator requests/bytes (not speed runs):
+
+
+Workspace/fmt/clippy pass;25 script+19 workload byte gates and VM-profile pass.
+Original cache-only3406PHPT statuses identical parent. Final main026/#292 integration verification is appended separately with exact binary/source and intentional imported fail→pass cases; no claim that pre-integration raw belongs to final head.
+All3406individualPHPT compared; 0 known range crash/timeout swaps,
+no new fail/pass/skip. Existing2727pass603fail25skip38unsupported retained;
+this is not full compatibility. Explicit release core clean/rebuild/hash recorded.
+External CI not asserted green. No suite parity claim or multiplication of step gains.
+Raw/source/hashes in bench/data/92/parity/oct11/memory-limit-boundaries-*.
+
+### #286/#292 integration on main026f3e2
+
+Integrated runtime df67afdc76a19f0983c15956b37ebded3a7f6a37. Explicit release clean/rebuild; workspace/fmt/clippy,25script+19workload native byte gates,VM-profile pass. Reference constructor probe: native/fixed2,2,9; original merged #2891,2,1. Fix BEFORE argument evaluation retains canonical caller Cells for by-ref ctor params. Existing vm_canonical_lifetimes check extended, no new fixture.3406PHPT vs pre-main026 candidate:2729pass601fail25skip38unsupported6crash7timeout; only exception_005 and traits/error_007 improve fail→pass from imported main integration, no new failures. Do not attribute these improvements or old timings to the limit cache. Integrated source/hash/gates/maps under memory-limit-integrated-*; original timings stay memory-limit-boundaries-* with their own binary.
+
+## #294 review: restore root global lifetime/bindings (2026-10-11)
+
+Root NewCall and direct MethodCall release caller slot handles before dispatch and refresh canonical globals afterward, including errors, just as Op::Call does. The simple unset/value-write probe was already byte-correct; the reference-rebind probe reproduced native9 versus old2 for both dispatches. ONE existing vm_canonical_lifetimes fixture extends both paths; canonical local-frame calls remain unchanged. Reviewer threads PRRT_kwDOU4oR3M6rLzlh / PRRT_kwDOU4oR3M6rLzln.
+
+Runtime a25f25377261affa86d850b67e7929f39543f86c; binarySHA256 faac63b35b157fc6f26ed69bb7f080cd3967fcdc1a393a784d9b48373ed00d03. Workspace/fmt/clippy/clean release/25script+19workload+VM-profile and four extra probes pass. All3406PHPT compared:2729pass601fail, only range_bug71132 crash→timeout (known resource result), no new fail/pass/skip. Prior CI rust/phpt succeeded at539a156; this new head requires its own CI. Prior cache-only/per-stage timings do not time this global synchronization restoration. Fresh paired/whole-suite measurements will use this exact reviewed binary.
+
+#295 independently duplicates the by-ref ctor correction and adds handle backlog stamping; its separate epoch fix is not included here. No external-host figures mixed into this report. Raw reviewed artifacts in bench/data/92/parity/oct11/memory-limit-review-*.

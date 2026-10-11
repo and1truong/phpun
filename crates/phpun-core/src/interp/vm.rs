@@ -259,6 +259,20 @@ enum Op {
         cache: std::cell::RefCell<Option<CachedMethod>>,
         fallback: Box<Expr>,
     },
+    /// `new X(...)` — class resolves at INIT (zend's order: before arg
+    /// side effects). Missing entries fall back to the canonical
+    /// `Expr::New` (autoload + not-found errors verbatim).
+    InitNew {
+        call: usize,
+        name: Rc<str>,
+        fallback: Box<Expr>,
+    },
+    NewCall {
+        lname: Rc<str>,
+        argc: u16,
+        site: usize,
+        cache: std::cell::RefCell<Option<CachedMethod>>,
+    },
     /// Statement boundary: decref the temps this statement left in
     /// expr_temps — the AST's Stmt::Expr-end sweep, which object
     /// dtors time against.
@@ -287,6 +301,9 @@ struct CachedMethod {
 
 /// Class-stable pieces of a direct method target — everything except
 /// the receiver itself and per-call context guards.
+/// `Op::InitNew` resolution product: class + its found ctor.
+type NewTarget = (Rc<PhpClass>, Option<(Rc<MethodDecl>, Rc<PhpClass>)>);
+
 #[derive(Clone)]
 struct MSiteCore {
     m: Rc<MethodDecl>,
@@ -1254,6 +1271,39 @@ impl Compiler {
                     *at = call;
                 }
             }
+            Expr::New { class, args, site }
+                if matches!(Interp::unmark_rhs(class), Expr::Const(n)
+                    if !(n.eq_ignore_ascii_case("self")
+                        || n.eq_ignore_ascii_case("parent")
+                        || n.eq_ignore_ascii_case("static")))
+                    && args.iter().all(|a| {
+                        !matches!(
+                            Interp::unmark_arg(a),
+                            Expr::Unpack(_) | Expr::Binary { op: "named", .. }
+                        )
+                    }) =>
+            {
+                let Expr::Const(cname) = Interp::unmark_rhs(class) else {
+                    unreachable!()
+                };
+                let init = self.emit(Op::InitNew {
+                    call: usize::MAX,
+                    name: Rc::from(cname.as_str()),
+                    fallback: Box::new(e.clone()),
+                });
+                for a in args {
+                    self.expr(Interp::unmark_arg(a))?;
+                }
+                let call = self.emit(Op::NewCall {
+                    lname: Rc::from(cname.to_lowercase().as_str()),
+                    argc: args.len() as u16,
+                    site: *site,
+                    cache: std::cell::RefCell::new(None),
+                });
+                if let Op::InitNew { call: at, .. } = &mut self.ops[init] {
+                    *at = call;
+                }
+            }
             Expr::Prop {
                 obj,
                 name: crate::ast::PropName::Name(name),
@@ -1305,7 +1355,6 @@ impl Compiler {
             | Expr::ClassConst { .. }
             | Expr::ClassConstDyn { .. }
             | Expr::Closure(_)
-            | Expr::New { .. }
             | Expr::Interp(_)
             | Expr::Cast { .. }
             | Expr::Const(_)
@@ -1615,16 +1664,41 @@ impl<'a> Interp<'a> {
         let __p = pnow!();
         let r = (|| {
             if decl.params.iter().any(|p| p.promoted) {
-                // Publish arguments before stores: a set hook can inspect this
-                // constructor's live args/locals or raise an exception.
-                self.vm_materialize(comp, &mut slots);
-                if let Some(obj) = self.cur().this_obj.clone() {
-                    for p in decl.params.iter().filter(|p| p.promoted) {
-                        let value = self.cur().vars[&p.name].borrow().clone();
-                        self.store_prop(Value::Object(obj.clone()), &p.name, value)?;
+                let obj = self.cur().this_obj.clone();
+                // A set hook can inspect this constructor's live
+                // args/locals — only a hooked promote pays materialize.
+                let hooked = obj.as_ref().is_some_and(|o| {
+                    decl.params
+                        .iter()
+                        .filter(|p| p.promoted)
+                        .any(|p| p.hooks.is_some() || self.hooked_prop(o, &p.name).is_some())
+                });
+                if hooked {
+                    self.vm_materialize(comp, &mut slots);
+                    if let Some(obj) = &obj {
+                        for p in decl.params.iter().filter(|p| p.promoted) {
+                            let value = self.cur().vars[&p.name].borrow().clone();
+                            self.store_prop(Value::Object(obj.clone()), &p.name, value)?;
+                        }
+                    }
+                    self.vm_refresh(comp, &mut slots);
+                } else if let Some(obj) = &obj {
+                    // No observer — publish straight from the bound
+                    // slots through the promoted fast path.
+                    let dc = self.cur().decl_class.clone();
+                    for (i, p) in decl.params.iter().enumerate() {
+                        if !p.promoted {
+                            continue;
+                        }
+                        let value = match &slots[i] {
+                            Slot::C(c) => c.borrow().clone(),
+                            Slot::V(v) => v.clone(),
+                            Slot::Arg(a) => self.cur().value_args[*a as usize].clone(),
+                            Slot::Uninit => Value::Null,
+                        };
+                        self.promoted_prop_write(obj, dc.as_ref(), &p.name, value)?;
                     }
                 }
-                self.vm_refresh(comp, &mut slots);
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             if let Some(value) = if self.cur().this_obj.is_none() && self.cur().closure_rc.is_none()
@@ -1659,7 +1733,11 @@ impl<'a> Interp<'a> {
         self.trace_pop();
         self.cur_line = saved.line;
         self.send_line = Some(saved.line);
-        let sweep_err = self.sweep_expr_temps(temps_base).err();
+        let keep = match &r {
+            Ok(Value::Object(o)) => Some(Rc::as_ptr(o) as usize),
+            _ => None,
+        };
+        let sweep_err = self.sweep_expr_temps_ret(temps_base, keep).err();
         let out = if let Some(mut f) = self.last_popped_frame.take() {
             // Slot-held objects die with the frame too — a call-returned
             // object stored in a local decrefs here like a CV decref.
@@ -1972,6 +2050,7 @@ impl<'a> Interp<'a> {
         targets: &mut Vec<CachedFn>,
     ) -> Result<Flow, PhpError> {
         let mut mtargets: Vec<Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)>> = Vec::new();
+        let mut ntargets: Vec<NewTarget> = Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
@@ -2419,6 +2498,62 @@ impl<'a> Interp<'a> {
                         continue;
                     }
                 }
+                Op::InitNew {
+                    call: at,
+                    name,
+                    fallback,
+                } => {
+                    let target = crate::interp::util::lkey_get(&self.classes, name)
+                        .cloned()
+                        .and_then(|cls| {
+                            let ctor = self.find_method_in(&cls, "__construct");
+                            if ctor
+                                .as_ref()
+                                .is_some_and(|(m, _)| m.decl.params.iter().any(|p| p.by_ref))
+                            {
+                                return None;
+                            }
+                            Some((cls, ctor))
+                        });
+                    match target {
+                        Some(target) => ntargets.push(target),
+                        None => {
+                            // Autoload, missing classes and by-ref ctor arguments
+                            // retain the canonical binder and caller Cells.
+                            self.vm_materialize(comp, slots);
+                            let r = self.eval(fallback);
+                            self.vm_refresh(comp, slots);
+                            vs.push(r?);
+                            pc = *at + 1;
+                            continue;
+                        }
+                    }
+                }
+                Op::NewCall {
+                    lname,
+                    argc,
+                    site,
+                    cache,
+                } => {
+                    let n = *argc as usize;
+                    self.send_line = Some(*site);
+                    let (cls, ctor) = ntargets.pop().expect("InitNew resolved this new");
+                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+                    argv.extend(vs.drain(vs.len() - n..));
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
+                    let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
+                    let v = result?;
+                    argv.clear();
+                    if self.vm_val_pool.len() < 64 {
+                        self.vm_val_pool.push(argv);
+                    }
+                    vs.push(v);
+                }
                 Op::MethodCall {
                     name, argc, site, ..
                 } => {
@@ -2429,6 +2564,9 @@ impl<'a> Interp<'a> {
                     };
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
+                    // A direct callee can rebind globals or release their
+                    // last PHP owner. Drop stale caller slot handles before
+                    // dispatch and reload the canonical bindings afterward.
                     if comp.top_level {
                         self.vm_materialize(comp, slots);
                     }
@@ -3150,6 +3288,82 @@ impl<'a> Interp<'a> {
     }
 
     /// Execute the target chosen before argument evaluation.
+    /// `new X(...)` with the class entry and ctor already resolved at
+    /// InitNew — runs new_instance's post-resolution sequence verbatim,
+    /// then routes the ctor through the same direct/canonical split a
+    /// `->m()` call takes (ctorless classes just drop the args).
+    fn vm_new_run(
+        &mut self,
+        cls: &Rc<PhpClass>,
+        lname: &Rc<str>,
+        ctor: Option<(Rc<MethodDecl>, Rc<PhpClass>)>,
+        argv: &mut Vec<Value>,
+        cache: &std::cell::RefCell<Option<CachedMethod>>,
+        site: usize,
+    ) -> Result<Value, PhpError> {
+        if cls.name().eq_ignore_ascii_case("closure") {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Instantiation of class Closure is not allowed",
+                0,
+            ));
+        }
+        if cls.name().eq_ignore_ascii_case("weakreference") {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Direct instantiation of WeakReference is not allowed, use WeakReference::create instead",
+                0,
+            ));
+        }
+        let kerr = |what: &str| {
+            PhpError::uncaught(
+                "Error",
+                format!("Cannot instantiate {} {}", what, cls.name()),
+                0,
+            )
+        };
+        match cls.decl.kind {
+            crate::ast::ClassKind::Trait => return self.fail(kerr("trait")),
+            crate::ast::ClassKind::Interface => return self.fail(kerr("interface")),
+            crate::ast::ClassKind::Enum => return self.fail(kerr("enum")),
+            _ => {}
+        }
+        if cls.decl.is_abstract {
+            return self.fail(kerr("abstract class"));
+        }
+        self.link_const_inits(cls)?;
+        let obj = self.instantiate(lname, &[])?;
+        if let Value::Object(o) = &obj {
+            let r = if let Some((m, dc)) = ctor {
+                // Same guards a `$o->m()` hit runs — private-ctor
+                // visibility and __call routing keep canonical errors.
+                match self.vm_method_target(o.clone(), "__construct", cache, site) {
+                    Some((o2, core)) => {
+                        self.vm_run_method_direct(&core, argv, o2, "__construct", site)
+                    }
+                    None => {
+                        let mut args = super::CallArgs::empty();
+                        args.cells = argv.drain(..).map(cell).collect();
+                        self.method_invoke_vis(o.clone(), "__construct", args, Some((m, dc)))
+                    }
+                }
+            } else {
+                // Ctorless class silently ignores the arg list.
+                Ok(Value::Null)
+            };
+            if let Err(e) = r {
+                // A ctor that throws leaves a half-built object;
+                // zend never runs its __destruct (bug29368_1/_3).
+                self.mark_destructed(o);
+                return Err(e);
+            }
+        }
+        if let Value::Object(o) = &obj {
+            self.expr_temps.push(o.clone());
+        }
+        Ok(obj)
+    }
+
     /// Resolve a `$cv->m` site to its direct target: receiver must be
     /// an object whose resolved method is a userland, compiled,
     /// value-callable decl. Per-call context guards (scope-private
@@ -3158,7 +3372,7 @@ impl<'a> Interp<'a> {
     fn vm_method_target(
         &mut self,
         o: Rc<std::cell::RefCell<PhpObject>>,
-        name: &Rc<str>,
+        name: &str,
         cache: &std::cell::RefCell<Option<CachedMethod>>,
         _site: usize,
     ) -> Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)> {
@@ -3216,7 +3430,7 @@ impl<'a> Interp<'a> {
         core: &MSiteCore,
         argv: &mut Vec<Value>,
         this_obj: Rc<std::cell::RefCell<PhpObject>>,
-        name: &Rc<str>,
+        name: &str,
         site: usize,
     ) -> Result<Value, PhpError> {
         let __p = pnow!();
@@ -4133,6 +4347,14 @@ unset($e); unset($h); var_dump($wh->get());
 
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
+        {
+            let mut limits = Interp::new("limit.php");
+            limits.ini.insert("memory_limit".into(), "128M".into());
+            assert!(limits.statement_boundary().is_none());
+            limits.ini.insert("memory_limit".into(), "1K".into());
+            assert!(limits.statement_boundary().is_some());
+            assert!(limits.mem_exceeded);
+        }
         let mut it = Interp::new("arena.php");
         let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let frame = it.frame_new("direct");

@@ -168,7 +168,7 @@ impl<'a> Interp<'a> {
         // growth since the last boundary reconciles into the
         // sim here — ob bytes are why the walk exists.
         self.ob_meter_sync();
-        let lim = self.ini_bytes("memory_limit");
+        let lim = self.memory_limit_bytes();
         crate::value::mem_set_arena_lim(lim);
         // lim > 0: zend refuses memory_limit=0 at ini_set, and a
         // limit of -1 (unlimited) can never trip.

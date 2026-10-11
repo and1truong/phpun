@@ -899,6 +899,8 @@ pub struct Interp<'a> {
     /// Freed handle slots in death order (Zend's LIFO free list) —
     /// `mark_obj_died` pushes, `push_handle` pops the freshest.
     dead_slots: Vec<usize>,
+    /// Last HANDLE_DROPS epoch the tail scan ran at — see push_handle.
+    handle_scan_drops: u64,
     /// Weak registry of arrays that gained a reference (`=&`) element
     /// — only those can join a cycle, so the GC pass scans just them
     /// (Zend roots every refcounted array, this is the cheap subset
@@ -1946,6 +1948,7 @@ impl<'a> Interp<'a> {
             obj_born: Vec::new(),
             obj_died: Vec::new(),
             dead_slots: Vec::new(),
+            handle_scan_drops: 0,
             arr_handles: Vec::new(),
             gc_pending: 0,
             gc_collecting: false,
@@ -1985,7 +1988,7 @@ impl<'a> Interp<'a> {
             assert_src: String::new(),
             mem_used: MM_BASE_USED,
             mem_last: 0,
-            mem_limit_ck: (0, None),
+            mem_limit_ck: (-1, None),
             mem_exceeded: false,
             oom_at: None,
             // zend_mm_init commits the first 2MB chunk eagerly.
@@ -3124,12 +3127,23 @@ impl<'a> Interp<'a> {
     /// nested statement's unwind must not free an outer statement's
     /// live temps (bug29368_3).
     fn sweep_expr_temps(&mut self, base: usize) -> Result<(), PhpError> {
+        self.sweep_expr_temps_ret(base, None)
+    }
+
+    /// `keep` = a value the caller is about to receive (this frame's
+    /// return): its temp must outlive this teardown — the enclosing
+    /// statement's discard check finds it by pointer in expr_temps.
+    /// Other survivors already have real owners and drop as before.
+    fn sweep_expr_temps_ret(&mut self, base: usize, keep: Option<usize>) -> Result<(), PhpError> {
         if self.expr_temps.len() == base {
             return Ok(());
         }
         let temps = self.expr_temps.split_off(base);
         for o in temps {
             if Rc::strong_count(&o) != 1 {
+                if keep.is_some_and(|k| Rc::as_ptr(&o) as usize == k) && Rc::strong_count(&o) == 2 {
+                    self.expr_temps.push(o);
+                }
                 continue;
             }
             let key = Rc::as_ptr(&o) as usize;
@@ -4013,6 +4027,15 @@ impl<'a> Interp<'a> {
         self.oom_at.is_some()
     }
 
+    fn memory_limit_bytes(&mut self) -> i64 {
+        let raw = self.ini.get("memory_limit").map(String::as_str);
+        if raw != self.mem_limit_ck.1.as_deref() {
+            let v = self.ini_bytes("memory_limit");
+            self.mem_limit_ck = (v, raw.map(str::to_string));
+        }
+        self.mem_limit_ck.0
+    }
+
     /// zend's memory_limit check runs inside the allocator where a
     /// request forces newly committed memory: a huge alloc needs its
     /// own segment (real_size + aligned request vs limit), anything
@@ -4027,12 +4050,7 @@ impl<'a> Interp<'a> {
     /// reusable runs, so fragmented heaps can trip a bit earlier.
     /// PR #88 owns the canonical page-level model.
     pub(crate) fn mem_check(&mut self, req: u64) -> Option<u64> {
-        let raw = self.ini.get("memory_limit").map(String::as_str);
-        if raw != self.mem_limit_ck.1.as_deref() {
-            let v = self.ini_bytes("memory_limit");
-            self.mem_limit_ck = (v, raw.map(str::to_string));
-        }
-        let limit = self.mem_limit_ck.0;
+        let limit = self.memory_limit_bytes();
         if limit <= 0 {
             return None;
         }
@@ -4749,7 +4767,7 @@ impl<'a> Interp<'a> {
                 let cap = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0)
                     + self.seg_above(key);
                 let reloc = fp > cap;
-                let limit = self.ini_bytes("memory_limit");
+                let limit = self.memory_limit_bytes();
                 let over = |s: &Self| -> bool {
                     if limit <= 0 {
                         return false;
