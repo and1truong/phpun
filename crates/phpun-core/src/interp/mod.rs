@@ -7806,6 +7806,12 @@ impl<'a> Interp<'a> {
             && !crate::value::cmp_notices_pending()
             && !self.mem_exceeded
             && self.oom_at.is_none()
+            && args.vm_sites.iter().all(|site| {
+                self.mem_tracked
+                    .get(&(Rc::as_ptr(site) as usize))
+                    .and_then(|charge| charge.vm)
+                    .is_some_and(|(_, _, own)| own == 0)
+            })
         {
             let mut values = [Value::Null, Value::Null, Value::Null];
             for (value, cell) in values.iter_mut().zip(&args.cells) {
