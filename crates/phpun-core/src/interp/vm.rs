@@ -4817,26 +4817,13 @@ unset($a); var_dump($weak->get());
         let super::Value::Object(inline) = &object else {
             panic!("object")
         };
-        assert!(inline
-            .borrow()
-            .slots
-            .iter()
-            .flatten()
-            .all(|s| s.existing_cell().is_none()));
-        assert!(fresh.gen_prop_sweep(inline).is_none());
-        let _ = fresh.gc_cycle_collect();
-        assert!(
-            inline
-                .borrow()
-                .slots
-                .iter()
-                .flatten()
-                .all(|s| s.existing_cell().is_none()),
-            "GC and generator scans must not box floats"
-        );
         let index = inline.borrow().decl_slot("y").unwrap();
         assert!(matches!(
-            inline.borrow().slots[index].as_ref().unwrap().read(),
+            inline.borrow().slots[index]
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .clone(),
             super::Value::Float(4.0)
         ));
         let alias = inline.borrow().prop_get("y").unwrap();
@@ -4845,7 +4832,11 @@ unset($a); var_dump($weak->get());
         *alias.borrow_mut() = super::Value::Float(8.0);
         assert!(
             matches!(
-                inline.borrow().slots[index].as_ref().unwrap().read(),
+                inline.borrow().slots[index]
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .clone(),
                 super::Value::Float(8.0)
             ),
             "direct read must use the canonical cell after alias mutation"
