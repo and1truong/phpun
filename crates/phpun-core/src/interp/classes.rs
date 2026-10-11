@@ -3703,7 +3703,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn new_instance(
         &mut self,
         name: &str,
-        args: CallArgs,
+        mut args: CallArgs,
     ) -> Result<Value, PhpError> {
         let lname = name.to_lowercase();
         if !self.classes.contains_key(&lname) {
@@ -3864,6 +3864,7 @@ impl<'a> Interp<'a> {
                             .prop_insert(&fp.key, cell(Value::Float(value)));
                     }
                     self.vm_frame_free(&args.vm_sites);
+                    self.vm_recycle_scalar_cells(args.cells.drain(..));
                     self.last_call_by_ref = false;
                 } else if let Err(e) =
                     self.method_invoke_vis(o.clone(), "__construct", args, Some((m, dc)))

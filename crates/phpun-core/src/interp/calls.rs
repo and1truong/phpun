@@ -862,11 +862,11 @@ impl<'a> Interp<'a> {
             } else {
                 let v = self.eval(expr)?;
                 if let Some(n) = name {
-                    out.named.push((n, cell(v), false, false));
+                    out.named.push((n, self.vm_scalar_arg(v), false, false));
                     seen_named = true;
                 } else {
                     crate::interp::util::alloc_hit(6);
-                    out.cells.push(cell(v));
+                    out.cells.push(self.vm_scalar_arg(v));
                     pos += 1;
                 }
             }

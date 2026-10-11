@@ -1828,21 +1828,7 @@ impl<'a> Interp<'a> {
             f.scope_class = None;
             f.called_class = None;
             f.decl_class = None;
-            for c in fa.drain(..) {
-                // Only uniquely owned, untracked scalar cells can be reused.
-                // Trace snapshots, references and captures keep their cells.
-                if self.vm_scalar_cell_pool.len() < 256
-                    && Rc::strong_count(&c) == 1
-                    && Rc::weak_count(&c) == 0
-                    && matches!(
-                        &*c.borrow(),
-                        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
-                    )
-                {
-                    *c.borrow_mut() = Value::Null;
-                    self.vm_scalar_cell_pool.push(c);
-                }
-            }
+            self.vm_recycle_scalar_cells(fa.drain(..));
             if self.vm_cell_pool.len() < 64 {
                 self.vm_cell_pool.push(fa);
             }
@@ -3267,20 +3253,43 @@ impl<'a> Interp<'a> {
 
     /// Cells for args taking the canonical bind path — scalar cells come
     /// from the recycle pool like the value-ABI teardown fills it.
+    pub(in crate::interp) fn vm_scalar_arg(&mut self, value: Value) -> Cell {
+        if matches!(
+            value,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+        ) {
+            if let Some(c) = self.vm_scalar_cell_pool.pop() {
+                *c.borrow_mut() = value;
+                return c;
+            }
+        }
+        cell(value)
+    }
+
+    // ponytail: retain at most256 scalar cells; raise this existing pool cap
+    // only if allocation profiles show larger live argument sets churn it.
+    pub(in crate::interp) fn vm_recycle_scalar_cells(&mut self, cells: impl Iterator<Item = Cell>) {
+        for c in cells {
+            // Same existing VM pool: owners, references, weak anchors and
+            // trace/capture snapshots keep their identities outside it.
+            if self.vm_scalar_cell_pool.len() < 256
+                && Rc::strong_count(&c) == 1
+                && Rc::weak_count(&c) == 0
+                && matches!(
+                    &*c.borrow(),
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                )
+            {
+                *c.borrow_mut() = Value::Null;
+                self.vm_scalar_cell_pool.push(c);
+            }
+        }
+    }
+
+    /// Cells for args taking the canonical bind path, using the same scalar pool.
     fn vm_arg_cells(&mut self, argv: &mut Vec<Value>) -> Vec<Cell> {
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
-        cells.extend(argv.drain(..).map(|value| {
-            if matches!(
-                value,
-                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
-            ) {
-                if let Some(c) = self.vm_scalar_cell_pool.pop() {
-                    *c.borrow_mut() = value;
-                    return c;
-                }
-            }
-            cell(value)
-        }));
+        cells.extend(argv.drain(..).map(|value| self.vm_scalar_arg(value)));
         cells
     }
 
@@ -4781,9 +4790,76 @@ unset($a); var_dump($weak->get());
             super::cell(super::Value::Int(3)),
             super::cell(super::Value::Float(4.0)),
         ]);
+        let argument_ids: Vec<_> = args.cells.iter().map(super::Rc::as_ptr).collect();
         fresh.vm_call_reserve(&mut args, 2);
         let before: Vec<_> = fresh.vm_stack.iter().map(|s| (s.size, s.used)).collect();
         let object = fresh.new_instance("FreshFloat", args).unwrap();
+        assert_eq!(fresh.vm_scalar_cell_pool.len(), 2);
+        assert!(fresh
+            .vm_scalar_cell_pool
+            .iter()
+            .all(|c| argument_ids.contains(&super::Rc::as_ptr(c))));
+        let reused = fresh.vm_scalar_arg(super::Value::Int(11));
+        assert!(argument_ids.contains(&super::Rc::as_ptr(&reused)));
+        assert!(matches!(*reused.borrow(), super::Value::Int(11)));
+        let weak = super::Rc::downgrade(&reused);
+        fresh.vm_recycle_scalar_cells(std::iter::once(reused));
+        assert!(
+            weak.upgrade().is_none(),
+            "weak-address observers must prevent recycling"
+        );
+        let shared = fresh.vm_scalar_arg(super::Value::Int(12));
+        let retained = shared.clone();
+        fresh.vm_recycle_scalar_cells(std::iter::once(shared));
+        assert_eq!(super::Rc::strong_count(&retained), 1);
+        assert!(matches!(*retained.borrow(), super::Value::Int(12)));
+
+        let super::Value::Object(inline) = &object else {
+            panic!("object")
+        };
+        assert!(inline
+            .borrow()
+            .slots
+            .iter()
+            .flatten()
+            .all(|s| s.existing_cell().is_none()));
+        assert!(fresh.gen_prop_sweep(inline).is_none());
+        let _ = fresh.gc_cycle_collect();
+        assert!(
+            inline
+                .borrow()
+                .slots
+                .iter()
+                .flatten()
+                .all(|s| s.existing_cell().is_none()),
+            "GC and generator scans must not box floats"
+        );
+        let index = inline.borrow().decl_slot("y").unwrap();
+        assert!(matches!(
+            inline.borrow().slots[index].as_ref().unwrap().read(),
+            super::Value::Float(4.0)
+        ));
+        let alias = inline.borrow().prop_get("y").unwrap();
+        let canonical = inline.borrow().prop_get("y").unwrap();
+        assert!(super::Rc::ptr_eq(&alias, &canonical));
+        *alias.borrow_mut() = super::Value::Float(8.0);
+        assert!(
+            matches!(
+                inline.borrow().slots[index].as_ref().unwrap().read(),
+                super::Value::Float(8.0)
+            ),
+            "direct read must use the canonical cell after alias mutation"
+        );
+        let super::Value::Object(copy) = fresh.clone_object(inline).unwrap() else {
+            panic!("clone")
+        };
+        let copied = copy.borrow().prop_get("y").unwrap();
+        assert!(!super::Rc::ptr_eq(&copied, &alias));
+        *copied.borrow_mut() = super::Value::Float(9.0);
+        assert!(matches!(*alias.borrow(), super::Value::Float(8.0)));
+        assert!(copy.borrow_mut().prop_take("y").is_some());
+        assert!(!copy.borrow().prop_has("y"));
+
         assert!(
             fresh.vm_frame_pool.is_empty(),
             "fresh float promotions bypass canonical frames"
