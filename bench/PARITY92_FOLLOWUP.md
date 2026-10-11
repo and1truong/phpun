@@ -3363,3 +3363,5 @@ Retirement: ordinary revert c4d90c2 restores all crates byte-identical #365/#363
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
 
 Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
+
+Timing artifact review: each byte-identical primary timing/followup alias now has one canonical *-timings.json. Distinct follow-up cohorts remain. Original bytes verified by SHA256; historical issue-body archive is unchanged. Runtime source unchanged.
