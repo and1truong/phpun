@@ -3942,6 +3942,14 @@ impl<'a> Interp<'a> {
             let c = &fp.declaring;
             let p = &c.decl.props[fp.prop_idx];
             let mut default = match &p.default {
+                // Literal scalars: the const-eval can neither fail nor
+                // observe the ctx save/restore — take the value
+                // directly and skip the machinery per `new`.
+                Some(Expr::Null) => Value::Null,
+                Some(Expr::Bool(b)) => Value::Bool(*b),
+                Some(Expr::Int(n)) => Value::Int(*n),
+                Some(Expr::Float(f)) => Value::Float(*f),
+                Some(Expr::Str(s)) => Value::str(s.clone()),
                 Some(d) => {
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
