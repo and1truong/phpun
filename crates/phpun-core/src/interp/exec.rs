@@ -1315,6 +1315,22 @@ impl<'a> Interp<'a> {
                 Err(e) => return self.err_flow(e),
             }
         };
+        self.exec_foreach_val(src, arr, key, val, body, iter_site, stmt_line)
+    }
+
+    /// The match-on-source half of `exec_foreach_with`, split so the
+    /// `Op::FeInit` replay can feed an already-evaluated `src`.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::interp) fn exec_foreach_val(
+        &mut self,
+        src: Value,
+        arr: &Expr,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &mut dyn FnMut(&mut Self) -> Flow,
+        iter_site: usize,
+        stmt_line: usize,
+    ) -> Flow {
         match src {
             Value::Array(rc) => {
                 // `foreach ($arr as [&$p, $q])` iterates by reference
@@ -1813,6 +1829,33 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
+        }
+    }
+
+    /// `Op::FeInit` non-array replay: the compiled expr already
+    /// evaluated the source — run the canonical foreach over that
+    /// value (a re-eval would replay its diagnostics).
+    pub(in crate::interp) fn fe_replay(&mut self, src: Value, s: &Stmt) -> Flow {
+        if let Stmt::Foreach {
+            arr,
+            key,
+            val,
+            body,
+            ..
+        } = s
+        {
+            let line = self.cur_line;
+            self.exec_foreach_val(
+                src,
+                arr,
+                key,
+                val,
+                &mut |i| i.exec_loop_body(body),
+                line,
+                line,
+            )
+        } else {
+            Flow::Normal
         }
     }
 

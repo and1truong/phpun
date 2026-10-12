@@ -284,19 +284,15 @@ enum Op {
         target: usize,
     },
     /// `foreach ($arr as $k => $v)` inlined into the surrounding
-    /// Compiled: FeInit binds the source once — a cursor over the live
-    /// table when it cannot be written (sole owner and no body
-    /// assignment), else the value-foreach snapshot — and FeNext
-    /// advances the cursor, writing the target slots; the body ops
-    /// run inline like zend's FE_FETCH_R pair. Non-array sources
-    /// replay the canonical statement verbatim.
+    /// Compiled: FeInit consumes the evaluated source once and, for
+    /// arrays, binds the value-foreach snapshot — FeNext then advances
+    /// it, writing the target slots; the body ops run inline like
+    /// zend's FE_FETCH_R pair. Non-array sources replay the canonical
+    /// foreach on that value.
     FeInit {
-        /// slot in the exec-local cursor vec — per-execution state so
-        /// reentrant runs of this Compiled can't collide.
+        /// slot in the exec-local snapshot vec — per-execution state
+        /// so reentrant runs of this Compiled can't collide.
         idx: u16,
-        /// compile verdict: the source var is written inside the body,
-        /// so iteration must ride a snapshot of the bound table.
-        needs_snap: bool,
         fallback: Box<Stmt>,
         depth: u32,
         /// op index of the FeNext — the bound path jumps here.
@@ -410,26 +406,6 @@ struct CachedMethod {
 struct AppendSnap {
     pre: DimPre,
     outer: Option<(Value, PhpError, bool, bool)>,
-}
-
-/// Live iteration state for an inline foreach — lives in the
-/// exec-local vec the FeInit/FeNext pair indexes, so recursion into
-/// the same Compiled gets its own.
-enum FeCursor {
-    Unused,
-    /// Sole-owned unwritten table — cursor over the live entries,
-    /// `n` frozen at bind (tomb-skip tolerates pre-existing holes).
-    Cursor {
-        arr: Rc<std::cell::RefCell<PhpArray>>,
-        i: usize,
-        n: usize,
-    },
-    /// Snapshot of (key, cell) pairs — the canonical value-foreach
-    /// isolation for shared or body-written tables.
-    Snap {
-        items: Vec<(crate::value::ArrKey, Cell)>,
-        i: usize,
-    },
 }
 
 /// Class-stable pieces of a direct method target — everything except
@@ -922,25 +898,21 @@ impl Compiler {
                 // The fallback replays the source expr — only side-effect-
                 // free sources may be bound twice: a Var read, or an
                 // ArrayLit (which can never reach the replay anyway).
-            } && matches!(Interp::unmark_rhs(arr), Expr::Var(_) | Expr::ArrayLit(_))
+                // The replay path consumes the value the emitted
+                // expr left on the stack — a Var read is the only
+                // side-effect-free source that can be bound before
+                // knowing its kind. Literals keep the canonical op:
+                // object elements inside need the canonical dtor
+                // timing, and every eval'd Var lands strong_count > 1
+                // anyway (the var's own cell) so only the snapshot
+                // arm would ever run for them.
+            } && matches!(Interp::unmark_rhs(arr), Expr::Var(_))
             {
                 self.expr(arr)?;
                 let idx = self.fe_count;
                 self.fe_count += 1;
-                // A body write to the source var must ride a snapshot
-                // (zend separates on write); an unwritten sole-owned
-                // table gets a plain cursor.
-                let needs_snap = match Interp::unmark_rhs(arr) {
-                    Expr::Var(n) => {
-                        let mut w = std::collections::HashSet::new();
-                        collect_assigned(body, &mut w);
-                        w.contains(n)
-                    }
-                    _ => false,
-                };
                 let at = self.emit(Op::FeInit {
                     idx,
-                    needs_snap,
                     fallback: Box::new(Stmt::Foreach {
                         arr: arr.clone(),
                         key: key.clone(),
@@ -2530,9 +2502,12 @@ impl<'a> Interp<'a> {
         let mut mtargets: Vec<Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)>> = Vec::new();
         let mut ntargets: Vec<NewTarget> = Vec::new();
         let mut app_snaps: Vec<AppendSnap> = Vec::new();
-        // Inline-foreach cursors — indexed by the FeInit/FeNext pair,
-        // exec-local so recursion into this Compiled can't collide.
-        let mut fe_states: Vec<FeCursor> = Vec::new();
+        // Inline-foreach snapshots — indexed by the FeInit/FeNext
+        // pair, exec-local so recursion into this Compiled can't
+        // collide. Consuming the into_iter per element mirrors the
+        // canonical loop's per-iteration cell drop (dtor timing).
+        let mut fe_states: Vec<Option<std::vec::IntoIter<(crate::value::ArrKey, Cell)>>> =
+            Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
@@ -2554,7 +2529,6 @@ impl<'a> Interp<'a> {
                 Op::Const(v) => vs.push(v.clone()),
                 Op::FeInit {
                     idx,
-                    needs_snap,
                     fallback,
                     depth,
                     fetch,
@@ -2565,30 +2539,20 @@ impl<'a> Interp<'a> {
                     let src = vs.pop().unwrap_or(Value::Null);
                     if let Value::Array(rc) = &src {
                         if fe_states.len() <= *idx as usize {
-                            fe_states.resize_with(*idx as usize + 1, || FeCursor::Unused);
+                            fe_states.resize_with(*idx as usize + 1, || None);
                         }
-                        fe_states[*idx as usize] =
-                            if *needs_snap || Rc::strong_count(rc) > 1 || rc.borrow().is_ref {
-                                FeCursor::Snap {
-                                    items: self.fe_snapshot(rc),
-                                    i: 0,
-                                }
-                            } else {
-                                FeCursor::Cursor {
-                                    arr: rc.clone(),
-                                    i: 0,
-                                    n: rc.borrow().entries.len(),
-                                }
-                            };
+                        fe_states[*idx as usize] = Some(self.fe_snapshot(rc).into_iter());
                         pc = *fetch;
                     } else {
                         // Traversable/scalar sources replay the
-                        // canonical statement — zend's FE_RESET splits
-                        // iterable kinds the same way.
+                        // canonical foreach on the evaluated value —
+                        // zend's FE_RESET splits iterable kinds the
+                        // same way, and the one eval keeps diagnostics
+                        // single.
                         self.vm_materialize(comp, slots);
                         let previous_depth =
                             std::mem::replace(&mut self.loop_depth, base_depth + depth);
-                        let flow = self.exec_at(fallback, None);
+                        let flow = self.fe_replay(src, fallback);
                         self.loop_depth = previous_depth;
                         self.vm_refresh(comp, slots);
                         pc = match flow {
@@ -2616,33 +2580,10 @@ impl<'a> Interp<'a> {
                     kslot,
                     end,
                 } => {
-                    let next = match fe_states.get_mut(*idx as usize) {
-                        Some(FeCursor::Cursor { arr, i, n }) => {
-                            let mut found = None;
-                            while *i < *n {
-                                let e = {
-                                    let a = arr.borrow();
-                                    a.entries.get(*i).map(|(k, c)| (k.clone(), c.clone()))
-                                };
-                                *i += 1;
-                                match e {
-                                    Some((k, c)) if !matches!(k, crate::value::ArrKey::Tomb) => {
-                                        found = Some((k, c));
-                                        break;
-                                    }
-                                    Some(_) => continue,
-                                    None => break,
-                                }
-                            }
-                            found
-                        }
-                        Some(FeCursor::Snap { items, i }) => {
-                            let e = items.get(*i).cloned();
-                            *i += 1;
-                            e
-                        }
-                        _ => None,
-                    };
+                    let next = fe_states
+                        .get_mut(*idx as usize)
+                        .and_then(|s| s.as_mut())
+                        .and_then(|it| it.next());
                     let Some((k, c)) = next else {
                         pc = *end;
                         continue;
