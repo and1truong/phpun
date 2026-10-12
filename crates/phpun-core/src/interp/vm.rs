@@ -912,17 +912,13 @@ impl Compiler {
                     if n != "this" && !Interp::is_superglobal(n)
             ) && match key {
                 None => true,
-                Some(crate::ast::ForeachKey::Var(n)) => {
-                    n != "this" && !Interp::is_superglobal(n)
-                }
+                Some(crate::ast::ForeachKey::Var(n)) => n != "this" && !Interp::is_superglobal(n),
                 _ => false,
-            // The fallback replays the source expr — only side-effect-
-            // free sources may be bound twice: a Var read, or an
-            // ArrayLit (which can never reach the replay anyway).
-            } && matches!(
-                Interp::unmark_rhs(arr),
-                Expr::Var(_) | Expr::ArrayLit(_)
-            ) {
+                // The fallback replays the source expr — only side-effect-
+                // free sources may be bound twice: a Var read, or an
+                // ArrayLit (which can never reach the replay anyway).
+            } && matches!(Interp::unmark_rhs(arr), Expr::Var(_) | Expr::ArrayLit(_))
+            {
                 self.expr(arr)?;
                 let idx = self.fe_count;
                 self.fe_count += 1;
@@ -2377,8 +2373,7 @@ impl<'a> Interp<'a> {
     ) -> Result<(), PhpError> {
         match &mut slots[s as usize] {
             Slot::Arg(i) => {
-                let old =
-                    std::mem::replace(&mut self.cur().value_args[*i as usize], v);
+                let old = std::mem::replace(&mut self.cur().value_args[*i as usize], v);
                 self.destruct_dying_value(&old)?;
             }
             Slot::Uninit => slots[s as usize] = Slot::V(v),
@@ -2567,21 +2562,19 @@ impl<'a> Interp<'a> {
                         if fe_states.len() <= *idx as usize {
                             fe_states.resize_with(*idx as usize + 1, || FeCursor::Unused);
                         }
-                        fe_states[*idx as usize] = if *needs_snap
-                            || Rc::strong_count(rc) > 1
-                            || rc.borrow().is_ref
-                        {
-                            FeCursor::Snap {
-                                items: self.fe_snapshot(rc),
-                                i: 0,
-                            }
-                        } else {
-                            FeCursor::Cursor {
-                                arr: rc.clone(),
-                                i: 0,
-                                n: rc.borrow().entries.len(),
-                            }
-                        };
+                        fe_states[*idx as usize] =
+                            if *needs_snap || Rc::strong_count(rc) > 1 || rc.borrow().is_ref {
+                                FeCursor::Snap {
+                                    items: self.fe_snapshot(rc),
+                                    i: 0,
+                                }
+                            } else {
+                                FeCursor::Cursor {
+                                    arr: rc.clone(),
+                                    i: 0,
+                                    n: rc.borrow().entries.len(),
+                                }
+                            };
                         pc = *fetch;
                     } else {
                         // Traversable/scalar sources replay the
@@ -2624,15 +2617,11 @@ impl<'a> Interp<'a> {
                             while *i < *n {
                                 let e = {
                                     let a = arr.borrow();
-                                    a.entries
-                                        .get(*i)
-                                        .map(|(k, c)| (k.clone(), c.clone()))
+                                    a.entries.get(*i).map(|(k, c)| (k.clone(), c.clone()))
                                 };
                                 *i += 1;
                                 match e {
-                                    Some((k, c))
-                                        if !matches!(k, crate::value::ArrKey::Tomb) =>
-                                    {
+                                    Some((k, c)) if !matches!(k, crate::value::ArrKey::Tomb) => {
                                         found = Some((k, c));
                                         break;
                                     }
