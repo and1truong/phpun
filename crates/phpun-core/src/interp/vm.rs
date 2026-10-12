@@ -2452,22 +2452,20 @@ impl<'a> Interp<'a> {
             }
             drop(arr);
         }
-        let nc = {
+        // Fresh cell bound with the value already inside: canonical's
+        // Null-cell + typed_slot_store + replace is dead work here —
+        // a brand-new cell has no typed-slot owners (prune clears a
+        // recycled address), nothing observes the bind between the two
+        // steps, and the displaced Null has no dtor.
+        {
             let mut arr = rc.borrow_mut();
             let k = ArrKey::Int(arr.next);
-            let nc = cell(Value::Null);
-            arr.bind_cell(k, nc.clone());
+            let nc = cell(v.clone());
+            self.prune_typed_slot(Rc::as_ptr(&nc) as usize);
+            arr.bind_cell(k, nc);
             let req = Self::ht_req(arr.entries.len(), arr.packed);
             drop(arr);
             self.mem_realloc(&rc, req);
-            nc
-        };
-        let v = self.typed_slot_store(&nc, v)?;
-        // B1 — a live upstream borrow drops the write invisibly.
-        if let Ok(mut nb) = nc.try_borrow_mut() {
-            let old = std::mem::replace(&mut *nb, v.clone());
-            drop(nb);
-            self.destruct_dying_value(&old)?;
         }
         Ok(v)
     }
