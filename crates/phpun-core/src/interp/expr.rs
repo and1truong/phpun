@@ -172,7 +172,7 @@ impl DimDetach {
     /// string-offset conversion diagnostics dispatch before the
     /// write drops (assign_to_string_offset addref'd the string
     /// across check_string_offset, then aborts on the delref).
-    fn scratch(&self) -> Cell {
+    pub(in crate::interp) fn scratch(&self) -> Cell {
         cell(match &self.pre {
             DimPre::Str(w) => w
                 .upgrade()
@@ -4836,7 +4836,7 @@ impl<'a> Interp<'a> {
     /// dim_throw outranks the op's own result value. The thrown value
     /// rode the pair so `pending_exception` is whole again the moment
     /// the throwable actually raises.
-    fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
+    pub(in crate::interp) fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
         match self.dim_throw.take() {
             Some((tv, e, _, _)) => {
                 self.pending_exception = Some(tv);
@@ -5685,7 +5685,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn dim_detached(&mut self, det: &DimDetach) -> bool {
+    pub(in crate::interp) fn dim_detached(&mut self, det: &DimDetach) -> bool {
         if det.name == "GLOBALS" {
             // $GLOBALS resolves to a fresh wrapper cell per fetch over
             // one immortal backing table — never detached.

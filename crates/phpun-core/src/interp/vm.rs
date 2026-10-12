@@ -329,7 +329,6 @@ struct CachedMethod {
 /// AppendSnap before the RHS ops run.
 struct AppendSnap {
     pre: DimPre,
-    pre_cell: usize,
     outer: Option<(Value, PhpError, bool, bool)>,
 }
 
@@ -2481,24 +2480,17 @@ impl<'a> Interp<'a> {
                     }
                     self.fresh_dyn_props.clear();
                     self.last_fresh_cell = None;
-                    let (pre, pre_cell) = match &slots[*array as usize] {
-                        Slot::C(c) => (DimPre::of(&c.borrow()), Rc::as_ptr(c) as usize),
-                        Slot::V(v) => (DimPre::of(v), 0),
-                        Slot::Arg(i) => (DimPre::of(&self.cur().value_args[*i as usize]), 0),
-                        Slot::Uninit => (DimPre::Scalar(Value::Null), 0),
+                    let pre = match &slots[*array as usize] {
+                        Slot::C(c) => DimPre::of(&c.borrow()),
+                        Slot::V(v) => DimPre::of(v),
+                        Slot::Arg(i) => DimPre::of(&self.cur().value_args[*i as usize]),
+                        Slot::Uninit => DimPre::Scalar(Value::Null),
                     };
-                    app_snaps.push(AppendSnap {
-                        pre,
-                        pre_cell,
-                        outer,
-                    });
+                    app_snaps.push(AppendSnap { pre, outer });
                 }
                 Op::StoreAppend { array, name } => {
-                    let AppendSnap {
-                        pre,
-                        pre_cell,
-                        outer,
-                    } = app_snaps.pop().expect("AppendSnap precedes StoreAppend");
+                    let AppendSnap { pre, outer } =
+                        app_snaps.pop().expect("AppendSnap precedes StoreAppend");
                     let v = vs.last().unwrap().clone();
                     let mut done = false;
                     let mut r = Ok(v.clone());
@@ -2552,22 +2544,47 @@ impl<'a> Interp<'a> {
                         // scalar, object, undef) — the canonical fetch keeps
                         // every zend gate: vivify, string-offset Errors,
                         // ArrayAccess, typed slots, the detach sentinel.
+                        // assign() snapshots det from the cell it bound —
+                        // the LIVE post-RHS value on the live cell — so a
+                        // rebound container lands the append instead of
+                        // detaching onto a scratch, and an in-place vivify
+                        // on the same cell stays bound.
+                        self.vm_materialize(comp, slots);
+                        let c = self.var_cell(name);
                         let det = DimDetach {
                             name: name.to_string(),
-                            pre,
-                            pre_cell,
+                            pre: DimPre::of(&c.borrow()),
+                            pre_cell: Rc::as_ptr(&c) as usize,
                             coalesce: false,
                         };
-                        self.vm_materialize(comp, slots);
-                        let c = self.var_cell(&det.name);
+                        let (target, silence) = if self.dim_detached(&det) {
+                            // zend's `=` on a false container vivifies with
+                            // a deprecation, then the fetch's sentinel
+                            // aborts before the dim operand is read.
+                            if matches!(&det.pre, DimPre::Scalar(Value::Bool(false))) {
+                                self.deprecated_ns(
+                                    "Automatic conversion of false to array is deprecated",
+                                )?;
+                                r = self.dim_raise(v);
+                                self.vm_refresh(comp, slots);
+                                *vs.last_mut().unwrap() = self.dim_op_outlet(r, outer)?;
+                                pc += 1;
+                                continue;
+                            }
+                            (det.scratch(), true)
+                        } else {
+                            (c, false)
+                        };
+                        let was_detached = std::mem::replace(&mut self.detached_dim, silence);
                         r = self.assign_index_path(
-                            c,
+                            target,
                             &[DimArg::Append],
                             v,
                             false,
                             Some(&det),
                             None,
                         );
+                        self.detached_dim = was_detached;
                         self.vm_refresh(comp, slots);
                     }
                     *vs.last_mut().unwrap() = self.dim_op_outlet(r, outer)?;
