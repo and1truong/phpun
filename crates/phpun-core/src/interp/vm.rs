@@ -259,6 +259,11 @@ enum Op {
     AppendCv(u16),
     /// Direct slot + immediate: no RHS value-stack push/pop or separate dispatch.
     BinaryCvConst(&'static str, u16, Value),
+    /// `$cv op= expr` fused: BinaryCv + Store — pop rhs, read slot's
+    /// current value, op it, write-through to the slot and leave the
+    /// stored value on the stack (exactly BinaryCv;Store). Two
+    /// dispatches become one and the rhs push/pop pair vanishes.
+    BinaryCvStore(&'static str, u16),
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
@@ -1270,8 +1275,12 @@ impl Compiler {
                     } else if let Some(rhs) = const_val(value) {
                         self.emit(Op::BinaryCvConst(bop, slot, rhs));
                     } else {
+                        // AssignBinary fused: rhs eval, then one op
+                        // reads lhs, applies bop and stores back —
+                        // the trailing shared Store is skipped.
                         self.expr(value)?;
-                        self.emit(Op::BinaryCv(bop, slot));
+                        self.emit(Op::BinaryCvStore(bop, slot));
+                        return Some(());
                     }
                 }
                 self.emit(Op::Store(slot));
@@ -2745,6 +2754,33 @@ impl<'a> Interp<'a> {
                     let lv = self.vm_slot_value(comp, slots, *sl)?;
                     let v = self.vm_binary(op, lv, rv)?;
                     vs.push(v);
+                }
+                Op::BinaryCvStore(op, sl) => {
+                    // BinaryCv + Store fused: vs.last() keeps the
+                    // stored value, matching the unfused pair's
+                    // peek-and-store shape.
+                    let rv = vs.pop().unwrap();
+                    let lv = self.vm_slot_value(comp, slots, *sl)?;
+                    let v = self.vm_binary(op, lv, rv)?;
+                    match &mut slots[*sl as usize] {
+                        Slot::Arg(i) => {
+                            let old = std::mem::replace(&mut self.cur().value_args[*i as usize], v);
+                            self.destruct_dying_value(&old)?;
+                        }
+                        Slot::Uninit => slots[*sl as usize] = Slot::V(v),
+                        Slot::V(x) => {
+                            let old = std::mem::replace(x, v);
+                            self.destruct_dying_value(&old)?;
+                        }
+                        Slot::C(c) => {
+                            let c = c.clone();
+                            let value = self.vm_cell_value(&c, v)?;
+                            self.cell_store(&c, value)?;
+                        }
+                    }
+                    let stored = self.vm_slot_value(comp, slots, *sl)?;
+                    vs.push(stored);
+                    self.vm_publish_global(comp, slots, *sl);
                 }
                 Op::AppendCv(sl) => {
                     let rhs = vs.pop().unwrap();

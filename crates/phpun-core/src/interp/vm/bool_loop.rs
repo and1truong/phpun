@@ -67,6 +67,7 @@ pub(super) fn eligible(ops: &[Op]) -> bool {
             | Op::Binary(_)
             | Op::BinaryCv(..)
             | Op::BinaryCvConst(_, _, Value::Int(_))
+            | Op::BinaryCvStore(..)
             | Op::Not
             | Op::Boolify
             | Op::Jump(_)
@@ -135,7 +136,10 @@ impl Interp<'_> {
                     used[*a as usize] = true;
                     used[*b as usize] = true;
                 }
-                Op::Store(i) | Op::IncDec { slot: i, .. } | Op::IncJump { slot: i, .. } => {
+                Op::Store(i)
+                | Op::IncDec { slot: i, .. }
+                | Op::IncJump { slot: i, .. }
+                | Op::BinaryCvStore(_, i) => {
                     used[*i as usize] = true;
                     written[*i as usize] = true;
                 }
@@ -265,6 +269,12 @@ impl Interp<'_> {
                     Op::BinaryCv(op, i) => {
                         let right = stack.pop()?;
                         stack.push(binary(op, locals[*i as usize]?, right)?);
+                    }
+                    Op::BinaryCvStore(op, i) => {
+                        let right = stack.pop()?;
+                        let v = binary(op, locals[*i as usize]?, right)?;
+                        locals[*i as usize] = Some(v);
+                        stack.push(v);
                     }
                     Op::BinaryCvConst(op, i, v) => {
                         stack.push(binary(op, locals[*i as usize]?, Scalar::from_value(v)?)?);

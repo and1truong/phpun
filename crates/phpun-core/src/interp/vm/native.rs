@@ -179,7 +179,7 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             Op::Store(_) => (1, 1),
             Op::Pop => (1, 0),
             Op::Binary(_) => (2, 1),
-            Op::BinaryCv(_, _) => (1, 1),
+            Op::BinaryCv(_, _) | Op::BinaryCvStore(_, _) => (1, 1),
             Op::Call { argc, .. } => (*argc as usize, 1),
             Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => (1, 0),
             Op::Return => (1, 0),
@@ -208,7 +208,10 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             return None;
         }
         match op {
-            Op::Binary(op) | Op::BinaryCv(op, _) | Op::BinaryCvConst(op, _, _)
+            Op::Binary(op)
+            | Op::BinaryCv(op, _)
+            | Op::BinaryCvConst(op, _, _)
+            | Op::BinaryCvStore(op, _)
                 if !matches!(*op, "+" | "-" | "*" | "%" | "<=>")
                     && !(matches!(*op, "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">=")
                         && (matches!(
@@ -426,6 +429,16 @@ impl Emitter {
                     self.emit(&rhs.to_le_bytes());
                     self.binary(op, &mut fail);
                     self.store(value(n));
+                }
+                Op::BinaryCvStore(op, slot) => {
+                    if *slot as usize >= c.nslots {
+                        return None;
+                    }
+                    self.local(*slot, &mut fail);
+                    self.load(value(n - 1), true);
+                    self.binary(op, &mut fail);
+                    self.store(i32::from(*slot) * 16);
+                    self.store(value(n - 1));
                 }
                 Op::IncDec { slot, delta, post } => {
                     if *slot as usize >= c.nslots {

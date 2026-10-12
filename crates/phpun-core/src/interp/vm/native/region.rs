@@ -25,7 +25,7 @@ fn depths(c: &Compiled, start: usize, end: usize) -> Option<Vec<Option<usize>>> 
                 (0, 1)
             }
             Op::Store(i) if (*i as usize) < c.nslots => (1, 1),
-            Op::BinaryCv(_, i) if (*i as usize) < c.nslots => (1, 1),
+            Op::BinaryCv(_, i) | Op::BinaryCvStore(_, i) if (*i as usize) < c.nslots => (1, 1),
             Op::Binary(_) => (2, 1),
             Op::Not | Op::Boolify => (1, 1),
             Op::Pop | Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => (1, 0),
@@ -37,7 +37,10 @@ fn depths(c: &Compiled, start: usize, end: usize) -> Option<Vec<Option<usize>>> 
             _ => return None,
         };
         match op {
-            Op::Binary(op) | Op::BinaryCv(op, _) | Op::BinaryCvConst(op, _, _)
+            Op::Binary(op)
+            | Op::BinaryCv(op, _)
+            | Op::BinaryCvConst(op, _, _)
+            | Op::BinaryCvStore(op, _)
                 if !matches!(
                     *op,
                     "+" | "-" | "*" | "%" | "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">="
@@ -195,6 +198,23 @@ impl Emitter {
                         self.store(value(n)?);
                     }
                     self.flag(value(n)? + 8, 1);
+                }
+                Op::BinaryCvStore(op, i) => {
+                    let out = match *op {
+                        "+" | "-" | "*" | "%" => 1,
+                        _ => 2,
+                    };
+                    self.region_local(*i, true, &mut fail);
+                    self.region_kind(value(n - 1)?, &mut fail);
+                    self.load(value(n - 1)?, true);
+                    self.binary(op, &mut fail);
+                    self.emit(&[0x49, 0x89, 0x84, 0x24]);
+                    self.word(i32::from(*i) * 16);
+                    self.emit(&[0x49, 0xc7, 0x84, 0x24]);
+                    self.word(i32::from(*i) * 16 + 8);
+                    self.word(out);
+                    self.store(value(n - 1)?);
+                    self.flag(value(n - 1)? + 8, out);
                 }
                 Op::DimCv {
                     key_slot,
