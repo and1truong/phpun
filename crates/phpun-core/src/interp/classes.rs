@@ -3688,7 +3688,7 @@ impl<'a> Interp<'a> {
         };
         let rc = self.alloc_obj(PhpObject {
             class: cls,
-            slots: Vec::new(),
+            slots: smallvec::SmallVec::new(),
             props: crate::value::FxMap::default(),
             prop_order: Rc::new(vec![]),
             id: 0,
@@ -3917,7 +3917,7 @@ impl<'a> Interp<'a> {
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
                     }),
-                    slots: Vec::new(),
+                    slots: smallvec::SmallVec::new(),
                     props: crate::value::FxMap::default(),
                     prop_order: Rc::new(vec![]),
                     id: 0,
@@ -3930,7 +3930,8 @@ impl<'a> Interp<'a> {
         // the chain walk, redecl-position and hooked-backing rules
         // are class-fixed, computed once in flat_props_of.
         let flat = self.flat_props_of(&cls);
-        let mut slots: Vec<Option<Cell>> = vec![None; flat.len()];
+        let mut slots: smallvec::SmallVec<[Option<Cell>; 8]> =
+            smallvec::smallvec![None; flat.len()];
         let prop_order = cls
             .prop_order_template
             .get_or_init(|| Rc::new(flat.iter().map(|fp| fp.key.clone()).collect()))

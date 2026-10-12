@@ -2654,7 +2654,7 @@ pub struct PhpObject {
     /// Declared-prop cells indexed by the class's `flat_props` order —
     /// `None` = uninitialized (typed, no default) or `unset()`.
     /// Dynamic props live in `props`.
-    pub slots: Vec<Option<Cell>>,
+    pub slots: smallvec::SmallVec<[Option<Cell>; 8]>,
     /// Dynamic instance properties only — declared cells live in
     /// `slots`. Use `prop_get`/`prop_insert`/… which route by key.
     pub props: FxMap<String, Cell>,

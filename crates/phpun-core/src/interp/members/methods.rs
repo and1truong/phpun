@@ -637,7 +637,7 @@ impl<'a> Interp<'a> {
                         let store = self.ao_store(obj);
                         let it = self.alloc_obj(PhpObject {
                             class: icls,
-                            slots: Vec::new(),
+                            slots: smallvec::SmallVec::new(),
                             props: Default::default(),
                             prop_order: Rc::new(Vec::new()),
                             id: 0,
@@ -1073,7 +1073,7 @@ impl<'a> Interp<'a> {
                         };
                         let it = self.alloc_obj(PhpObject {
                             class: icls,
-                            slots: Vec::new(),
+                            slots: smallvec::SmallVec::new(),
                             props: Default::default(),
                             prop_order: Rc::new(Vec::new()),
                             id: 0,
@@ -3483,7 +3483,7 @@ impl<'a> Interp<'a> {
         props.insert("\0di\0secs".into(), cell(Value::Int(sc)));
         Value::Object(self.alloc_obj(PhpObject {
             class: dc,
-            slots: Vec::new(),
+            slots: smallvec::SmallVec::new(),
             props,
             prop_order: Rc::new(order),
             id: 0,

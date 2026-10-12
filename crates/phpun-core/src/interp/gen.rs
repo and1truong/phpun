@@ -311,7 +311,7 @@ impl<'a> Interp<'a> {
             .expect("Generator class registered");
         self.alloc_obj(PhpObject {
             class: cls,
-            slots: Vec::new(),
+            slots: smallvec::SmallVec::new(),
             props: crate::value::FxMap::default(),
             prop_order: Rc::new(Vec::new()),
             id: 0,

@@ -995,7 +995,7 @@ fn stdclass(
     };
     Value::Object(it.alloc_obj(PhpObject {
         class: cls,
-        slots: Vec::new(),
+        slots: smallvec::SmallVec::new(),
         props,
         prop_order: Rc::new(order),
         id: 0,

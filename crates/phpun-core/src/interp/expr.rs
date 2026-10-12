@@ -5218,7 +5218,8 @@ impl<'a> Interp<'a> {
             }
             cell(c.borrow().clone())
         };
-        let mut slots: Vec<Option<Cell>> = Vec::with_capacity(ob.slots.len());
+        let mut slots: smallvec::SmallVec<[Option<Cell>; 8]> =
+            smallvec::SmallVec::with_capacity(ob.slots.len());
         for (si, s) in ob.slots.iter().enumerate() {
             slots.push(s.as_ref().map(|c| {
                 let key = ob.prop_order.get(si).cloned().unwrap_or_default();
@@ -10710,7 +10711,7 @@ impl<'a> Interp<'a> {
                         .expect("stdClass registered");
                     Value::Object(self.alloc_obj(PhpObject {
                         class: cls,
-                        slots: Vec::new(),
+                        slots: smallvec::SmallVec::new(),
                         props,
                         prop_order: Rc::new(order),
                         id: 0,

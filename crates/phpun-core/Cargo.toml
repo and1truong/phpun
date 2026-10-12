@@ -16,6 +16,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 libc = "0.2"
 flate2 = "1.1.10"
 bzip2 = "0.6.1"
+smallvec = "1"
 
 [dev-dependencies]
 phpun-phpt = { path = "../phpun-phpt" }

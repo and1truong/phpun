@@ -671,7 +671,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(Value::Object(self.alloc_obj(PhpObject {
                         class: oc,
-                        slots: Vec::new(),
+                        slots: smallvec::SmallVec::new(),
                         props,
                         prop_order: Rc::new(order),
                         id: 0,
@@ -734,7 +734,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(Value::Object(self.alloc_obj(PhpObject {
                         class: oc,
-                        slots: Vec::new(),
+                        slots: smallvec::SmallVec::new(),
                         props,
                         prop_order: Rc::new(order),
                         id: 0,

@@ -1161,7 +1161,7 @@ pub struct Interp<'a> {
     /// Seconds figure for the 'Maximum execution time' message.
     deadline_secs: i64,
     /// `-d` ini settings (e.g. short_open_tag=on).
-    pub ini: HashMap<String, String>,
+    pub ini: FxMap<String, String>,
 }
 
 /// Mode for the compile-time const-closure scan: `Const` walks a
@@ -2028,7 +2028,7 @@ impl<'a> Interp<'a> {
             mem_sweep_at: 4096,
             deadline: None,
             deadline_secs: 0,
-            ini: HashMap::from([
+            ini: FxMap::from_iter([
                 ("pcre.jit".into(), "1".into()),
                 ("error_reporting".to_string(), "30719".to_string()),
                 // Zend's compiled-in default (hardcoded in main/php.ini).
