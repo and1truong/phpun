@@ -320,6 +320,10 @@ enum Op {
     InitNew {
         call: usize,
         name: Rc<str>,
+        /// (class, ctor) resolution memo — registered classes are
+        /// append-only so a hit is stable; a miss stays uncached so an
+        /// autoload can still register the class later.
+        cache: std::cell::RefCell<Option<NewTarget>>,
         fallback: Box<Expr>,
     },
     NewCall {
@@ -1511,6 +1515,7 @@ impl Compiler {
                 let init = self.emit(Op::InitNew {
                     call: usize::MAX,
                     name: Rc::from(cname.as_str()),
+                    cache: std::cell::RefCell::new(None),
                     fallback: Box::new(e.clone()),
                 });
                 for a in args {
@@ -3002,20 +3007,27 @@ impl<'a> Interp<'a> {
                 Op::InitNew {
                     call: at,
                     name,
+                    cache,
                     fallback,
                 } => {
-                    let target = crate::interp::util::lkey_get(&self.classes, name)
-                        .cloned()
-                        .and_then(|cls| {
-                            let ctor = self.find_method_in(&cls, "__construct");
-                            if ctor
-                                .as_ref()
-                                .is_some_and(|(m, _)| m.decl.params.iter().any(|p| p.by_ref))
-                            {
-                                return None;
-                            }
-                            Some((cls, ctor))
-                        });
+                    let target = {
+                        let hit = cache.borrow().clone();
+                        hit.or_else(|| {
+                            crate::interp::util::lkey_get(&self.classes, name)
+                                .cloned()
+                                .and_then(|cls| {
+                                    let ctor = self.find_method_in(&cls, "__construct");
+                                    if ctor.as_ref().is_some_and(|(m, _)| {
+                                        m.decl.params.iter().any(|p| p.by_ref)
+                                    }) {
+                                        return None;
+                                    }
+                                    let t = (cls, ctor);
+                                    *cache.borrow_mut() = Some(t.clone());
+                                    Some(t)
+                                })
+                        })
+                    };
                     match target {
                         Some(target) => ntargets.push(target),
                         None => {
