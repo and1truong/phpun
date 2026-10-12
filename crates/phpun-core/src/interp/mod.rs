@@ -7059,6 +7059,9 @@ impl<'a> Interp<'a> {
                     // the full dying-cell snapshot before callbacks run.
                     {
                         let b = a.borrow();
+                        if b.entries.is_scalar_packed() {
+                            return;
+                        }
                         // `gc_purpled` empty also proves every
                         // `gc_maybe_collect` below is the drain-only path —
                         // no real collect, no dtor can run mid-walk to
@@ -7103,9 +7106,11 @@ impl<'a> Interp<'a> {
                         // and a collect check, never a keyed root (flat
                         // objects hold no graph target, and with no shared
                         // cells nothing outside reaches this dying table).
-                        // `depth` still gates the slot call itself, so this
-                        // path only runs where the walk would actually act.
-                        if quiet && depth >= 2 {
+                        // `depth` gates twice on the way here: the slot
+                        // call needs depth-1>0 and its gc_note_dying
+                        // recursion needs depth-2>0 to act, so this path
+                        // only runs where the walk would actually count.
+                        if quiet && depth >= 3 {
                             for (_, c) in b.entries.iter() {
                                 if matches!(&*c.borrow(), Value::Object(_)) {
                                     self.gc_maybe_collect();
