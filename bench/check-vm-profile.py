@@ -27,7 +27,7 @@ echo scalar(1), scalar(2), fallback_body(), fallback_body(), foreach_body([8]), 
     counters = dict(line.removeprefix('vm-coverage: ').split('=')
                     for line in log.splitlines() if line.startswith('vm-coverage: '))
     assert int(counters['executed-body']) == 4, log
-    assert int(counters['other']) >= 2 and int(counters['hybrid-body']) == 1, log
+    assert int(counters['other']) >= 2 and int(counters['hybrid-body']) == 2, log
 print('VM coverage diagnostics: ok')
 
 # Root loops must actually use bytecode while preserving global scope.
