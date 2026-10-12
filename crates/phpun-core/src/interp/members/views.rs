@@ -3019,31 +3019,32 @@ impl<'a> Interp<'a> {
         }
         let alias_l = alias.trim_start_matches('\\').to_lowercase();
         let key = name.trim_start_matches('\\').to_lowercase();
-        // Zend refuses to shadow an existing name: "Cannot declare
-        // class A, because the name is already in use" + false.
-        if self.classes.contains_key(&alias_l)
-            || self.interfaces.contains_key(&alias_l)
-            || self.traits.contains_key(&alias_l)
-        {
-            self.warn(&format!(
-                "Cannot declare class {}, because the name is already in use",
-                alias.trim_start_matches('\\')
-            ))?;
-            return Ok(false);
-        }
+        // Zend refuses to shadow an existing name — "Cannot redeclare
+        // class A (previously declared in F:L)" + false — but only
+        // after the source resolves: a missing source keeps its own
+        // 'not found' warning.
         if let Some(c) = self.classes.get(&key).cloned() {
+            if self.alias_shadowed(alias, &alias_l)? {
+                return Ok(false);
+            }
             self.classes.insert(alias_l.clone(), c);
             self.decl_aliases
                 .push((crate::ast::ClassKind::Class, alias_l));
             return Ok(true);
         }
         if let Some(i) = self.interfaces.get(&key).cloned() {
+            if self.alias_shadowed(alias, &alias_l)? {
+                return Ok(false);
+            }
             self.interfaces.insert(alias_l.clone(), i);
             self.decl_aliases
                 .push((crate::ast::ClassKind::Interface, alias_l));
             return Ok(true);
         }
         if let Some(t) = self.traits.get(&key).cloned() {
+            if self.alias_shadowed(alias, &alias_l)? {
+                return Ok(false);
+            }
             self.traits.insert(alias_l.clone(), t);
             self.decl_aliases
                 .push((crate::ast::ClassKind::Trait, alias_l));
@@ -3051,6 +3052,22 @@ impl<'a> Interp<'a> {
         }
         self.warn(&format!("Class \"{}\" not found", name))?;
         Ok(false)
+    }
+
+    /// Occupied alias name — zend refuses the shadow ("Cannot
+    /// redeclare K A (previously declared in F:L)", K = the
+    /// existing decl's kind) and returns false.
+    fn alias_shadowed(&mut self, alias: &str, alias_l: &str) -> Result<bool, PhpError> {
+        let Some((kind, file, line)) = self.existing_class_site(alias_l) else {
+            return Ok(false);
+        };
+        self.warn(&Self::redeclare_class_msg(
+            kind,
+            alias.trim_start_matches('\\'),
+            &file,
+            line,
+        ))?;
+        Ok(true)
     }
 
     /// Does this object's class implement `iname` (transitively)?
