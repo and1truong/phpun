@@ -2307,37 +2307,34 @@ impl<'a> Interp<'a> {
             // Numeric fast arms: Float×Float and Int/Float scalars. `/`
             // still drops to canonical on a zero divisor (zend throws),
             // `%` keeps int-mod semantics, `===`/`!==` stay type-strict
-            // (int !== float), and comparisons bail when an int operand
-            // exceeds f64 precision (PHP 8 compares int/float exactly).
+            // (int !== float), and `<=>` falls through when an operand
+            // is NaN (zend orders NaN greater — Int(1), not the
+            // partial_cmp None → 0 fold). int→f64 casts are lossy the
+            // same way zend's compare is.
             let num = |v: &Value| match v {
                 Value::Int(v) => Some(*v as f64),
                 Value::Float(v) => Some(*v),
                 _ => None,
             };
-            let precise = |v: &Value| !matches!(v, Value::Int(i) if i.unsigned_abs() > (1 << 53));
             match (num(&lv), num(&rv)) {
                 (Some(a), Some(b)) => match op {
                     "+" => Some(Value::Float(a + b)),
                     "-" => Some(Value::Float(a - b)),
                     "*" => Some(Value::Float(a * b)),
                     "/" if b != 0.0 => Some(Value::Float(a / b)),
-                    "==" | "!=" | "<=>" | "<" | "<=" | ">" | ">="
-                        if precise(&lv) && precise(&rv) =>
-                    {
-                        Some(match op {
-                            "==" => Value::Bool(a == b),
-                            "!=" => Value::Bool(a != b),
-                            "<=>" => Value::Int(match a.partial_cmp(&b) {
-                                Some(Ordering::Less) => -1,
-                                Some(Ordering::Greater) => 1,
-                                _ => 0,
-                            }),
-                            "<" => Value::Bool(a < b),
-                            "<=" => Value::Bool(a <= b),
-                            ">" => Value::Bool(a > b),
-                            _ => Value::Bool(a >= b),
-                        })
+                    "==" => Some(Value::Bool(a == b)),
+                    "!=" => Some(Value::Bool(a != b)),
+                    "<=>" if !a.is_nan() && !b.is_nan() => {
+                        Some(Value::Int(match a.partial_cmp(&b) {
+                            Some(Ordering::Less) => -1,
+                            Some(Ordering::Greater) => 1,
+                            _ => 0,
+                        }))
                     }
+                    "<" => Some(Value::Bool(a < b)),
+                    "<=" => Some(Value::Bool(a <= b)),
+                    ">" => Some(Value::Bool(a > b)),
+                    ">=" => Some(Value::Bool(a >= b)),
                     "===" if matches!((&lv, &rv), (Value::Float(_), Value::Float(_))) => {
                         Some(Value::Bool(a == b))
                     }
