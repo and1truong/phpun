@@ -2303,6 +2303,11 @@ pub struct PhpClass {
     /// `None` is a cached miss). ponytail: polymorphic sites thrash a
     /// single slot; upgrade is a small name-keyed map on the class.
     pub method_ic: MethodIc,
+    /// `__destruct` resolution memo — a constant-name lookup the
+    /// polymorphic method_ic can't hold across other probes. Class-fixed
+    /// (parent chain and decl are bound at registration), so a OnceCell
+    /// is enough; `None` is a cached miss.
+    pub destructor: std::cell::OnceCell<MethodHit>,
     /// name()'s truncated display form — the input (decl.name) never
     /// changes after registration, so the split/scan runs once.
     pub short_name: std::cell::OnceCell<Box<str>>,
