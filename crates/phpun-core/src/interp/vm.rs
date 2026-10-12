@@ -2883,16 +2883,18 @@ impl<'a> Interp<'a> {
                     };
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
-                    if comp.top_level {
-                        if let Some(value) = self.vm_float_method(&core, &argv, &obj) {
-                            argv.clear();
-                            if self.vm_val_pool.len() < 64 {
-                                self.vm_val_pool.push(argv);
-                            }
-                            vs.push(value);
-                            pc += 1;
-                            continue;
+                    // float_leaf needs no top_level gate: the proof
+                    // already rules out a callee that could observe
+                    // caller-frame state, and inside a loop body it is
+                    // the only cheap path (loop comps aren't top_level).
+                    if let Some(value) = self.vm_float_method(&core, &argv, &obj) {
+                        argv.clear();
+                        if self.vm_val_pool.len() < 64 {
+                            self.vm_val_pool.push(argv);
                         }
+                        vs.push(value);
+                        pc += 1;
+                        continue;
                     }
                     // A direct callee can rebind globals or release their
                     // last PHP owner. Drop stale caller slot handles before
