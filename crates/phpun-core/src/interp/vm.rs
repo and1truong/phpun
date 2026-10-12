@@ -314,6 +314,16 @@ enum Op {
         cache: std::cell::RefCell<Option<CachedMethod>>,
         fallback: Box<Expr>,
     },
+    /// Zero-arg `$cv->name()` — InitMethod+MethodCall as one op. Only
+    /// argc==0 is fused: with arg ops between resolution and dispatch
+    /// a fallback eval would re-run their side effects.
+    MethodCallSlot {
+        obj: u16,
+        name: Rc<str>,
+        site: usize,
+        cache: std::cell::RefCell<Option<CachedMethod>>,
+        fallback: Box<Expr>,
+    },
     /// `new X(...)` — class resolves at INIT (zend's order: before arg
     /// side effects). Missing entries fall back to the canonical
     /// `Expr::New` (autoload + not-found errors verbatim).
@@ -1479,22 +1489,32 @@ impl Compiler {
                     unreachable!()
                 };
                 let obj = self.slot(vname);
-                let init = self.emit(Op::InitMethod {
-                    call: usize::MAX,
-                    obj,
-                });
-                for a in args {
-                    self.expr(Interp::unmark_arg(a))?;
-                }
-                let call = self.emit(Op::MethodCall {
-                    name: Rc::from(mname.as_str()),
-                    argc: args.len() as u16,
-                    site: *site,
-                    cache: std::cell::RefCell::new(None),
-                    fallback: Box::new(e.clone()),
-                });
-                if let Op::InitMethod { call: at, .. } = &mut self.ops[init] {
-                    *at = call;
+                if args.is_empty() {
+                    self.emit(Op::MethodCallSlot {
+                        obj,
+                        name: Rc::from(mname.as_str()),
+                        site: *site,
+                        cache: std::cell::RefCell::new(None),
+                        fallback: Box::new(e.clone()),
+                    });
+                } else {
+                    let init = self.emit(Op::InitMethod {
+                        call: usize::MAX,
+                        obj,
+                    });
+                    for a in args {
+                        self.expr(Interp::unmark_arg(a))?;
+                    }
+                    let call = self.emit(Op::MethodCall {
+                        name: Rc::from(mname.as_str()),
+                        argc: args.len() as u16,
+                        site: *site,
+                        cache: std::cell::RefCell::new(None),
+                        fallback: Box::new(e.clone()),
+                    });
+                    if let Op::InitMethod { call: at, .. } = &mut self.ops[init] {
+                        *at = call;
+                    }
                 }
             }
             Expr::New { class, args, site }
@@ -3003,6 +3023,58 @@ impl<'a> Interp<'a> {
                         pc = *at + 1;
                         continue;
                     }
+                }
+                Op::MethodCallSlot {
+                    obj,
+                    name,
+                    site,
+                    cache,
+                    fallback,
+                } => {
+                    let mval = match &slots[*obj as usize] {
+                        Slot::V(v) => Some(v.clone()),
+                        Slot::C(c) => Some(c.borrow().clone()),
+                        Slot::Arg(i) => self
+                            .stack
+                            .last()
+                            .and_then(|f| f.value_args.get(*i as usize).cloned()),
+                        Slot::Uninit => None,
+                    };
+                    let hit = match mval {
+                        Some(Value::Object(o)) => self.vm_method_target(o, name, cache, *site),
+                        _ => None,
+                    };
+                    let Some((o, core)) = hit else {
+                        self.vm_materialize(comp, slots);
+                        let r = self.eval(fallback);
+                        self.vm_refresh(comp, slots);
+                        vs.push(r?);
+                        pc += 1;
+                        continue;
+                    };
+                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+                    if let Some(value) = self.vm_float_method(&core, &argv, &o) {
+                        argv.clear();
+                        if self.vm_val_pool.len() < 64 {
+                            self.vm_val_pool.push(argv);
+                        }
+                        vs.push(value);
+                        pc += 1;
+                        continue;
+                    }
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
+                    let result = self.vm_run_method_direct(&core, &mut argv, o, name, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
+                    let v = result?;
+                    argv.clear();
+                    if self.vm_val_pool.len() < 64 {
+                        self.vm_val_pool.push(argv);
+                    }
+                    vs.push(v);
                 }
                 Op::InitNew {
                     call: at,
