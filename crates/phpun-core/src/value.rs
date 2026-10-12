@@ -2315,7 +2315,7 @@ pub struct PhpClass {
 /// `None` = cached miss.
 pub type MethodHit = Option<(Rc<crate::ast::MethodDecl>, Rc<PhpClass>)>;
 /// 1-entry `(looked-up name, hit)` memo slot on `PhpClass`.
-pub type MethodIc = RefCell<Option<(String, MethodHit)>>;
+pub type MethodIc = RefCell<[Option<(String, MethodHit)>; 2]>;
 
 /// One entry of the flattened declared-prop layout: the storage key
 /// (mangled `\0Cls\0name` for private slots, else the plain name)
@@ -2654,10 +2654,10 @@ pub struct PhpObject {
     /// Declared-prop cells indexed by the class's `flat_props` order —
     /// `None` = uninitialized (typed, no default) or `unset()`.
     /// Dynamic props live in `props`.
-    pub slots: Vec<Option<Cell>>,
+    pub slots: smallvec::SmallVec<[Option<Cell>; 8]>,
     /// Dynamic instance properties only — declared cells live in
     /// `slots`. Use `prop_get`/`prop_insert`/… which route by key.
-    pub props: HashMap<String, Cell>,
+    pub props: FxMap<String, Cell>,
     /// Property order for var_dump/foreach output: declared keys in
     /// `flat_props` order, then dynamic inserts; `unset()` tombstones.
     /// Class-fixed names are shared; each mutator uses Rc::make_mut.
@@ -2668,7 +2668,7 @@ pub struct PhpObject {
     pub internal: Option<ObjectInternal>,
     /// Typed props that were `unset()` — reads route to `__get` like
     /// undefined props instead of the uninitialized-typed Error.
-    pub unset_props: std::collections::HashSet<String>,
+    pub unset_props: FxSet<String>,
 }
 
 impl PhpObject {

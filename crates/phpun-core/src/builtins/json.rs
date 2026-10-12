@@ -905,7 +905,7 @@ fn json_value(
                 return Ok(if cx.assoc {
                     Value::Array(Rc::new(RefCell::new(PhpArray::new())))
                 } else {
-                    stdclass(it, HashMap::new(), Vec::new())
+                    stdclass(it, crate::value::FxMap::default(), Vec::new())
                 });
             }
             if b.get(*pos) == Some(&b']') {
@@ -941,7 +941,7 @@ fn json_value(
                 Ok(Value::Array(Rc::new(RefCell::new(a))))
             } else {
                 // stdClass: build props directly, no temp array pass.
-                let mut props = HashMap::new();
+                let mut props = crate::value::FxMap::default();
                 let mut order = Vec::new();
                 loop {
                     json_ws(b, pos)?;
@@ -985,18 +985,22 @@ fn json_value(
     }
 }
 
-fn stdclass(it: &mut Interp, props: HashMap<String, Cell>, order: Vec<String>) -> Value {
+fn stdclass(
+    it: &mut Interp,
+    props: crate::value::FxMap<String, Cell>,
+    order: Vec<String>,
+) -> Value {
     let Some(cls) = it.lookup_class("stdclass") else {
         return Value::Null;
     };
     Value::Object(it.alloc_obj(PhpObject {
         class: cls,
-        slots: Vec::new(),
+        slots: smallvec::SmallVec::new(),
         props,
         prop_order: Rc::new(order),
         id: 0,
         internal: None,
-        unset_props: std::collections::HashSet::new(),
+        unset_props: crate::value::FxSet::default(),
     }))
 }
 

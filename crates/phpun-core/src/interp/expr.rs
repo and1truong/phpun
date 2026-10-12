@@ -76,7 +76,7 @@ impl CondFold<'_> {
 /// FETCH_DIM_W failure preempts the var's read (`$b['x'][$u] = v` on
 /// a scalar `$b['x']` fatals without warning `$u`).
 #[derive(Clone)]
-enum DimArg {
+pub(in crate::interp) enum DimArg {
     Append,
     Key(Cell),
     /// The CV's marked (argline) line sites its own read diagnostic.
@@ -114,7 +114,7 @@ enum UnsetKey {
 /// Value-types keep their value (zend's refcount sentinel can't fire
 /// on non-refcounted scalars — no detach check exists there).
 #[derive(Clone)]
-enum DimPre {
+pub(in crate::interp) enum DimPre {
     Arr(std::rc::Weak<RefCell<PhpArray>>),
     Obj(std::rc::Weak<RefCell<PhpObject>>),
     Str(std::rc::Weak<Vec<u8>>),
@@ -124,7 +124,7 @@ enum DimPre {
 }
 
 impl DimPre {
-    fn of(v: &Value) -> Self {
+    pub(in crate::interp) fn of(v: &Value) -> Self {
         match v {
             Value::Array(rc) => Self::Arr(Rc::downgrade(rc)),
             Value::Object(rc) => Self::Obj(Rc::downgrade(rc)),
@@ -152,18 +152,18 @@ impl DimPre {
 }
 
 #[derive(Clone)]
-struct DimDetach {
-    name: String,
-    pre: DimPre,
+pub(in crate::interp) struct DimDetach {
+    pub(in crate::interp) name: String,
+    pub(in crate::interp) pre: DimPre,
     /// The var CELL's Rc ptr at op entry — non-refcounted `pre`
     /// (scalars/Null) can't detach by zval identity, so only a cell
     /// replacement counts as a rebind (auto-viv Null → Array mutates
     /// the same cell and stays bound). 0 = unknown (det built on a
     /// scratch, e.g. `??=`'s Null `cur`).
-    pre_cell: usize,
+    pub(in crate::interp) pre_cell: usize,
     /// `??=`'s assign is a separate op dispatching on the CURRENT
     /// container — its write runs on that value, not `pre`.
-    coalesce: bool,
+    pub(in crate::interp) coalesce: bool,
 }
 
 impl DimDetach {
@@ -172,7 +172,7 @@ impl DimDetach {
     /// string-offset conversion diagnostics dispatch before the
     /// write drops (assign_to_string_offset addref'd the string
     /// across check_string_offset, then aborts on the delref).
-    fn scratch(&self) -> Cell {
+    pub(in crate::interp) fn scratch(&self) -> Cell {
         cell(match &self.pre {
             DimPre::Str(w) => w
                 .upgrade()
@@ -4836,7 +4836,7 @@ impl<'a> Interp<'a> {
     /// dim_throw outranks the op's own result value. The thrown value
     /// rode the pair so `pending_exception` is whole again the moment
     /// the throwable actually raises.
-    fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
+    pub(in crate::interp) fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
         match self.dim_throw.take() {
             Some((tv, e, _, _)) => {
                 self.pending_exception = Some(tv);
@@ -4878,7 +4878,7 @@ impl<'a> Interp<'a> {
     /// `outer` is the arm a nested op inherited — zend clears
     /// EG(exception) around the nested call, so a clean nested run
     /// restores it for the outer op's own end.
-    fn dim_op_outlet<T>(
+    pub(in crate::interp) fn dim_op_outlet<T>(
         &mut self,
         r: Result<T, PhpError>,
         outer: Option<(crate::value::Value, PhpError, bool, bool)>,
@@ -5207,7 +5207,7 @@ impl<'a> Interp<'a> {
     /// the `clone $o` operator and `clone($o, [...])`.
     pub(crate) fn clone_object(&mut self, o: &Rc<RefCell<PhpObject>>) -> Result<Value, PhpError> {
         let ob = o.borrow();
-        let mut props = HashMap::new();
+        let mut props = crate::value::FxMap::default();
         // References survive clone — the clone's prop
         // shares the same zval and keeps the typed gate
         // (typed_properties_081).
@@ -5218,7 +5218,8 @@ impl<'a> Interp<'a> {
             }
             cell(c.borrow().clone())
         };
-        let mut slots: Vec<Option<Cell>> = Vec::with_capacity(ob.slots.len());
+        let mut slots: smallvec::SmallVec<[Option<Cell>; 8]> =
+            smallvec::SmallVec::with_capacity(ob.slots.len());
         for (si, s) in ob.slots.iter().enumerate() {
             slots.push(s.as_ref().map(|c| {
                 let key = ob.prop_order.get(si).cloned().unwrap_or_default();
@@ -5625,7 +5626,7 @@ impl<'a> Interp<'a> {
     /// rebound 'rebound' string is a new alloc), while `$a=$a` and
     /// `$tmp=$a;$a=$tmp` preserve it (shared zval stays alive). Scalar
     /// containers have no sentinel — equal values stay bound.
-    fn same_container(pre: &DimPre, cur: &Value) -> bool {
+    pub(in crate::interp) fn same_container(pre: &DimPre, cur: &Value) -> bool {
         match (pre, cur) {
             (DimPre::Arr(w), Value::Array(rc)) => w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, rc)),
             (DimPre::Obj(w), Value::Object(rc)) => w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, rc)),
@@ -5685,7 +5686,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn dim_detached(&mut self, det: &DimDetach) -> bool {
+    pub(in crate::interp) fn dim_detached(&mut self, det: &DimDetach) -> bool {
         if det.name == "GLOBALS" {
             // $GLOBALS resolves to a fresh wrapper cell per fetch over
             // one immortal backing table — never detached.
@@ -5974,7 +5975,7 @@ impl<'a> Interp<'a> {
     /// Returns the effective stored value: string-offset writes return the
     /// byte actually stored, everything else echoes `v` (bug22592: chained
     /// `$a[i] = $a[j] = $s` only warns for the first write).
-    fn assign_index_path(
+    pub(in crate::interp) fn assign_index_path(
         &mut self,
         mut c: Cell,
         keys: &[DimArg],
@@ -8968,7 +8969,11 @@ impl<'a> Interp<'a> {
         Some(self.err_flow(e))
     }
 
-    fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
+    pub(in crate::interp) fn typed_slot_store(
+        &mut self,
+        c: &Cell,
+        v: Value,
+    ) -> Result<Value, PhpError> {
         self.typed_slot_store_mode(c, v, false)
     }
 
@@ -10679,7 +10684,7 @@ impl<'a> Interp<'a> {
             CastKind::Object => match &v {
                 Value::Object(_) => v,
                 _ => {
-                    let mut props = HashMap::new();
+                    let mut props = crate::value::FxMap::default();
                     let mut order = Vec::new();
                     match &v {
                         Value::Array(a) => {
@@ -10706,12 +10711,12 @@ impl<'a> Interp<'a> {
                         .expect("stdClass registered");
                     Value::Object(self.alloc_obj(PhpObject {
                         class: cls,
-                        slots: Vec::new(),
+                        slots: smallvec::SmallVec::new(),
                         props,
                         prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
-                        unset_props: std::collections::HashSet::new(),
+                        unset_props: crate::value::FxSet::default(),
                     }))
                 }
             },

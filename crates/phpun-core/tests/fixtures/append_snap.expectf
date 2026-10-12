@@ -1,0 +1,76 @@
+array(3) {
+  [0]=>
+  int(1)
+  [1]=>
+  string(1) "s"
+  [2]=>
+  float(2.5)
+}
+int(2)
+array(1) {
+  [0]=>
+  int(9)
+}
+array(1) {
+  [0]=>
+  int(9)
+}
+array(3) {
+  [0]=>
+  int(7)
+  [1]=>
+  int(8)
+  [2]=>
+  array(2) {
+    [0]=>
+    int(7)
+    [1]=>
+    int(8)
+  }
+}
+array(1) {
+  [0]=>
+  NULL
+}
+array(2) {
+  [0]=>
+  int(9)
+  [1]=>
+  array(1) {
+    [0]=>
+    int(9)
+  }
+}
+array(2) {
+  [0]=>
+  array(2) {
+    [0]=>
+    int(9)
+    [1]=>
+    array(1) {
+      [0]=>
+      int(9)
+    }
+  }
+  [1]=>
+  array(2) {
+    [0]=>
+    int(9)
+    [1]=>
+    array(1) {
+      [0]=>
+      int(9)
+    }
+  }
+}
+
+Deprecated: Automatic conversion of false to array is deprecated in %s on line %d
+array(1) {
+  [0]=>
+  int(1)
+}
+
+Fatal error: Uncaught Error: Cannot use a scalar value as an array in %s:44
+Stack trace:
+#0 {main}
+  thrown in %s on line %d

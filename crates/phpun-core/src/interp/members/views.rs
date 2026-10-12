@@ -3226,12 +3226,14 @@ impl<'a> Interp<'a> {
         name: &str,
     ) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
         // Monomorphic probe: class-keyed resolution is stable (methods
-        // can't be added post-registration), so the last lookup hits.
+        // can't be added post-registration). Two slots — the teardown
+        // probes (`__destruct`) and call-site names otherwise evict
+        // each other every iteration of a method-calling loop.
         {
             let ic = cls.method_ic.borrow();
-            if let Some((n, hit)) = ic.as_ref() {
-                if n.eq_ignore_ascii_case(name) {
-                    return hit.clone();
+            for e in ic.iter().flatten() {
+                if e.0.eq_ignore_ascii_case(name) {
+                    return e.1.clone();
                 }
             }
         }
@@ -3245,7 +3247,11 @@ impl<'a> Interp<'a> {
             cur = self.parent_of(&c);
         }
         if let Ok(mut ic) = cls.method_ic.try_borrow_mut() {
-            *ic = Some((name.to_string(), out.clone()));
+            // FIFO fill: keep the resident entries when both slots hit.
+            if ic[0].is_some() {
+                ic[1] = ic[0].take();
+            }
+            ic[0] = Some((name.to_string(), out.clone()));
         }
         out
     }

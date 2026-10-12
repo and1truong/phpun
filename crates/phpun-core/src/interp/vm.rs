@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::calls::builtin_byref;
+use super::expr::{DimArg, DimDetach, DimPre};
 use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, MethodDecl, Param, Stmt};
 use crate::builtins;
@@ -89,7 +90,16 @@ pub(crate) struct Compiled {
     value_abi: bool,
     /// Bounded, read-only f64 expression leaf; runtime IC/owner guards remain.
     float_leaf: bool,
+    ctor_leaf: bool,
+    /// ctor_leaf prop-write memo — (obj class ptr, caller scope ptr)
+    /// → per-param PromoteSite. The resolution is class-static, so it
+    /// recomputes only on a fresh key (polymorphic `new static`).
+    promote_ic: std::cell::RefCell<PromoteIc>,
 }
+
+/// Promote-site memo table — see `Compiled::promote_ic`.
+type PromoteIc =
+    crate::value::FxMap<(usize, usize), Vec<Option<crate::interp::members::PromoteSite>>>;
 
 pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -217,6 +227,20 @@ enum Op {
     /// Store top-of-stack into a slot, KEEPING it on the stack
     /// (an assignment is an expression).
     Store(u16),
+    /// `$cv[] = expr` — zend binds the dim container before the RHS:
+    /// snapshot the slot's op-entry value (and `assign`'s dim-throw
+    /// boundary) so StoreAppend's canonical tail detaches a rebound
+    /// root exactly like the eval'd op.
+    AppendSnap {
+        array: u16,
+    },
+    /// `$cv[] = expr` — index_into_key's append arm on the live
+    /// op-entry array, else the canonical assign_index_path tail so
+    /// vivify, string-offset, object and detach cases keep one path.
+    StoreAppend {
+        array: u16,
+        name: Rc<str>,
+    },
     /// Discard top-of-stack — object/callable temps get the same
     /// decref pass exec's statement end runs (methods_003).
     Pop,
@@ -307,6 +331,14 @@ enum Op {
 struct CachedMethod {
     class: Rc<PhpClass>,
     core: Option<MSiteCore>,
+}
+
+/// A pending `$cv[] =` write's op-entry record — container snapshot,
+/// cell identity and `assign()`'s dim-throw boundary, taken at
+/// AppendSnap before the RHS ops run.
+struct AppendSnap {
+    pre: DimPre,
+    outer: Option<(Value, PhpError, bool, bool)>,
 }
 
 /// Class-stable pieces of a direct method target — everything except
@@ -520,6 +552,17 @@ impl Compiled {
                 ) || matches!(op, Op::Call { lname, argc: 1, .. } if lname.as_ref() == "sqrt")
             })
             && c.ops.iter().any(|op| matches!(op, Op::Return));
+        // ponytail: a ctor whose every param promotes into a prop and
+        // whose body cannot observe the frame publishes straight from
+        // the bound values — no frame, trace or destruct scan. Kept
+        // narrow: hookable, partially-promoted or non-trivial bodies
+        // keep the canonical call.
+        let ctor_leaf = value_abi
+            && decl.name.eq_ignore_ascii_case("__construct")
+            && decl.params.iter().all(|p| p.promoted)
+            && c.ops
+                .iter()
+                .all(|op| matches!(op, Op::Line(_) | Op::Sweep | Op::Return));
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -537,6 +580,8 @@ impl Compiled {
             param_fast,
             value_abi,
             float_leaf,
+            ctor_leaf,
+            promote_ic: std::cell::RefCell::new(crate::value::FxMap::default()),
         }))
     }
 
@@ -579,6 +624,8 @@ impl Compiled {
             param_fast: Vec::new(),
             value_abi: false,
             float_leaf: false,
+            ctor_leaf: false,
+            promote_ic: std::cell::RefCell::new(crate::value::FxMap::default()),
         }))
     }
 }
@@ -1080,6 +1127,36 @@ impl Compiler {
                                         return Some(());
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // `$cv[] = expr` — zend binds the dim container before
+                    // the RHS; AppendSnap records it, StoreAppend replays
+                    // index_into_key's append arm or the canonical tail.
+                    // A bare-CV RHS stays canonical (pin_rhs defers its
+                    // read into the op for the warn site).
+                    if let Expr::Index { e: base, i: None } = Interp::unmark_rhs(target) {
+                        if let Expr::Var(n) = Interp::unmark_rhs(base) {
+                            if n != "this"
+                                && !Interp::is_superglobal(n)
+                                && self.assigned.contains(n.as_str())
+                                && !Interp::is_cv(Interp::unmark_rhs(value))
+                            {
+                                let array = self.slot(n);
+                                let mark = self.ops.len();
+                                self.emit(Op::AppendSnap { array });
+                                if self.expr(value).is_some() {
+                                    self.emit(Op::StoreAppend {
+                                        array,
+                                        name: Rc::from(n.as_str()),
+                                    });
+                                } else {
+                                    // RHS needs canonical machinery — rewind
+                                    // the snap and partial RHS ops, eval whole.
+                                    self.ops.truncate(mark);
+                                    self.emit(Op::Canonical(Box::new(e.clone())));
+                                }
+                                return Some(());
                             }
                         }
                     }
@@ -2018,6 +2095,58 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// index_into_key's `[]` arm on the live op-entry table: the
+    /// scalar-packed gate first, then the fresh-cell bind + the
+    /// table-growth charge. `is_ref` carries the container cell's ref
+    /// mark — bare slot places have no cell, so no mark and no B1.
+    fn vm_append_place(
+        &mut self,
+        place: &mut Value,
+        is_ref: bool,
+        v: Value,
+    ) -> Result<Value, PhpError> {
+        let packed = !is_ref
+            && matches!(
+                &v,
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+            )
+            && matches!(place, Value::Array(a) if a.borrow().packed
+                && (a.borrow().entries.is_scalar_packed() || a.borrow().entries.is_empty()));
+        self.cow_split(place);
+        let rc = match place {
+            Value::Array(rc) => rc.clone(),
+            _ => unreachable!("same_container kept the op-entry array"),
+        };
+        if packed {
+            let mut arr = rc.borrow_mut();
+            if arr.push_packed_scalar(&v) {
+                let req = Self::ht_req(arr.entries.len(), arr.packed);
+                drop(arr);
+                self.mem_realloc(&rc, req);
+                return Ok(v);
+            }
+            drop(arr);
+        }
+        let nc = {
+            let mut arr = rc.borrow_mut();
+            let k = ArrKey::Int(arr.next);
+            let nc = cell(Value::Null);
+            arr.bind_cell(k, nc.clone());
+            let req = Self::ht_req(arr.entries.len(), arr.packed);
+            drop(arr);
+            self.mem_realloc(&rc, req);
+            nc
+        };
+        let v = self.typed_slot_store(&nc, v)?;
+        // B1 — a live upstream borrow drops the write invisibly.
+        if let Ok(mut nb) = nc.try_borrow_mut() {
+            let old = std::mem::replace(&mut *nb, v.clone());
+            drop(nb);
+            self.destruct_dying_value(&old)?;
+        }
+        Ok(v)
+    }
+
     fn vm_materialize(&mut self, comp: &Compiled, slots: &mut [Slot]) {
         let frame = self.cur();
         if !frame.value_args.is_empty() {
@@ -2088,6 +2217,7 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, PhpError> {
         let mut mtargets: Vec<Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)>> = Vec::new();
         let mut ntargets: Vec<NewTarget> = Vec::new();
+        let mut app_snaps: Vec<AppendSnap> = Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
@@ -2117,9 +2247,25 @@ impl<'a> Interp<'a> {
                     self.vm_materialize(comp, slots);
                     let previous_depth =
                         std::mem::replace(&mut self.loop_depth, base_depth + depth);
+                    // Plain `as $k => $v` targets write through the same
+                    // vars cells every pass — and a compiled body can't
+                    // rebind names (unset/global/`=&` all bail it) — so
+                    // seeded C-slots stay valid across iterations; hoist
+                    // the slot vec + name seeding out of the loop.
+                    let fast_body = matches!(val, crate::ast::ForeachTarget::Var(_))
+                        && !matches!(key, Some(crate::ast::ForeachKey::ByRef));
+                    let mut bslots = if fast_body {
+                        self.vm_slot_pool.pop().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let flow = self.exec_foreach_with(arr, key, val, &mut |s| {
                         s.loop_depth += 1;
-                        let result = s.vm_scope_exec(body, true);
+                        let result = if fast_body {
+                            s.vm_body_exec(body, &mut bslots)
+                        } else {
+                            s.vm_scope_exec(body, true)
+                        };
                         let flow = match result {
                             Ok(flow) => flow,
                             Err(error) => s.err_flow(error),
@@ -2128,6 +2274,12 @@ impl<'a> Interp<'a> {
                         flow
                     });
                     self.loop_depth = previous_depth;
+                    if !bslots.is_empty() {
+                        bslots.clear();
+                        if self.vm_slot_pool.len() < 64 {
+                            self.vm_slot_pool.push(bslots);
+                        }
+                    }
                     self.vm_refresh(comp, slots);
                     if !matches!(flow, Flow::Normal) {
                         return Ok(flow);
@@ -2361,6 +2513,127 @@ impl<'a> Interp<'a> {
                         }
                     }
                     self.vm_publish_global(comp, slots, *s);
+                }
+                Op::AppendSnap { array } => {
+                    // assign()'s op boundary at container bind, like the
+                    // canonical: a pending dim throwable rides `outer`
+                    // into the store; the op's conversion caches and
+                    // fresh-prop markers reset here.
+                    let outer = self.dim_throw.take();
+                    if !self.in_handler {
+                        self.dim_key_conv.clear();
+                        self.dim_cv_bound.clear();
+                    }
+                    self.fresh_dyn_props.clear();
+                    self.last_fresh_cell = None;
+                    let pre = match &slots[*array as usize] {
+                        Slot::C(c) => DimPre::of(&c.borrow()),
+                        Slot::V(v) => DimPre::of(v),
+                        Slot::Arg(i) => DimPre::of(&self.cur().value_args[*i as usize]),
+                        Slot::Uninit => DimPre::Scalar(Value::Null),
+                    };
+                    app_snaps.push(AppendSnap { pre, outer });
+                }
+                Op::StoreAppend { array, name } => {
+                    let AppendSnap { pre, outer } =
+                        app_snaps.pop().expect("AppendSnap precedes StoreAppend");
+                    let v = vs.last().unwrap().clone();
+                    let mut done = false;
+                    let mut r = Ok(v.clone());
+                    if !self.detached_dim && !self.in_handler && self.dim_throw.is_none() {
+                        match &mut slots[*array as usize] {
+                            Slot::C(c) => {
+                                let live = matches!(&*c.borrow(), cur @ Value::Array(_)
+                                    if Self::same_container(&pre, cur));
+                                if live {
+                                    done = true;
+                                    let is_ref = self.is_ref_cell(c);
+                                    r = match c.try_borrow_mut() {
+                                        // B1 — a live upstream borrow lands
+                                        // the write on a dead scratch.
+                                        Err(_) => Ok(v.clone()),
+                                        Ok(mut b) => {
+                                            self.vm_append_place(&mut b, is_ref, v.clone())
+                                        }
+                                    };
+                                }
+                            }
+                            Slot::V(sv) => {
+                                let live = matches!(&*sv, cur @ Value::Array(_)
+                                    if Self::same_container(&pre, cur));
+                                if live {
+                                    done = true;
+                                    r = self.vm_append_place(sv, false, v.clone());
+                                }
+                            }
+                            Slot::Arg(i) => {
+                                let live = matches!(
+                                    &self.cur().value_args[*i as usize],
+                                    cur @ Value::Array(_)
+                                        if Self::same_container(&pre, cur)
+                                );
+                                if live {
+                                    done = true;
+                                    let mut sv = std::mem::replace(
+                                        &mut self.cur().value_args[*i as usize],
+                                        Value::Null,
+                                    );
+                                    r = self.vm_append_place(&mut sv, false, v.clone());
+                                    self.cur().value_args[*i as usize] = sv;
+                                }
+                            }
+                            Slot::Uninit => {}
+                        }
+                    }
+                    if !done {
+                        // The container isn't the op-entry array (rebound,
+                        // scalar, object, undef) — the canonical fetch keeps
+                        // every zend gate: vivify, string-offset Errors,
+                        // ArrayAccess, typed slots, the detach sentinel.
+                        // assign() snapshots det from the cell it bound —
+                        // the LIVE post-RHS value on the live cell — so a
+                        // rebound container lands the append instead of
+                        // detaching onto a scratch, and an in-place vivify
+                        // on the same cell stays bound.
+                        self.vm_materialize(comp, slots);
+                        let c = self.var_cell(name);
+                        let det = DimDetach {
+                            name: name.to_string(),
+                            pre: DimPre::of(&c.borrow()),
+                            pre_cell: Rc::as_ptr(&c) as usize,
+                            coalesce: false,
+                        };
+                        let (target, silence) = if self.dim_detached(&det) {
+                            // zend's `=` on a false container vivifies with
+                            // a deprecation, then the fetch's sentinel
+                            // aborts before the dim operand is read.
+                            if matches!(&det.pre, DimPre::Scalar(Value::Bool(false))) {
+                                self.deprecated_ns(
+                                    "Automatic conversion of false to array is deprecated",
+                                )?;
+                                r = self.dim_raise(v);
+                                self.vm_refresh(comp, slots);
+                                *vs.last_mut().unwrap() = self.dim_op_outlet(r, outer)?;
+                                pc += 1;
+                                continue;
+                            }
+                            (det.scratch(), true)
+                        } else {
+                            (c, false)
+                        };
+                        let was_detached = std::mem::replace(&mut self.detached_dim, silence);
+                        r = self.assign_index_path(
+                            target,
+                            &[DimArg::Append],
+                            v,
+                            false,
+                            Some(&det),
+                            None,
+                        );
+                        self.detached_dim = was_detached;
+                        self.vm_refresh(comp, slots);
+                    }
+                    *vs.last_mut().unwrap() = self.dim_op_outlet(r, outer)?;
                 }
                 Op::Pop => {
                     // Statement boundary like exec's Stmt::Expr entry:
@@ -2598,13 +2871,11 @@ impl<'a> Interp<'a> {
                     let (cls, ctor) = ntargets.pop().expect("InitNew resolved this new");
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
-                    if comp.top_level {
-                        self.vm_materialize(comp, slots);
-                    }
-                    let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site);
-                    if comp.top_level {
-                        self.vm_refresh(comp, slots);
-                    }
+                    // The slot sync moves inside vm_new_run: a leaf ctor
+                    // never observes caller vars, so its whole call skips
+                    // the materialize/refresh a real callee needs.
+                    let sync = comp.top_level.then_some((comp, &mut *slots));
+                    let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site, sync);
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -2622,16 +2893,18 @@ impl<'a> Interp<'a> {
                     };
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
-                    if comp.top_level {
-                        if let Some(value) = self.vm_float_method(&core, &argv, &obj) {
-                            argv.clear();
-                            if self.vm_val_pool.len() < 64 {
-                                self.vm_val_pool.push(argv);
-                            }
-                            vs.push(value);
-                            pc += 1;
-                            continue;
+                    // float_leaf needs no top_level gate: the proof
+                    // already rules out a callee that could observe
+                    // caller-frame state, and inside a loop body it is
+                    // the only cheap path (loop comps aren't top_level).
+                    if let Some(value) = self.vm_float_method(&core, &argv, &obj) {
+                        argv.clear();
+                        if self.vm_val_pool.len() < 64 {
+                            self.vm_val_pool.push(argv);
                         }
+                        vs.push(value);
+                        pc += 1;
+                        continue;
                     }
                     // A direct callee can rebind globals or release their
                     // last PHP owner. Drop stale caller slot handles before
@@ -2717,6 +2990,43 @@ impl<'a> Interp<'a> {
     /// exec_block's stmt-level failures.
     pub(in crate::interp) fn vm_bound_exec(&mut self, comp: &Compiled) -> Result<Flow, PhpError> {
         self.vm_scope_exec(comp, comp.top_level)
+    }
+
+    /// Loop-body exec with caller-owned slots: seeded once, then only
+    /// non-C entries reseed (a compiled body cannot rebind its names,
+    /// so C cells never go stale) — and the keep_vars tail only pushes
+    /// still-V names into vars, promoting them to C for next pass.
+    fn vm_body_exec(&mut self, comp: &Compiled, slots: &mut Vec<Slot>) -> Result<Flow, PhpError> {
+        if slots.len() != comp.nslots {
+            slots.clear();
+            slots.resize_with(comp.nslots, || Slot::Uninit);
+        }
+        for (name, idx) in &comp.names {
+            if let Slot::C(bound) = &slots[*idx as usize] {
+                // Between iterations, user code (Iterator::valid/next,
+                // destructors) can replace vars[name]'s cell — e.g.
+                // unset($GLOBALS['v']) tombstones the bridged cell and
+                // the next access seeds a fresh one. Rebind only when
+                // vars no longer holds this exact cell; a C slot whose
+                // cell is still live keeps its cache.
+                if matches!(self.cur().vars.get(name), Some(c) if Rc::ptr_eq(c, bound)) {
+                    continue;
+                }
+            }
+            slots[*idx as usize] = match self.cur().vars.get(name) {
+                Some(c) => Slot::C(c.clone()),
+                None => Slot::Uninit,
+            };
+        }
+        let r = self.vm_exec(comp, slots, self.expr_temps.len());
+        for (name, idx) in &comp.names {
+            if let Slot::V(v) = &mut slots[*idx as usize] {
+                let c = cell(std::mem::replace(v, Value::Null));
+                self.cur().vars.insert(name.clone(), c.clone());
+                slots[*idx as usize] = Slot::C(c);
+            }
+        }
+        r
     }
 
     fn vm_scope_exec(&mut self, comp: &Compiled, keep_vars: bool) -> Result<Flow, PhpError> {
@@ -3400,6 +3710,151 @@ impl<'a> Interp<'a> {
     /// InitNew — runs new_instance's post-resolution sequence verbatim,
     /// then routes the ctor through the same direct/canonical split a
     /// `->m()` call takes (ctorless classes just drop the args).
+    /// A proven leaf ctor — every param promotes into a prop and the
+    /// body cannot observe the frame — binds like the value-ABI arm
+    /// (param_fast proofs plus the float-ty int widening) and publishes
+    /// through promoted_prop_write with no frame, trace or destruct
+    /// scan at all. Any binding shape the proven gates cannot settle
+    /// bails to the canonical call untouched, like a rebind miss.
+    fn vm_ctor_leaf(
+        &mut self,
+        core: &MSiteCore,
+        argv: &mut Vec<Value>,
+        obj: &Rc<std::cell::RefCell<PhpObject>>,
+    ) -> Option<Result<Value, PhpError>> {
+        // Private-promoted decls resolve through the live scope —
+        // scope_private_prop reads the top frame, so lend the caller
+        // frame (or the globals pseudo-frame at top level) the ctor's
+        // scope for the whole leaf like the pushed ctor frame would.
+        let depth = self.stack.len();
+        let saved_scope = {
+            let f = self.cur();
+            (
+                f.decl_class.replace(core.dc.clone()),
+                f.scope_class.replace(core.dc.clone()),
+            )
+        };
+        let r = self.vm_ctor_leaf_inner(core, argv, obj);
+        // Unwind can drop the borrowed frame; restore only if it lives.
+        let f = if self.stack.len() >= depth && depth > 0 {
+            Some(&mut *self.stack[depth - 1])
+        } else if depth == 0 {
+            Some(&mut self.globals)
+        } else {
+            None
+        };
+        if let Some(f) = f {
+            f.decl_class = saved_scope.0;
+            f.scope_class = saved_scope.1;
+        }
+        r
+    }
+
+    fn vm_ctor_leaf_inner(
+        &mut self,
+        core: &MSiteCore,
+        argv: &mut Vec<Value>,
+        obj: &Rc<std::cell::RefCell<PhpObject>>,
+    ) -> Option<Result<Value, PhpError>> {
+        let decl = &core.fdecl;
+        let comp = &core.comp;
+        let required = decl
+            .params
+            .iter()
+            .rposition(|p| p.default.is_none() && !p.variadic)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if argv.len() < required
+            || decl
+                .params
+                .iter()
+                .any(|p| p.hooks.is_some() || self.hooked_prop(obj, &p.name).is_some())
+        {
+            return None;
+        }
+        for (i, p) in decl.params.iter().enumerate() {
+            let float_ty = p.ty.as_ref().is_some_and(|ty| {
+                ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                    && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"))
+            });
+            match argv.get_mut(i) {
+                Some(v) => {
+                    if p.ty.is_none() || comp.param_fast[i].is_some_and(|g| g(v)) {
+                        continue;
+                    }
+                    // `float $f` accepts an exact-int arg like the abi
+                    // slow gate — deprecation attributes to the decl.
+                    if float_ty {
+                        if let Value::Int(n) = *v {
+                            let (old, cv) = (v.clone(), Value::Float(n as f64));
+                            let pl = self.cur_line;
+                            self.cur_line = decl.line;
+                            self.deprecate_lossy_int(p.ty.as_ref().unwrap(), &old, &cv);
+                            self.cur_line = pl;
+                            *v = cv;
+                            continue;
+                        }
+                    }
+                    return None;
+                }
+                None => {
+                    // Missing args bind their const default; a float-ty
+                    // int default widens like the value-ABI bind.
+                    let mut dv = comp.defaults[i].clone().unwrap_or(Value::Null);
+                    if float_ty {
+                        if let Value::Int(n) = dv {
+                            dv = Value::Float(n as f64);
+                        }
+                    }
+                    argv.push(dv);
+                }
+            }
+        }
+        // Same accounting as the float leaf: the frame span that was
+        // never taken still repays into the live arena segment.
+        let want = super::VM_FRAME_SLOTS + argv.len() as u64;
+        if let Some(top) = self.vm_stack.last_mut() {
+            let key = Rc::as_ptr(&top.tok) as usize;
+            top.used += want * 16;
+            Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
+        }
+        self.last_call_by_ref = false;
+        // Prop-site memo: resolve_direct/hook/flat scans are
+        // class-static per (obj class, caller scope) — pay them once,
+        // then a Vec index per param. The borrow drops before each
+        // write: store_prop can re-enter (magic __set → new).
+        let scope_key = {
+            let f = self.cur();
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|c| Rc::as_ptr(c) as usize)
+                .unwrap_or(0)
+        };
+        let ic_key = (Rc::as_ptr(&obj.borrow().class) as usize, scope_key);
+        for (i, p) in decl.params.iter().enumerate() {
+            let site = {
+                let mut ic = comp.promote_ic.borrow_mut();
+                let sites = ic
+                    .entry(ic_key)
+                    .or_insert_with(|| vec![None; decl.params.len()]);
+                match sites.get_mut(i).and_then(|e| *e) {
+                    Some(s) => s,
+                    None => {
+                        let s = self.promote_site(obj, &core.dc, &p.name);
+                        sites[i] = Some(s);
+                        s
+                    }
+                }
+            };
+            if let Err(e) = self.promoted_write(obj, &core.dc, &p.name, site, argv[i].clone()) {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(Value::Null))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn vm_new_run(
         &mut self,
         cls: &Rc<PhpClass>,
@@ -3408,20 +3863,36 @@ impl<'a> Interp<'a> {
         argv: &mut Vec<Value>,
         cache: &std::cell::RefCell<Option<CachedMethod>>,
         site: usize,
+        sync: Option<(&Compiled, &mut [Slot])>,
     ) -> Result<Value, PhpError> {
+        // `sync` materializes lazily — paid only where a callee or an
+        // error could observe caller vars, never for a leaf publish.
+        let mut sync = sync;
+        let mut synced = false;
+        // Error exits that skipped the fast sync still owe the caller a
+        // reconciled slot view — handlers downstream read globals.
+        macro_rules! fail_synced {
+            ($e:expr) => {{
+                if let Some((c, s)) = sync.as_mut() {
+                    self.vm_materialize(c, s);
+                    self.vm_refresh(c, s);
+                }
+                return $e;
+            }};
+        }
         if cls.name().eq_ignore_ascii_case("closure") {
-            return self.fail(PhpError::uncaught(
+            fail_synced!(self.fail(PhpError::uncaught(
                 "Error",
                 "Instantiation of class Closure is not allowed",
                 0,
-            ));
+            )));
         }
         if cls.name().eq_ignore_ascii_case("weakreference") {
-            return self.fail(PhpError::uncaught(
+            fail_synced!(self.fail(PhpError::uncaught(
                 "Error",
                 "Direct instantiation of WeakReference is not allowed, use WeakReference::create instead",
                 0,
-            ));
+            )));
         }
         let kerr = |what: &str| {
             PhpError::uncaught(
@@ -3431,25 +3902,50 @@ impl<'a> Interp<'a> {
             )
         };
         match cls.decl.kind {
-            crate::ast::ClassKind::Trait => return self.fail(kerr("trait")),
-            crate::ast::ClassKind::Interface => return self.fail(kerr("interface")),
-            crate::ast::ClassKind::Enum => return self.fail(kerr("enum")),
+            crate::ast::ClassKind::Trait => fail_synced!(self.fail(kerr("trait"))),
+            crate::ast::ClassKind::Interface => fail_synced!(self.fail(kerr("interface"))),
+            crate::ast::ClassKind::Enum => fail_synced!(self.fail(kerr("enum"))),
             _ => {}
         }
         if cls.decl.is_abstract {
-            return self.fail(kerr("abstract class"));
+            fail_synced!(self.fail(kerr("abstract class")));
         }
-        self.link_const_inits(cls)?;
-        let obj = self.instantiate(lname, &[])?;
+        if let Err(e) = self.link_const_inits(cls) {
+            fail_synced!(Err(e));
+        }
+        let obj = match self.instantiate(lname, &[]) {
+            Ok(v) => v,
+            Err(e) => fail_synced!(Err(e)),
+        };
         if let Value::Object(o) = &obj {
             let r = if let Some((m, dc)) = ctor {
                 // Same guards a `$o->m()` hit runs — private-ctor
                 // visibility and __call routing keep canonical errors.
                 match self.vm_method_target(o.clone(), "__construct", cache, site) {
                     Some((o2, core)) => {
-                        self.vm_run_method_direct(&core, argv, o2, "__construct", site)
+                        if core.comp.ctor_leaf {
+                            if let Some(r) = self.vm_ctor_leaf(&core, argv, &o2) {
+                                r
+                            } else {
+                                if let Some((c, s)) = sync.as_mut() {
+                                    self.vm_materialize(c, s);
+                                    synced = true;
+                                }
+                                self.vm_run_method_direct(&core, argv, o2, "__construct", site)
+                            }
+                        } else {
+                            if let Some((c, s)) = sync.as_mut() {
+                                self.vm_materialize(c, s);
+                                synced = true;
+                            }
+                            self.vm_run_method_direct(&core, argv, o2, "__construct", site)
+                        }
                     }
                     None => {
+                        if let Some((c, s)) = sync.as_mut() {
+                            self.vm_materialize(c, s);
+                            synced = true;
+                        }
                         let mut args = super::CallArgs::empty();
                         args.cells = argv.drain(..).map(cell).collect();
                         self.method_invoke_vis(o.clone(), "__construct", args, Some((m, dc)))
@@ -3460,11 +3956,26 @@ impl<'a> Interp<'a> {
                 Ok(Value::Null)
             };
             if let Err(e) = r {
+                if let Some((c, s)) = sync.as_mut() {
+                    self.vm_materialize(c, s);
+                    synced = true;
+                }
                 // A ctor that throws leaves a half-built object;
                 // zend never runs its __destruct (bug29368_1/_3).
                 self.mark_destructed(o);
+                if synced {
+                    if let Some((c, s)) = sync.as_mut() {
+                        self.vm_refresh(c, s);
+                    }
+                }
                 return Err(e);
             }
+            if synced {
+                if let Some((c, s)) = sync.as_mut() {
+                    self.vm_refresh(c, s);
+                }
+            }
+            r?;
         }
         if let Value::Object(o) = &obj {
             self.expr_temps.push(o.clone());

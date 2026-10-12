@@ -412,7 +412,7 @@ impl<'a> Interp<'a> {
                         flat_props: std::cell::OnceCell::new(),
                         prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
-                        method_ic: std::cell::RefCell::new(None),
+                        method_ic: std::cell::RefCell::new([None, None]),
                         short_name: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
@@ -3048,8 +3048,7 @@ impl<'a> Interp<'a> {
         &mut self,
         cls: &Rc<PhpClass>,
     ) -> Result<(), PhpError> {
-        let lname = cls.decl.name.to_lowercase();
-        if !self.consts_linked.insert(lname) {
+        if !self.consts_linked.insert(Rc::as_ptr(cls) as usize) {
             return Ok(());
         }
         let mut chain = vec![cls.clone()];
@@ -3058,7 +3057,7 @@ impl<'a> Interp<'a> {
             let Some(pc) = lkey_get(&self.classes, p).cloned() else {
                 break;
             };
-            if !self.consts_linked.insert(pc.decl.name.to_lowercase()) {
+            if !self.consts_linked.insert(Rc::as_ptr(&pc) as usize) {
                 break;
             }
             pn = pc.decl.parent.clone();
@@ -3097,7 +3096,7 @@ impl<'a> Interp<'a> {
         if let Some(v) = self.enum_cases.get(&key) {
             return Ok(v.clone());
         }
-        let mut props = std::collections::HashMap::new();
+        let mut props = crate::value::FxMap::default();
         props.insert("name".to_string(), Value::str(case));
         let is_unit = matches!(cd.value, Expr::Null);
         if !is_unit {
@@ -3688,12 +3687,12 @@ impl<'a> Interp<'a> {
         };
         let rc = self.alloc_obj(PhpObject {
             class: cls,
-            slots: Vec::new(),
-            props: HashMap::new(),
+            slots: smallvec::SmallVec::new(),
+            props: crate::value::FxMap::default(),
             prop_order: Rc::new(vec![]),
             id: 0,
             internal: Some(ObjectInternal::WeakRef(Rc::downgrade(&target))),
-            unset_props: std::collections::HashSet::new(),
+            unset_props: crate::value::FxSet::default(),
         });
         self.weakrefs.insert(target_id, Rc::downgrade(&rc));
         Ok(Value::Object(rc))
@@ -3912,17 +3911,17 @@ impl<'a> Interp<'a> {
                         flat_props: std::cell::OnceCell::new(),
                         prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
-                        method_ic: std::cell::RefCell::new(None),
+                        method_ic: std::cell::RefCell::new([None, None]),
                         short_name: std::cell::OnceCell::new(),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
                     }),
-                    slots: Vec::new(),
-                    props: HashMap::new(),
+                    slots: smallvec::SmallVec::new(),
+                    props: crate::value::FxMap::default(),
                     prop_order: Rc::new(vec![]),
                     id: 0,
                     internal: None,
-                    unset_props: std::collections::HashSet::new(),
+                    unset_props: crate::value::FxSet::default(),
                 })))
             }
         };
@@ -3930,7 +3929,8 @@ impl<'a> Interp<'a> {
         // the chain walk, redecl-position and hooked-backing rules
         // are class-fixed, computed once in flat_props_of.
         let flat = self.flat_props_of(&cls);
-        let mut slots: Vec<Option<Cell>> = vec![None; flat.len()];
+        let mut slots: smallvec::SmallVec<[Option<Cell>; 8]> =
+            smallvec::smallvec![None; flat.len()];
         let prop_order = cls
             .prop_order_template
             .get_or_init(|| Rc::new(flat.iter().map(|fp| fp.key.clone()).collect()))
@@ -3942,6 +3942,14 @@ impl<'a> Interp<'a> {
             let c = &fp.declaring;
             let p = &c.decl.props[fp.prop_idx];
             let mut default = match &p.default {
+                // Literal scalars: the const-eval can neither fail nor
+                // observe the ctx save/restore — take the value
+                // directly and skip the machinery per `new`.
+                Some(Expr::Null) => Value::Null,
+                Some(Expr::Bool(b)) => Value::Bool(*b),
+                Some(Expr::Int(n)) => Value::Int(*n),
+                Some(Expr::Float(f)) => Value::Float(*f),
+                Some(Expr::Str(s)) => Value::str(s.clone()),
                 Some(d) => {
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
@@ -3992,11 +4000,11 @@ impl<'a> Interp<'a> {
         let v = Value::Object(self.alloc_obj(PhpObject {
             class: cls,
             slots,
-            props: HashMap::new(),
+            props: crate::value::FxMap::default(),
             prop_order,
             id: 0,
             internal,
-            unset_props: std::collections::HashSet::new(),
+            unset_props: crate::value::FxSet::default(),
         }));
         // zend's throwable dump view needs engine state materialized
         // into props (file/line/string/trace) before any ctor runs.

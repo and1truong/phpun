@@ -455,7 +455,9 @@ pub struct Interp<'a> {
     /// Enum case singletons keyed `"cls\0case"` — `E::Foo === E::Foo`.
     enum_cases: std::collections::HashMap<String, Value>,
     /// Classes whose const initializers were already link-evaluated.
-    consts_linked: std::collections::HashSet<String>,
+    /// Class already const-linked — keyed by Rc ptr (classes are
+    /// unique per interp; avoids a lowercase alloc per `new`).
+    consts_linked: FxSet<usize>,
     /// Top-level parentless classes registered by hoisting (early
     /// binding): name → (compile unit, AST decl ptr), so only the SAME
     /// decl site in the SAME unit no-ops on execution — a different
@@ -924,12 +926,12 @@ pub struct Interp<'a> {
     gc_collecting: bool,
     /// Values already rooted (Zend's "already purple" bit): binds and
     /// surviving decrefs each count a zval once — cleared on collect.
-    pub(crate) gc_purpled: HashSet<usize>,
+    pub(crate) gc_purpled: FxSet<usize>,
     /// In-flight slot decrefs from `gc_note_dying` walks: cell ptr →
     /// count. A dying container still holds its cells while a collect
     /// fires mid-walk — Zend's destructor has already decremented the
     /// member refcounts, so the root test subtracts these holds.
-    gc_dying: HashMap<usize, usize>,
+    gc_dying: FxMap<usize, usize>,
     /// `gc_status()` counters: collect runs so far and roots collected
     /// across them (Zend reports both verbatim), plus wall-clock
     /// seconds spent collecting / running dtors / engine uptime.
@@ -1161,7 +1163,7 @@ pub struct Interp<'a> {
     /// Seconds figure for the 'Maximum execution time' message.
     deadline_secs: i64,
     /// `-d` ini settings (e.g. short_open_tag=on).
-    pub ini: HashMap<String, String>,
+    pub ini: FxMap<String, String>,
 }
 
 /// Mode for the compile-time const-closure scan: `Const` walks a
@@ -1402,7 +1404,7 @@ struct GcScan {
     nodes: FxMap<usize, Value>,
     /// In-flight slot decrefs (`gc_note_dying` walks) — a snapshot of
     /// `Interp::gc_dying` taken at pass start.
-    dying: HashMap<usize, usize>,
+    dying: FxMap<usize, usize>,
     /// Containers reached through internal-machinery prop cells only
     /// (`\0Cls\0prop` on GC_PROPLESS_CLASSES): engine-modeled storage,
     /// not zvals — dead ones don't count toward the collect total.
@@ -1849,7 +1851,7 @@ impl<'a> Interp<'a> {
             interfaces: HashMap::new(),
             decl_order: Vec::new(),
             enum_cases: std::collections::HashMap::new(),
-            consts_linked: std::collections::HashSet::new(),
+            consts_linked: FxSet::default(),
             decl_aliases: Vec::new(),
             early_bound_classes: HashMap::new(),
             early_bound_funcs: HashMap::new(),
@@ -1966,8 +1968,8 @@ impl<'a> Interp<'a> {
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             native_regions_bytes: Rc::new(std::cell::Cell::new(0)),
             gc_collecting: false,
-            gc_purpled: HashSet::new(),
-            gc_dying: HashMap::new(),
+            gc_purpled: FxSet::default(),
+            gc_dying: FxMap::default(),
             gc_runs: 0,
             gc_collected: 0,
             gc_collector_time: 0.0,
@@ -2028,7 +2030,7 @@ impl<'a> Interp<'a> {
             mem_sweep_at: 4096,
             deadline: None,
             deadline_secs: 0,
-            ini: HashMap::from([
+            ini: FxMap::from_iter([
                 ("pcre.jit".into(), "1".into()),
                 ("error_reporting".to_string(), "30719".to_string()),
                 // Zend's compiled-in default (hardcoded in main/php.ini).
@@ -3153,18 +3155,25 @@ impl<'a> Interp<'a> {
         if self.expr_temps.len() == base {
             return Ok(());
         }
-        let temps = self.expr_temps.split_off(base);
-        for o in temps {
-            if Rc::strong_count(&o) != 1 {
-                if keep.is_some_and(|k| Rc::as_ptr(&o) as usize == k) && Rc::strong_count(&o) == 2 {
-                    self.expr_temps.push(o);
+        // Walk the tail in place — split_off heap-alloc'd a Vec per
+        // statement. The count check borrows the entry; the clone
+        // only happens on the rare last-ref dtor path. Kept survivors
+        // re-land above base for the next sweep, same as the split.
+        let n = self.expr_temps.len();
+        let mut kept: Vec<Rc<RefCell<PhpObject>>> = Vec::new();
+        for i in base..n {
+            let o = &self.expr_temps[i];
+            if Rc::strong_count(o) != 1 {
+                if keep.is_some_and(|k| Rc::as_ptr(o) as usize == k) && Rc::strong_count(o) == 2 {
+                    kept.push(o.clone());
                 }
                 continue;
             }
-            let key = Rc::as_ptr(&o) as usize;
+            let key = Rc::as_ptr(o) as usize;
             if self.was_destructed(key) {
                 continue;
             }
+            let o = o.clone();
             if self
                 .find_method_in(&o.borrow().class, "__destruct")
                 .is_some()
@@ -3174,6 +3183,8 @@ impl<'a> Interp<'a> {
                 self.mark_obj_died(&o);
             }
         }
+        self.expr_temps.truncate(base);
+        self.expr_temps.extend(kept);
         Ok(())
     }
 
@@ -3197,14 +3208,15 @@ impl<'a> Interp<'a> {
         }
         // A displaced zval that stays alive is Zend's purple-add — a
         // potential cycle root entering the buffer (gc/bug70805).
-        let purple = match v {
-            Value::Object(o) if Rc::strong_count(o) > 1 => Some(Rc::as_ptr(o) as usize),
-            Value::Array(a) if Rc::strong_count(a) > 1 => Some(Rc::as_ptr(a) as usize),
-            Value::Callable(c) if Rc::strong_count(c) > 1 => Some(Rc::as_ptr(c) as usize),
-            _ => None,
-        };
-        if let Some(k) = purple {
-            self.gc_note_purple(k);
+        match v {
+            Value::Object(o) if Rc::strong_count(o) > 1 => self.gc_note_purple_obj(o),
+            Value::Array(a) if Rc::strong_count(a) > 1 => {
+                self.gc_note_purple(Rc::as_ptr(a) as usize)
+            }
+            Value::Callable(c) if Rc::strong_count(c) > 1 => {
+                self.gc_note_purple(Rc::as_ptr(c) as usize)
+            }
+            _ => {}
         }
         // A container taking its last ref decrefs every held slot —
         // Zend buffers each surviving payload as a root candidate
@@ -3216,7 +3228,25 @@ impl<'a> Interp<'a> {
         if matches!(v, Value::Object(o) if Rc::strong_count(o) > 1) {
             return Ok(());
         }
-        let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
+        // A lone dying object is the common case — check it without
+        // building the dedup map composites need.
+        if let Value::Object(o) = v {
+            if Rc::strong_count(o) == 1
+                && self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+                && self.mark_destructed(&o.clone())
+            {
+                if self.pending_exception.is_some() {
+                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                } else {
+                    self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+                }
+                self.mark_obj_died(o);
+            }
+            return Ok(());
+        }
+        let mut held: FxMap<usize, (usize, Rc<RefCell<PhpObject>>)> = FxMap::default();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
             held.entry(Rc::as_ptr(o) as usize)
                 .or_insert_with(|| (0, o.clone()))
@@ -3324,21 +3354,36 @@ impl<'a> Interp<'a> {
     /// generator frame's stashed CVs decref the same way when its
     /// execute_data is freed.
     pub(in crate::interp) fn destruct_cells(&mut self, cells: &[Cell]) -> Result<(), PhpError> {
-        if !cells
-            .iter()
-            .any(|c| matches!(&*c.borrow(), Value::Object(_)))
-        {
+        // Everything past this point orders/dedups __destruct calls —
+        // when no cell holds an object whose class declares one the
+        // maps below are bookkeeping for nothing (an IC-cached probe
+        // per object beats two N-sized map builds + walks).
+        let mut any_dtor = false;
+        for c in cells {
+            if let Value::Object(o) = &*c.borrow() {
+                if self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+                {
+                    any_dtor = true;
+                    break;
+                }
+            }
+        }
+        if !any_dtor {
             return Ok(());
         }
         // Only a cell DYING with this batch decrefs its zval: a shared
         // cell (`=&` alias still owned by props/statics/another var)
         // keeps its content — the frame's handle dropping is not a
         // zval decref (gh10168: call1's $tmp survives in $box->value).
-        let mut cell_refs: HashMap<usize, usize> = HashMap::new();
+        let mut cell_refs: FxMap<usize, usize> =
+            FxMap::with_capacity_and_hasher(cells.len(), crate::value::FxBuild::default());
         for c in cells {
             *cell_refs.entry(Rc::as_ptr(c) as usize).or_default() += 1;
         }
-        let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
+        let mut held: FxMap<usize, (usize, Rc<RefCell<PhpObject>>)> =
+            FxMap::with_capacity_and_hasher(cells.len(), crate::value::FxBuild::default());
         for c in cells {
             let seen = cell_refs[&(Rc::as_ptr(c) as usize)];
             // +1 = the owner's map slot being torn down after us.
@@ -7054,8 +7099,25 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 if Rc::strong_count(o) - 1 > 1 {
-                    self.gc_note_purple(Rc::as_ptr(o) as usize);
+                    self.gc_note_purple_obj(o);
                 } else {
+                    // Scalar-prop objects hold no graph target — the
+                    // array arm's packed/scalar early-out, same rule.
+                    {
+                        let b = o.borrow();
+                        if b.slots.iter().flatten().chain(b.props.values()).all(|c| {
+                            matches!(
+                                &*c.borrow(),
+                                Value::Null
+                                    | Value::Bool(_)
+                                    | Value::Int(_)
+                                    | Value::Float(_)
+                                    | Value::Str(_)
+                            )
+                        }) {
+                            return;
+                        }
+                    }
                     let dying = {
                         let b = o.borrow();
                         self.gc_dying_acquire(
@@ -7152,7 +7214,7 @@ impl<'a> Interp<'a> {
         if cstrong > 1 {
             match pv {
                 Value::Array(a) => self.gc_note_purple(Rc::as_ptr(a) as usize),
-                Value::Object(o) => self.gc_note_purple(Rc::as_ptr(o) as usize),
+                Value::Object(o) => self.gc_note_purple_obj(o),
                 Value::Callable(k) => self.gc_note_purple(Rc::as_ptr(k) as usize),
                 _ => {}
             }
@@ -7175,12 +7237,46 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Purple-add for a displaced object: a plain object whose props
+    /// are all scalar holds no graph target, so its buffer entry would
+    /// be discarded by every cycle scan — skip the keyed insert and
+    /// keep only the buffer accounting (collect cadence unchanged;
+    /// zend counts zval decrefs, not unique roots, so no dedup here).
+    /// `internal` is gated out: Generator/ArrayIter payloads can hold
+    /// container refs and stay cyclic-capable.
+    fn gc_note_purple_obj(&mut self, o: &Rc<RefCell<PhpObject>>) {
+        let b = o.borrow();
+        let flat = b.internal.is_none()
+            && b.slots.iter().flatten().chain(b.props.values()).all(|c| {
+                matches!(
+                    &*c.borrow(),
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+                )
+            });
+        drop(b);
+        if flat {
+            self.gc_maybe_collect();
+            self.gc_pending += 1;
+        } else {
+            self.gc_note_purple(Rc::as_ptr(o) as usize);
+        }
+    }
+
     /// Zend auto-collects when its 10k-entry root buffer overflows:
     /// run the same pass here once enough potential roots piled up.
     /// Errors raised mid-collect are dropped — Zend likewise collects
     /// silently (its own buffer-overflow call has no error channel).
     pub(in crate::interp) fn gc_maybe_collect(&mut self) {
         if self.gc_pending < 10_000 || self.gc_collecting || !self.ini_on("zend.enable_gc") {
+            return;
+        }
+        // An empty buffer means no displaced cyclic-capable node ever
+        // purpled — every live object's graph edges are owned, so the
+        // mark pass would collect nothing. Drain the hysteresis
+        // counter exactly like collect_impl does on a drained run;
+        // gc_runs stays untouched either way (`buffered || total>0`).
+        if self.gc_purpled.is_empty() {
+            self.gc_pending = 0;
             return;
         }
         self.gc_collecting = true;
