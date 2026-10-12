@@ -3102,10 +3102,18 @@ impl<'a> Interp<'a> {
                     // decref (hold2's ED ordering).
                     self.last_ret_cell = None;
                     if let Some(v) = vs.pop() {
-                        if matches!(v, Value::Object(_) | Value::Callable(_)) {
-                            // Discarded object temp: same decref pass
-                            // exec's statement end runs.
-                            self.destruct_cells(&[cell(v)])?;
+                        match v {
+                            // Discarded object temp: a lone object needs
+                            // only the last-ref teardown — the cell wrap
+                            // destruct_cells requires is bookkeeping for
+                            // shared owners this fresh wrapper can't have.
+                            Value::Object(o) if Rc::strong_count(&o) == 1 => {
+                                self.destruct_last_ref_obj(&o)?;
+                            }
+                            Value::Object(_) | Value::Callable(_) => {
+                                self.destruct_cells(&[cell(v)])?;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -3247,7 +3255,11 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 Op::Sweep => {
-                    self.sweep_expr_temps(tmark)?;
+                    // The sweep's own early-out costs a call anyway —
+                    // skip it here when this statement made no temps.
+                    if self.expr_temps.len() != tmark {
+                        self.sweep_expr_temps(tmark)?;
+                    }
                     tmark = self.expr_temps.len();
                 }
                 Op::IncDec { slot, delta, post } => {

@@ -1253,6 +1253,17 @@ impl Value {
         }
     }
 
+    /// Payloads that can never run `__destruct` on decref nor hold a
+    /// graph target — the shared early-out for every displaced-zval
+    /// destructor pass (a dropped string decrefs bytes, nothing else).
+    #[inline]
+    pub(crate) fn is_dtor_free(&self) -> bool {
+        matches!(
+            self,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        )
+    }
+
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Null => false,
@@ -2573,8 +2584,15 @@ fn mem_charge(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) 
 /// machinery; clears the crossing record when usage is under it
 /// again (ini_set raised the ceiling or frees dropped usage).
 pub fn mem_set_arena_lim(lim: i64) {
-    ARENA_LIM.store(lim, std::sync::atomic::Ordering::Relaxed);
-    if lim < 0 || MEM_BASE_BYTES + mem_live_raw() <= lim {
+    // The boundary calls this every statement with an almost-always
+    // unchanged limit — read-guard both writes so the steady path is
+    // two loads instead of two stores plus a full live-byte read.
+    if ARENA_LIM.load(std::sync::atomic::Ordering::Relaxed) != lim {
+        ARENA_LIM.store(lim, std::sync::atomic::Ordering::Relaxed);
+    }
+    if ARENA_TRIP.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && (lim < 0 || MEM_BASE_BYTES + mem_live_raw() <= lim)
+    {
         ARENA_TRIP.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }

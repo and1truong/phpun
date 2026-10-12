@@ -594,6 +594,10 @@ pub struct Interp<'a> {
     /// real level, never released: oracle keeps ~128 after the last
     /// pop.
     ob_boot: Option<Rc<()>>,
+    /// The alloc figure last routed to ob_boot's token — the per-level
+    /// `charged` walk still runs each sync; this skips only the
+    /// boot/emit re-apply probes on the nothing-changed path.
+    ob_boot_want: u64,
     /// Zend's opcode-style builtins (strlen/count/sizeof/
     /// array_key_exists/call_user_func*) raise arg errors with the
     /// callee frame still off the trace — exception() skips it.
@@ -602,6 +606,9 @@ pub struct Interp<'a> {
     /// One-time token for the output machinery zend retains once
     /// bytes reach the real stdout sink — EMIT_RESID, never released.
     emit_boot: Option<Rc<()>>,
+    /// ob_boot_want's emit twin — want is fixed at EMIT_RESID, so a
+    /// nonzero value means the token charge is already applied.
+    emit_want: u64,
     /// Bytes reached the real stdout sink at least once (live_io's
     /// writes bypass `self.out`, so the sink can't be probed there).
     pub(crate) emit_seen: bool,
@@ -1888,7 +1895,9 @@ impl<'a> Interp<'a> {
             ob_stack: Vec::new(),
             suspended_obs: Vec::new(),
             ob_boot: None,
+            ob_boot_want: 0,
             emit_boot: None,
+            emit_want: 0,
             emit_seen: false,
             silence: 0,
             isset_quiet: 0,
@@ -3182,6 +3191,9 @@ impl<'a> Interp<'a> {
     /// last ref) sees the new value already in place (gh10168).
     pub(in crate::interp) fn cell_store(&mut self, c: &Cell, v: Value) -> Result<(), PhpError> {
         let old = std::mem::replace(&mut *c.borrow_mut(), v);
+        if old.is_dtor_free() {
+            return Ok(());
+        }
         self.destruct_dying_value(&old)
     }
 
@@ -3209,10 +3221,7 @@ impl<'a> Interp<'a> {
     /// __destruct — `unset($closure)` decrefs the closure's bound
     /// $this and captures (Zend refcount semantics — closure_005).
     pub(in crate::interp) fn destruct_dying_value(&mut self, v: &Value) -> Result<(), PhpError> {
-        if matches!(
-            v,
-            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
-        ) {
+        if v.is_dtor_free() {
             return Ok(());
         }
         // A displaced zval that stays alive is Zend's purple-add — a
@@ -3401,21 +3410,30 @@ impl<'a> Interp<'a> {
             if Rc::strong_count(&o) != n + 1 {
                 continue;
             }
-            let key = Rc::as_ptr(&o) as usize;
-            if !self.was_destructed(key) && self.class_dtor(&o).is_some() {
-                self.mark_destructed(&o);
-                // A throw inside the dtor must not clobber the
-                // in-flight exception being unwound (bug52361) — Zend
-                // chains it as `Next ...` (not yet modelled). On a
-                // clean frame exit the dtor's error propagates and
-                // aborts the script instead.
-                let saved = self.pending_exception.take();
-                let r = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
-                let was_unwinding = saved.is_some();
-                self.pending_exception = saved.or(self.pending_exception.take());
-                if !was_unwinding {
-                    r?;
-                }
+            self.destruct_last_ref_obj(&o)?;
+        }
+        Ok(())
+    }
+
+    /// Last-ref object teardown, shared by destruct_cells' held loop
+    /// and Op::Pop's bare-value discard: the was_destructed/class_dtor
+    /// gate plus the in-flight-exception dance, with no cell-level
+    /// bookkeeping a single owner can't exercise.
+    fn destruct_last_ref_obj(&mut self, o: &Rc<RefCell<PhpObject>>) -> Result<(), PhpError> {
+        let key = Rc::as_ptr(o) as usize;
+        if !self.was_destructed(key) && self.class_dtor(o).is_some() {
+            self.mark_destructed(o);
+            // A throw inside the dtor must not clobber the
+            // in-flight exception being unwound (bug52361) — Zend
+            // chains it as `Next ...` (not yet modelled). On a
+            // clean frame exit the dtor's error propagates and
+            // aborts the script instead.
+            let saved = self.pending_exception.take();
+            let r = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+            let was_unwinding = saved.is_some();
+            self.pending_exception = saved.or(self.pending_exception.take());
+            if !was_unwinding {
+                r?;
             }
         }
         Ok(())
@@ -5056,7 +5074,7 @@ impl<'a> Interp<'a> {
                 self.ob_boot = Some(std::rc::Rc::new(()));
             }
         }
-        if let Some(boot) = self.ob_boot.clone() {
+        if let Some(boot) = &self.ob_boot {
             let n = self
                 .ob_stack
                 .iter()
@@ -5071,15 +5089,22 @@ impl<'a> Interp<'a> {
             } else {
                 OB_RESID
             };
-            self.ob_mem_apply(&boot, want);
+            if self.ob_boot_want != want {
+                let boot = boot.clone();
+                self.ob_mem_apply(&boot, want);
+                self.ob_boot_want = want;
+            }
         }
         // zend's sapi-write machinery is retained for the request
         // once any bytes reached real stdout (+32, stderr excluded).
         if self.emit_boot.is_none() && (self.emit_seen || !self.out.is_empty()) {
             self.emit_boot = Some(std::rc::Rc::new(()));
         }
-        if let Some(eb) = self.emit_boot.clone() {
-            self.ob_mem_apply(&eb, EMIT_RESID);
+        if self.emit_want != EMIT_RESID {
+            if let Some(eb) = self.emit_boot.clone() {
+                self.ob_mem_apply(&eb, EMIT_RESID);
+                self.emit_want = EMIT_RESID;
+            }
         }
         for i in 0..self.ob_stack.len() {
             let (tok, want) = (self.ob_stack[i].mem_tok.clone(), self.ob_stack[i].charged);
