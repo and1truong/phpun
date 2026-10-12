@@ -3199,14 +3199,15 @@ impl<'a> Interp<'a> {
         }
         // A displaced zval that stays alive is Zend's purple-add — a
         // potential cycle root entering the buffer (gc/bug70805).
-        let purple = match v {
-            Value::Object(o) if Rc::strong_count(o) > 1 => Some(Rc::as_ptr(o) as usize),
-            Value::Array(a) if Rc::strong_count(a) > 1 => Some(Rc::as_ptr(a) as usize),
-            Value::Callable(c) if Rc::strong_count(c) > 1 => Some(Rc::as_ptr(c) as usize),
-            _ => None,
-        };
-        if let Some(k) = purple {
-            self.gc_note_purple(k);
+        match v {
+            Value::Object(o) if Rc::strong_count(o) > 1 => self.gc_note_purple_obj(o),
+            Value::Array(a) if Rc::strong_count(a) > 1 => {
+                self.gc_note_purple(Rc::as_ptr(a) as usize)
+            }
+            Value::Callable(c) if Rc::strong_count(c) > 1 => {
+                self.gc_note_purple(Rc::as_ptr(c) as usize)
+            }
+            _ => {}
         }
         // A container taking its last ref decrefs every held slot —
         // Zend buffers each surviving payload as a root candidate
@@ -7076,7 +7077,7 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 if Rc::strong_count(o) - 1 > 1 {
-                    self.gc_note_purple(Rc::as_ptr(o) as usize);
+                    self.gc_note_purple_obj(o);
                 } else {
                     // Scalar-prop objects hold no graph target — the
                     // array arm's packed/scalar early-out, same rule.
@@ -7191,7 +7192,7 @@ impl<'a> Interp<'a> {
         if cstrong > 1 {
             match pv {
                 Value::Array(a) => self.gc_note_purple(Rc::as_ptr(a) as usize),
-                Value::Object(o) => self.gc_note_purple(Rc::as_ptr(o) as usize),
+                Value::Object(o) => self.gc_note_purple_obj(o),
                 Value::Callable(k) => self.gc_note_purple(Rc::as_ptr(k) as usize),
                 _ => {}
             }
@@ -7211,6 +7212,31 @@ impl<'a> Interp<'a> {
             if self.gc_purpled.insert(key) {
                 self.gc_pending += 1;
             }
+        }
+    }
+
+    /// Purple-add for a displaced object: a plain object whose props
+    /// are all scalar holds no graph target, so its buffer entry would
+    /// be discarded by every cycle scan — skip the keyed insert and
+    /// keep only the buffer accounting (collect cadence unchanged;
+    /// zend counts zval decrefs, not unique roots, so no dedup here).
+    /// `internal` is gated out: Generator/ArrayIter payloads can hold
+    /// container refs and stay cyclic-capable.
+    fn gc_note_purple_obj(&mut self, o: &Rc<RefCell<PhpObject>>) {
+        let b = o.borrow();
+        let flat = b.internal.is_none()
+            && b.slots.iter().flatten().chain(b.props.values()).all(|c| {
+                matches!(
+                    &*c.borrow(),
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+                )
+            });
+        drop(b);
+        if flat {
+            self.gc_maybe_collect();
+            self.gc_pending += 1;
+        } else {
+            self.gc_note_purple(Rc::as_ptr(o) as usize);
         }
     }
 
