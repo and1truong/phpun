@@ -38,3 +38,28 @@ class Noisy {
     function __destruct() { echo "dtor\n"; }
 }
 try { new Noisy(1); } catch (Exception $e) { echo $e->getMessage(), "\n"; }
+
+// Readonly promoted at top level — the globals pseudo-frame borrows
+// the ctor scope (caller_scope falls back to it).
+class Ro {
+    function __construct(public readonly int $x = 1) {}
+}
+var_dump((new Ro(0))->x);
+
+class RoP {
+    function __construct(private readonly int $x = 1) {}
+    function get(): int { return $this->x; }
+}
+var_dump((new RoP(7))->get());
+
+class RoS {
+    function __construct(protected(set) readonly int $x = 1) {}
+}
+var_dump((new RoS(5))->x);
+
+// Hooked promoted at top level — StoreProp runs the set hook with
+// the lent scope.
+class RoH {
+    function __construct(public int $x { set => $value * 2; }) {}
+}
+var_dump((new RoH(3))->x);

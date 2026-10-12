@@ -34,12 +34,20 @@ impl<'a> Interp<'a> {
             .unwrap_or_else(|| self.globals.ns.clone())
     }
 
+    /// The class whose scope the caller runs in — read from the
+    /// live call frame, or the globals pseudo-frame at top level,
+    /// which frame-less fast paths (ctor_leaf) lend the callee's
+    /// scope.
+    pub(in crate::interp) fn caller_scope(&self) -> Option<&Rc<PhpClass>> {
+        let f = self
+            .stack
+            .last()
+            .map(|f| f.as_ref())
+            .unwrap_or(&self.globals);
+        f.decl_class.as_ref().or(f.scope_class.as_ref())
+    }
+
     pub fn caller_scope_name(&self) -> Option<String> {
-        self.stack.last().and_then(|f| {
-            f.decl_class
-                .as_ref()
-                .or(f.scope_class.as_ref())
-                .map(|c| c.name().to_string())
-        })
+        self.caller_scope().map(|c| c.name().to_string())
     }
 }
