@@ -2756,29 +2756,38 @@ impl<'a> Interp<'a> {
                     vs.push(v);
                 }
                 Op::BinaryCvStore(op, sl) => {
-                    // BinaryCv + Store fused: vs.last() keeps the
-                    // stored value, matching the unfused pair's
-                    // peek-and-store shape.
+                    // BinaryCv + Store fused: the pushed value mirrors
+                    // Op::Store's vs.last() — the raw rhs for Arg/Uninit/V
+                    // arms, the post-vm_cell_value value for a cell store
+                    // (a re-read could see a destructor's rewrite).
                     let rv = vs.pop().unwrap();
                     let lv = self.vm_slot_value(comp, slots, *sl)?;
                     let v = self.vm_binary(op, lv, rv)?;
-                    match &mut slots[*sl as usize] {
+                    let stored = match &mut slots[*sl as usize] {
                         Slot::Arg(i) => {
-                            let old = std::mem::replace(&mut self.cur().value_args[*i as usize], v);
+                            let old = std::mem::replace(
+                                &mut self.cur().value_args[*i as usize],
+                                v.clone(),
+                            );
                             self.destruct_dying_value(&old)?;
+                            v
                         }
-                        Slot::Uninit => slots[*sl as usize] = Slot::V(v),
+                        Slot::Uninit => {
+                            slots[*sl as usize] = Slot::V(v.clone());
+                            v
+                        }
                         Slot::V(x) => {
-                            let old = std::mem::replace(x, v);
+                            let old = std::mem::replace(x, v.clone());
                             self.destruct_dying_value(&old)?;
+                            v
                         }
                         Slot::C(c) => {
                             let c = c.clone();
                             let value = self.vm_cell_value(&c, v)?;
-                            self.cell_store(&c, value)?;
+                            self.cell_store(&c, value.clone())?;
+                            value
                         }
-                    }
-                    let stored = self.vm_slot_value(comp, slots, *sl)?;
+                    };
                     vs.push(stored);
                     self.vm_publish_global(comp, slots, *sl);
                 }
