@@ -29,6 +29,11 @@ function object_region_overflow($values) {
     foreach ($values as $value) { $seen++; $sum += $value; }
     return [$seen, is_float($sum)];
 }
+function object_region_overflow_stack($values) {
+    $sum = 1; $seen = 0;
+    foreach ($values as $value) { $seen++; $sum += $value; }
+    return [$seen, $sum];
+}
 function object_region_nested($groups, $points) {
     $sum = 0.0;
     foreach ($groups as $group) {
@@ -119,6 +124,7 @@ echo json_encode(object_region_args($points)), "\n";
 echo json_encode(object_region_scalars([1.5, 3.0, 12.0, 50.0])), "\n";
 echo json_encode(object_region_scalars([1, 2, "3", 12])), "\n";
 echo json_encode(object_region_overflow([1, 1, 1])), "\n";
+echo json_encode(object_region_overflow_stack([PHP_INT_MAX, -PHP_INT_MAX, 3])), "\n";
 echo json_encode(object_region_nested([0, 1, 2], $points)), "\n";
 echo json_encode(object_region_escape([0, 1, 2], [1, 2, 3])), "\n";
 echo json_encode(object_region_ref([1, 2, 3])), "\n";
