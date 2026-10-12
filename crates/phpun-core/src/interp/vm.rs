@@ -2054,7 +2054,13 @@ impl<'a> Interp<'a> {
                     decl.params
                         .iter()
                         .filter(|p| p.promoted)
-                        .any(|p| p.hooks.is_some() || self.hooked_prop(o, &p.name).is_some())
+                        .any(|p| p.hooks.is_some())
+                        || (self.class_has_hooked_prop(&o.borrow().class)
+                            && decl
+                                .params
+                                .iter()
+                                .filter(|p| p.promoted)
+                                .any(|p| self.hooked_prop(o, &p.name).is_some()))
                 });
                 if hooked {
                     self.vm_materialize(comp, &mut slots);
