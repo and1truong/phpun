@@ -2,7 +2,7 @@
 use super::{CachedFn, Compiled, FunctionDecl, Interp, Op, Rc, Slot, Value};
 use std::cell::Cell;
 
-mod region;
+pub(in crate::interp) mod region;
 
 pub(in crate::interp) enum State {
     Cold(u32),

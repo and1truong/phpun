@@ -7,6 +7,8 @@
 pub(in crate::interp) mod native;
 
 mod bool_loop;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod region_obj;
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -324,6 +326,10 @@ enum Op {
         /// u16::MAX when the loop has no `$k =>`.
         kslot: u16,
         end: usize,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        native: std::cell::OnceCell<Option<(native::Program, Vec<Option<usize>>)>>,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        region_fails: std::cell::Cell<u64>,
     },
     /// Direct literal-name call with Zend's persistent call-site cache.
     /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
@@ -1003,6 +1009,10 @@ impl Compiler {
                     vslot,
                     kslot,
                     end: usize::MAX,
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    native: std::cell::OnceCell::new(),
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    region_fails: std::cell::Cell::new(0),
                 });
                 self.loops.push((Vec::new(), Vec::new()));
                 self.stmts(body)?;
@@ -2674,7 +2684,35 @@ impl<'a> Interp<'a> {
                     vslot,
                     kslot,
                     end,
+                    ..
                 } => {
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    if let Op::FeNext {
+                        native,
+                        region_fails,
+                        ..
+                    } = &comp.ops[pc]
+                    {
+                        if vs.is_empty() {
+                            if let Some((resume, flow, vals)) = self.vm_obj_region(
+                                comp,
+                                slots,
+                                tmark,
+                                &mut fe_states,
+                                native,
+                                region_fails,
+                                pc,
+                                *end,
+                            )? {
+                                vs.extend(vals);
+                                if let Some(flow) = flow {
+                                    return Ok(flow);
+                                }
+                                pc = resume;
+                                continue;
+                            }
+                        }
+                    }
                     let next = fe_states
                         .get_mut(*idx as usize)
                         .and_then(|s| s.as_mut())
@@ -5000,6 +5038,69 @@ mod tests {
     use super::Interp;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     use std::rc::Rc;
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn object_regions_execute_and_resume_without_replaying_side_effects() {
+        let mut it = Interp::new("object-regions.php");
+        let result = it.run_source(include_str!("../../tests/fixtures/vm_object_regions.php"));
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.err_buf, "");
+        assert_eq!(
+            it.out,
+            include_bytes!("../../tests/fixtures/vm_object_regions.expect")
+        );
+        for name in [
+            "object_region_sum",
+            "object_region_scalars",
+            "object_region_overflow",
+            "object_region_nested",
+        ] {
+            let decl = it.functions[name].clone();
+            let compiled = it.vm_compiled(&decl).unwrap();
+            assert!(
+                compiled.ops.iter().any(|op| matches!(op,
+                    super::Op::FeNext { native, .. }
+                        if native.get().and_then(Option::as_ref)
+                            .is_some_and(|(p, _)| p.executions.get() > 0)
+                )),
+                "{name} never completed a native region"
+            );
+        }
+        let decl = it.functions["object_region_overflow"].clone();
+        let compiled = it.vm_compiled(&decl).unwrap();
+        assert!(
+            compiled.ops.iter().any(|op| matches!(op,
+                super::Op::FeNext { region_fails, .. } if region_fails.get() > 0
+            )),
+            "integer overflow must resume at the failing arithmetic op"
+        );
+        for name in [
+            "object_region_alias",
+            "object_region_args",
+            "object_region_ctor",
+            "object_region_escape",
+        ] {
+            let decl = it.functions[name].clone();
+            let compiled = it.vm_compiled(&decl).unwrap();
+            assert!(
+                compiled.ops.iter().all(|op| !matches!(op,
+                    super::Op::FeNext { native, .. }
+                        if native.get().and_then(Option::as_ref)
+                            .is_some_and(|(p, _)| p.executions.get() > 0)
+                )),
+                "{name} must stay canonical"
+            );
+        }
+        let decl = it.functions["object_region_ref"].clone();
+        let compiled = it.vm_compiled(&decl).unwrap();
+        assert!(!compiled
+            .ops
+            .iter()
+            .any(|op| matches!(op, super::Op::FeNext { .. })));
+        let decl = it.functions["object_region_generator"].clone();
+        assert!(it.vm_compiled(&decl).is_none());
+    }
 
     #[test]
     fn scalar_dimension_slots_preserve_mutation_refs_views_and_fallbacks() {
