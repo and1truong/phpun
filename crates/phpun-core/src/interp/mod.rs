@@ -949,7 +949,7 @@ pub struct Interp<'a> {
     /// destructed object alive forever) and go stale with the object
     /// — a dead entry at a recycled address is simply unmarked
     /// (bug74053).
-    destructed: HashMap<usize, std::rc::Weak<RefCell<PhpObject>>>,
+    destructed: crate::value::FxMap<usize, std::rc::Weak<RefCell<PhpObject>>>,
     /// Next `destructed` size that triggers a stale-weak prune —
     /// doubling growth like `ref_cells_prune`.
     destructed_prune: usize,
@@ -1977,7 +1977,7 @@ impl<'a> Interp<'a> {
             t0: std::time::Instant::now(),
             spawn_seq: 0,
             fcc_fn_cache: HashMap::new(),
-            destructed: HashMap::new(),
+            destructed: crate::value::FxMap::default(),
             destructed_prune: 1024,
             expr_temps: Vec::new(),
             last_popped_frame: None,

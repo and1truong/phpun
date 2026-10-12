@@ -2276,7 +2276,47 @@ impl<'a> Interp<'a> {
                 _ => None,
             }
         } else {
-            None
+            // Numeric fast arms: Float×Float and Int/Float scalars. `/`
+            // still drops to canonical on a zero divisor (zend throws),
+            // `%` keeps int-mod semantics, `===`/`!==` stay type-strict
+            // (int !== float), and `<=>` falls through when an operand
+            // is NaN (zend orders NaN greater — Int(1), not the
+            // partial_cmp None → 0 fold). int→f64 casts are lossy the
+            // same way zend's compare is.
+            let num = |v: &Value| match v {
+                Value::Int(v) => Some(*v as f64),
+                Value::Float(v) => Some(*v),
+                _ => None,
+            };
+            match (num(&lv), num(&rv)) {
+                (Some(a), Some(b)) => match op {
+                    "+" => Some(Value::Float(a + b)),
+                    "-" => Some(Value::Float(a - b)),
+                    "*" => Some(Value::Float(a * b)),
+                    "/" if b != 0.0 => Some(Value::Float(a / b)),
+                    "==" => Some(Value::Bool(a == b)),
+                    "!=" => Some(Value::Bool(a != b)),
+                    "<=>" if !a.is_nan() && !b.is_nan() => {
+                        Some(Value::Int(match a.partial_cmp(&b) {
+                            Some(Ordering::Less) => -1,
+                            Some(Ordering::Greater) => 1,
+                            _ => 0,
+                        }))
+                    }
+                    "<" => Some(Value::Bool(a < b)),
+                    "<=" => Some(Value::Bool(a <= b)),
+                    ">" => Some(Value::Bool(a > b)),
+                    ">=" => Some(Value::Bool(a >= b)),
+                    "===" if matches!((&lv, &rv), (Value::Float(_), Value::Float(_))) => {
+                        Some(Value::Bool(a == b))
+                    }
+                    "!==" if matches!((&lv, &rv), (Value::Float(_), Value::Float(_))) => {
+                        Some(Value::Bool(a != b))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
         };
         Ok(match fast {
             Some(v) => v,
@@ -4714,8 +4754,9 @@ impl<'a> Interp<'a> {
         {
             return None;
         }
-        let mut values = [0.0f64; 64];
+        let mut values = [0.0f64; 16];
         let mut used = 0usize;
+        let mut obj_cell = None;
         for op in &comp.ops {
             let value = match op {
                 Op::Const(Value::Float(v)) => Some(*v),
@@ -4727,7 +4768,7 @@ impl<'a> Interp<'a> {
                 Op::ThisProp { cache, .. } => {
                     let hit = cache.borrow();
                     let hit = hit.as_ref()?;
-                    let ob = obj.borrow();
+                    let ob = obj_cell.get_or_insert_with(|| obj.borrow());
                     if !Rc::ptr_eq(&hit.class, &ob.class)
                         || !hit
                             .scope
