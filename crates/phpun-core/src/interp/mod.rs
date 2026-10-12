@@ -953,6 +953,10 @@ pub struct Interp<'a> {
     /// Next `destructed` size that triggers a stale-weak prune —
     /// doubling growth like `ref_cells_prune`.
     destructed_prune: usize,
+    /// Per-class verdict: some prop on the class or an ancestor carries
+    /// hooks — hooks live on decls and class ptrs are registration-
+    /// stable, so the answer never changes once the chain is bound.
+    cls_hooked: crate::value::FxMap<usize, bool>,
     /// `new` temporaries of the running expression statement — swept
     /// at statement end so unowned objects destruct promptly
     /// (bug29368_2/_3).
@@ -1978,6 +1982,7 @@ impl<'a> Interp<'a> {
             spawn_seq: 0,
             fcc_fn_cache: HashMap::new(),
             destructed: crate::value::FxMap::default(),
+            cls_hooked: crate::value::FxMap::default(),
             destructed_prune: 1024,
             expr_temps: Vec::new(),
             last_popped_frame: None,
