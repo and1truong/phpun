@@ -446,6 +446,18 @@ type ObjFail = Vec<(usize, usize)>;
 
 /// Ops an object region can emit — a native fast arm or a helper call.
 fn obj_supported(op: &Op) -> bool {
+    if let Op::Binary(operator)
+    | Op::BinaryCv(operator, _)
+    | Op::BinaryCvConst(operator, _, _)
+    | Op::BinaryCvStore(operator, _) = op
+    {
+        if !matches!(
+            *operator,
+            "+" | "-" | "*" | "%" | "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">="
+        ) {
+            return false;
+        }
+    }
     matches!(
         op,
         Op::Const(Value::Int(_) | Value::Bool(_) | Value::Float(_) | Value::Null)

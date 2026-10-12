@@ -5054,6 +5054,7 @@ mod tests {
             "object_region_sum",
             "object_region_scalars",
             "object_region_overflow",
+            "object_region_overflow_stack",
             "object_region_nested",
         ] {
             let decl = it.functions[name].clone();
@@ -5100,6 +5101,68 @@ mod tests {
             .any(|op| matches!(op, super::Op::FeNext { .. })));
         let decl = it.functions["object_region_generator"].clone();
         assert!(it.vm_compiled(&decl).is_none());
+
+        // A GC pause must neither consume a snapshot item nor permanently
+        // disable the region. The canonical fetch will service the overflow.
+        let decl = it.functions["object_region_sum"].clone();
+        let compiled = it.vm_compiled(&decl).unwrap();
+        let (start, end, idx) = compiled
+            .ops
+            .iter()
+            .enumerate()
+            .find_map(|(pc, op)| match op {
+                super::Op::FeNext { end, idx, .. } => Some((pc, *end, *idx)),
+                _ => None,
+            })
+            .unwrap();
+        let mut slots: Vec<_> = (0..compiled.nslots).map(|_| super::Slot::Uninit).collect();
+        let mut states: Vec<_> = (0..=idx).map(|_| None).collect();
+        states[idx as usize] = Some(
+            vec![(
+                crate::value::ArrKey::Int(0),
+                super::FeItem::Val(super::Value::Int(7)),
+            )]
+            .into_iter(),
+        );
+        let points = Rc::new(std::cell::RefCell::new(crate::value::PhpArray::new()));
+        it.globals_arr = None;
+        it.gc_pending = 9_996;
+        it.gc_purpled.insert(Rc::as_ptr(&points) as usize);
+        let native = std::cell::OnceCell::new();
+        let fails = std::cell::Cell::new(0);
+        let tmark = it.expr_temps.len();
+        assert!(it
+            .vm_obj_region(
+                &compiled,
+                &mut slots,
+                tmark,
+                &mut states,
+                &native,
+                &fails,
+                start,
+                end,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(states[idx as usize].as_ref().unwrap().len(), 1);
+        assert_eq!(fails.get(), 0);
+        it.gc_pending = 0;
+        it.gc_purpled.clear();
+        assert!(it
+            .vm_obj_region(
+                &compiled,
+                &mut slots,
+                tmark,
+                &mut states,
+                &native,
+                &fails,
+                start,
+                end,
+            )
+            .unwrap()
+            .is_some());
+        assert_eq!(states[idx as usize].as_ref().unwrap().len(), 0);
+        assert_eq!(fails.get(), 1, "the non-object method receiver must deopt");
     }
 
     #[test]
