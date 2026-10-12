@@ -3352,11 +3352,13 @@ impl<'a> Interp<'a> {
         // cell (`=&` alias still owned by props/statics/another var)
         // keeps its content — the frame's handle dropping is not a
         // zval decref (gh10168: call1's $tmp survives in $box->value).
-        let mut cell_refs: FxMap<usize, usize> = FxMap::default();
+        let mut cell_refs: FxMap<usize, usize> =
+            FxMap::with_capacity_and_hasher(cells.len(), crate::value::FxBuild::default());
         for c in cells {
             *cell_refs.entry(Rc::as_ptr(c) as usize).or_default() += 1;
         }
-        let mut held: FxMap<usize, (usize, Rc<RefCell<PhpObject>>)> = FxMap::default();
+        let mut held: FxMap<usize, (usize, Rc<RefCell<PhpObject>>)> =
+            FxMap::with_capacity_and_hasher(cells.len(), crate::value::FxBuild::default());
         for c in cells {
             let seen = cell_refs[&(Rc::as_ptr(c) as usize)];
             // +1 = the owner's map slot being torn down after us.

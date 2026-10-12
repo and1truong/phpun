@@ -91,7 +91,15 @@ pub(crate) struct Compiled {
     /// Bounded, read-only f64 expression leaf; runtime IC/owner guards remain.
     float_leaf: bool,
     ctor_leaf: bool,
+    /// ctor_leaf prop-write memo — (obj class ptr, caller scope ptr)
+    /// → per-param PromoteSite. The resolution is class-static, so it
+    /// recomputes only on a fresh key (polymorphic `new static`).
+    promote_ic: std::cell::RefCell<PromoteIc>,
 }
+
+/// Promote-site memo table — see `Compiled::promote_ic`.
+type PromoteIc =
+    crate::value::FxMap<(usize, usize), Vec<Option<crate::interp::members::PromoteSite>>>;
 
 pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -573,6 +581,7 @@ impl Compiled {
             value_abi,
             float_leaf,
             ctor_leaf,
+            promote_ic: std::cell::RefCell::new(crate::value::FxMap::default()),
         }))
     }
 
@@ -616,6 +625,7 @@ impl Compiled {
             value_abi: false,
             float_leaf: false,
             ctor_leaf: false,
+            promote_ic: std::cell::RefCell::new(crate::value::FxMap::default()),
         }))
     }
 }
@@ -3801,9 +3811,35 @@ impl<'a> Interp<'a> {
             Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
         }
         self.last_call_by_ref = false;
+        // Prop-site memo: resolve_direct/hook/flat scans are
+        // class-static per (obj class, caller scope) — pay them once,
+        // then a Vec index per param. The borrow drops before each
+        // write: store_prop can re-enter (magic __set → new).
+        let scope_key = {
+            let f = self.cur();
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|c| Rc::as_ptr(c) as usize)
+                .unwrap_or(0)
+        };
+        let ic_key = (Rc::as_ptr(&obj.borrow().class) as usize, scope_key);
         for (i, p) in decl.params.iter().enumerate() {
-            if let Err(e) = self.promoted_prop_write(obj, Some(&core.dc), &p.name, argv[i].clone())
-            {
+            let site = {
+                let mut ic = comp.promote_ic.borrow_mut();
+                let sites = ic
+                    .entry(ic_key)
+                    .or_insert_with(|| vec![None; decl.params.len()]);
+                match sites.get_mut(i).and_then(|e| *e) {
+                    Some(s) => s,
+                    None => {
+                        let s = self.promote_site(obj, &core.dc, &p.name);
+                        sites[i] = Some(s);
+                        s
+                    }
+                }
+            };
+            if let Err(e) = self.promoted_write(obj, &core.dc, &p.name, site, argv[i].clone()) {
                 return Some(Err(e));
             }
         }

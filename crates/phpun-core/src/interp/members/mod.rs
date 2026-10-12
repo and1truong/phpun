@@ -12,6 +12,8 @@ mod props;
 mod statics;
 mod views;
 
+pub(in crate::interp) use props::PromoteSite;
+
 impl<'a> Interp<'a> {
     /// Name of the class whose scope the current frame runs in —
     /// private props are only visible to their own declaring class.

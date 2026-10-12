@@ -4,6 +4,18 @@
 
 use super::*;
 
+/// Where a promoted-prop write lands: `Direct` publishes straight
+/// into the flat slot, `KeyPath` uses the canonical mangled-key
+/// map write (flat table absent), `StoreProp` keeps the full
+/// store_prop machinery. The outcome is class-static per
+/// (obj class, caller scope) pair — memoizable.
+#[derive(Clone, Copy)]
+pub(in crate::interp) enum PromoteSite {
+    Direct(usize),
+    KeyPath,
+    StoreProp,
+}
+
 impl<'a> Interp<'a> {
     // ----- property hooks (PHP 8.4, Zend/tests/property_hooks) -----
 
@@ -64,19 +76,20 @@ impl<'a> Interp<'a> {
     /// scope/visibility/undeclared machinery. Anything else falls
     /// back to the full path (readonly double-init errors, hooks,
     /// exotic decls).
-    pub(in crate::interp) fn promoted_prop_write(
-        &mut self,
+    /// The direct/key/store decision promoted_prop_write makes per
+    /// write — extracted so ctor_leaf can memoize it per param.
+    pub(in crate::interp) fn promote_site(
+        &self,
         obj: &Rc<RefCell<PhpObject>>,
-        dc: Option<&Rc<PhpClass>>,
+        dc: &Rc<PhpClass>,
         pname: &str,
-        v: Value,
-    ) -> Result<(), PhpError> {
-        let p = dc.and_then(|c| c.decl.props.iter().find(|p| p.name == pname));
+    ) -> PromoteSite {
+        let p = dc.decl.props.iter().find(|p| p.name == pname);
         // Fast path needs the EFFECTIVE prop to be the same unhooked,
         // non-readonly decl — a child redeclaring it with a hook (or
         // different visibility/readonly) goes through store_prop.
-        let direct = match (dc, p) {
-            (Some(dc), Some(p)) if p.hooks.is_none() && !p.readonly => {
+        let direct = match p {
+            Some(p) if p.hooks.is_none() && !p.readonly => {
                 self.hooked_prop(obj, pname).is_none()
                     && self.decl_prop_site(obj, pname).is_some_and(|(index, ec)| {
                         let ep = &ec.decl.props[index];
@@ -88,52 +101,89 @@ impl<'a> Interp<'a> {
             }
             _ => false,
         };
-        match (dc, p) {
-            (Some(dc), Some(p)) if direct => {
-                // The flat table already stores the mangled key + slot
-                // index — a private promote skips its per-write format!
-                // and hash lookup. Missing table → canonical key path.
-                let flat_i = dc.flat_props.get().and_then(|flat| {
-                    flat.iter().position(|fp| {
-                        std::rc::Rc::ptr_eq(&fp.declaring, dc)
-                            && dc.decl.props[fp.prop_idx].name == pname
-                    })
-                });
-                if let Some(i) = flat_i {
-                    let mut o = obj.borrow_mut();
-                    if let Some(s) = o.slots.get_mut(i) {
-                        match s.take() {
-                            Some(c) => {
-                                *c.borrow_mut() = v;
-                                *s = Some(c);
-                            }
-                            None => *s = Some(super::cell(v)),
-                        }
-                        o.unset_props.remove(&dc.flat_props.get().unwrap()[i].key);
-                        return Ok(());
+        if !direct {
+            return PromoteSite::StoreProp;
+        }
+        // The flat table already stores the mangled key + slot index —
+        // a private promote skips its per-write format! and hash
+        // lookup. Missing table → canonical key path.
+        let flat_i = dc.flat_props.get().and_then(|flat| {
+            flat.iter().position(|fp| {
+                std::rc::Rc::ptr_eq(&fp.declaring, dc) && dc.decl.props[fp.prop_idx].name == pname
+            })
+        });
+        match flat_i {
+            Some(i) => PromoteSite::Direct(i),
+            None => PromoteSite::KeyPath,
+        }
+    }
+
+    /// Execute a promoted-prop write for an already-resolved site —
+    /// the three outcome arms of promoted_prop_write.
+    pub(in crate::interp) fn promoted_write(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        dc: &Rc<PhpClass>,
+        pname: &str,
+        site: PromoteSite,
+        v: Value,
+    ) -> Result<(), PhpError> {
+        let p = dc.decl.props.iter().find(|p| p.name == pname);
+        if let PromoteSite::Direct(i) = site {
+            let mut o = obj.borrow_mut();
+            if let Some(s) = o.slots.get_mut(i) {
+                match s.take() {
+                    Some(c) => {
+                        *c.borrow_mut() = v;
+                        *s = Some(c);
                     }
+                    None => *s = Some(super::cell(v)),
                 }
-                let key = if p.visibility == crate::ast::Visibility::Private {
-                    format!("\0{}\0{}", dc.name(), pname)
-                } else {
-                    pname.to_string()
-                };
-                let mut o = obj.borrow_mut();
-                match o.prop_get(&key) {
-                    Some(c) => *c.borrow_mut() = v,
-                    None => {
-                        // Typed-uninit slot: order was reserved at
-                        // instantiate, the cell lands now.
-                        o.prop_insert(key.clone(), cell(v));
-                        if !o.prop_order.contains(&key) {
-                            Rc::make_mut(&mut o.prop_order).push(key.clone());
-                        }
-                    }
-                }
-                o.unset_props.remove(&key);
-                Ok(())
+                o.unset_props.remove(&dc.flat_props.get().unwrap()[i].key);
+                return Ok(());
             }
-            _ => self
+        }
+        if matches!(site, PromoteSite::StoreProp) || p.is_none() {
+            return self
+                .store_prop(Value::Object(obj.clone()), pname, v)
+                .map(|_| ());
+        }
+        let p = p.unwrap();
+        let key = if p.visibility == crate::ast::Visibility::Private {
+            format!("\0{}\0{}", dc.name(), pname)
+        } else {
+            pname.to_string()
+        };
+        let mut o = obj.borrow_mut();
+        match o.prop_get(&key) {
+            Some(c) => *c.borrow_mut() = v,
+            None => {
+                // Typed-uninit slot: order was reserved at
+                // instantiate, the cell lands now.
+                o.prop_insert(key.clone(), cell(v));
+                if !o.prop_order.contains(&key) {
+                    Rc::make_mut(&mut o.prop_order).push(key.clone());
+                }
+            }
+        }
+        o.unset_props.remove(&key);
+        Ok(())
+    }
+
+    pub(in crate::interp) fn promoted_prop_write(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        dc: Option<&Rc<PhpClass>>,
+        pname: &str,
+        v: Value,
+    ) -> Result<(), PhpError> {
+        let site = match dc {
+            Some(dc) => self.promote_site(obj, dc, pname),
+            None => PromoteSite::StoreProp,
+        };
+        match dc {
+            Some(dc) => self.promoted_write(obj, dc, pname, site, v),
+            None => self
                 .store_prop(Value::Object(obj.clone()), pname, v)
                 .map(|_| ()),
         }
