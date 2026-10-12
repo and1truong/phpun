@@ -7057,19 +7057,71 @@ impl<'a> Interp<'a> {
                     // No graph target or PHP callback can appear during this
                     // last-owner walk. Mixed/nested/resource tables retain
                     // the full dying-cell snapshot before callbacks run.
-                    if a.borrow().entries.is_scalar_packed()
-                        || a.borrow().entries.iter().all(|(_, c)| {
-                            matches!(
-                                &*c.borrow(),
-                                Value::Null
+                    {
+                        let b = a.borrow();
+                        if b.entries.is_scalar_packed() {
+                            return;
+                        }
+                        // `gc_purpled` empty also proves every
+                        // `gc_maybe_collect` below is the drain-only path —
+                        // no real collect, no dtor can run mid-walk to
+                        // mutate a prop and stale the flat verdicts.
+                        let quiet = self.gc_purpled.is_empty()
+                            && b.entries.iter().all(|(_, c)| {
+                                if Rc::strong_count(c) > 1 {
+                                    return false;
+                                }
+                                match &*c.borrow() {
+                                    Value::Null
                                     | Value::Bool(_)
                                     | Value::Int(_)
                                     | Value::Float(_)
-                                    | Value::Str(_)
-                            )
-                        })
-                    {
-                        return;
+                                    | Value::Str(_) => true,
+                                    Value::Object(o) => {
+                                        let ob = o.borrow();
+                                        ob.internal.is_none()
+                                            && ob
+                                                .slots
+                                                .iter()
+                                                .flatten()
+                                                .chain(ob.props.values())
+                                                .all(|c| {
+                                                    matches!(
+                                                        &*c.borrow(),
+                                                        Value::Null
+                                                            | Value::Bool(_)
+                                                            | Value::Int(_)
+                                                            | Value::Float(_)
+                                                            | Value::Str(_)
+                                                    )
+                                                })
+                                    }
+                                    _ => false,
+                                }
+                            });
+                        // Every element scalar or an unshared flat object:
+                        // the canonical slot's two clones leave each object
+                        // with >1 owner, so every step already reduces to
+                        // `gc_note_purple_obj`'s flat arm — a pending count
+                        // and a collect check, never a keyed root (flat
+                        // objects hold no graph target, and with no shared
+                        // cells nothing outside reaches this dying table).
+                        // `depth` gates twice on the way here: the slot
+                        // call needs depth-1>0 and its gc_note_dying
+                        // recursion needs depth-2>0 to act, so this path
+                        // only runs where the walk would actually count.
+                        if quiet && depth >= 3 {
+                            for (_, c) in b.entries.iter() {
+                                if matches!(&*c.borrow(), Value::Object(_)) {
+                                    self.gc_maybe_collect();
+                                    self.gc_pending += 1;
+                                }
+                            }
+                            return;
+                        }
+                        if quiet {
+                            return;
+                        }
                     }
                     let dying = {
                         let b = a.borrow();
