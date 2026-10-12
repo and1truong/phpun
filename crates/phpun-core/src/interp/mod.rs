@@ -3155,18 +3155,25 @@ impl<'a> Interp<'a> {
         if self.expr_temps.len() == base {
             return Ok(());
         }
-        let temps = self.expr_temps.split_off(base);
-        for o in temps {
-            if Rc::strong_count(&o) != 1 {
-                if keep.is_some_and(|k| Rc::as_ptr(&o) as usize == k) && Rc::strong_count(&o) == 2 {
-                    self.expr_temps.push(o);
+        // Walk the tail in place — split_off heap-alloc'd a Vec per
+        // statement. The count check borrows the entry; the clone
+        // only happens on the rare last-ref dtor path. Kept survivors
+        // re-land above base for the next sweep, same as the split.
+        let n = self.expr_temps.len();
+        let mut kept: Vec<Rc<RefCell<PhpObject>>> = Vec::new();
+        for i in base..n {
+            let o = &self.expr_temps[i];
+            if Rc::strong_count(o) != 1 {
+                if keep.is_some_and(|k| Rc::as_ptr(o) as usize == k) && Rc::strong_count(o) == 2 {
+                    kept.push(o.clone());
                 }
                 continue;
             }
-            let key = Rc::as_ptr(&o) as usize;
+            let key = Rc::as_ptr(o) as usize;
             if self.was_destructed(key) {
                 continue;
             }
+            let o = o.clone();
             if self
                 .find_method_in(&o.borrow().class, "__destruct")
                 .is_some()
@@ -3176,6 +3183,8 @@ impl<'a> Interp<'a> {
                 self.mark_obj_died(&o);
             }
         }
+        self.expr_temps.truncate(base);
+        self.expr_temps.extend(kept);
         Ok(())
     }
 
