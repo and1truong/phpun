@@ -3024,7 +3024,12 @@ impl<'a> Interp<'a> {
         // after the source resolves: a missing source keeps its own
         // 'not found' warning.
         if let Some(c) = self.classes.get(&key).cloned() {
-            if self.alias_shadowed(alias, &alias_l)? {
+            let kind = if c.decl.kind == crate::ast::ClassKind::Enum {
+                "enum"
+            } else {
+                "class"
+            };
+            if self.alias_shadowed(alias, &alias_l, kind, &c.decl.file, c.decl.line)? {
                 return Ok(false);
             }
             self.classes.insert(alias_l.clone(), c);
@@ -3033,7 +3038,7 @@ impl<'a> Interp<'a> {
             return Ok(true);
         }
         if let Some(i) = self.interfaces.get(&key).cloned() {
-            if self.alias_shadowed(alias, &alias_l)? {
+            if self.alias_shadowed(alias, &alias_l, "interface", &i.file, i.line)? {
                 return Ok(false);
             }
             self.interfaces.insert(alias_l.clone(), i);
@@ -3042,7 +3047,7 @@ impl<'a> Interp<'a> {
             return Ok(true);
         }
         if let Some(t) = self.traits.get(&key).cloned() {
-            if self.alias_shadowed(alias, &alias_l)? {
+            if self.alias_shadowed(alias, &alias_l, "trait", &t.file, t.line)? {
                 return Ok(false);
             }
             self.traits.insert(alias_l.clone(), t);
@@ -3054,17 +3059,25 @@ impl<'a> Interp<'a> {
         Ok(false)
     }
 
-    /// Occupied alias name — zend refuses the shadow ("Cannot
-    /// redeclare K A (previously declared in F:L)", K = the
-    /// existing decl's kind) and returns false.
-    fn alias_shadowed(&mut self, alias: &str, alias_l: &str) -> Result<bool, PhpError> {
-        let Some((kind, file, line)) = self.existing_class_site(alias_l) else {
+    /// Occupied alias name — zend refuses the shadow and returns
+    /// false. The redeclare diagnostic describes the SOURCE decl
+    /// (kind + decl site), named by the alias: class_alias reads as
+    /// "re-declare the source under a new name".
+    fn alias_shadowed(
+        &mut self,
+        alias: &str,
+        alias_l: &str,
+        kind: &str,
+        file: &str,
+        line: usize,
+    ) -> Result<bool, PhpError> {
+        if self.existing_class_site(alias_l).is_none() {
             return Ok(false);
-        };
+        }
         self.warn(&Self::redeclare_class_msg(
             kind,
             alias.trim_start_matches('\\'),
-            &file,
+            file,
             line,
         ))?;
         Ok(true)
