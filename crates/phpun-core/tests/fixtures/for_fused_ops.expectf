@@ -1,0 +1,14 @@
+lt 10
+gt 40
+le 1 1
+0 1 2 4 5 
+
+Warning: Undefined variable $undef_x in %s on line %d
+done
+
+Deprecated: Increment on non-numeric string is deprecated, use str_increment() instead in %s on line %d
+
+Deprecated: Increment on non-numeric string is deprecated, use str_increment() instead in %s on line %d
+str c
+nest 6
+ref 9 3

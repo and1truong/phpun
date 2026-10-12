@@ -225,9 +225,15 @@ impl<'a> Interp<'a> {
         // write pass's re-lookup would read post-handler values).
         self.last_prop_ov = None;
         if !self.in_handler {
-            self.dim_key_conv.clear();
-            self.dim_cv_bound.clear();
-            self.dim_undef_cells.clear();
+            if !self.dim_key_conv.is_empty() {
+                self.dim_key_conv.clear();
+            }
+            if !self.dim_cv_bound.is_empty() {
+                self.dim_cv_bound.clear();
+            }
+            if !self.dim_undef_cells.is_empty() {
+                self.dim_undef_cells.clear();
+            }
         }
         None
     }
@@ -299,9 +305,7 @@ impl<'a> Interp<'a> {
                             if let Value::Object(o) = &v {
                                 if Rc::strong_count(o) == 2
                                     && self.expr_temps.iter().any(|t| Rc::ptr_eq(t, o))
-                                    && self
-                                        .find_method_in(&o.borrow().class, "__destruct")
-                                        .is_some()
+                                    && self.class_dtor(o).is_some()
                                     && self.mark_destructed(o)
                                 {
                                     if let Err(e) = self.method_invoke(
@@ -1829,11 +1833,7 @@ impl<'a> Interp<'a> {
         if Rc::strong_count(&it) == 2 && self.expr_temps.iter().any(|o| Rc::ptr_eq(o, &it)) {
             self.expr_temps.retain(|o| !Rc::ptr_eq(o, &it));
             let key = Rc::as_ptr(&it) as usize;
-            if !self.was_destructed(key)
-                && self
-                    .find_method_in(&it.borrow().class, "__destruct")
-                    .is_some()
-            {
+            if !self.was_destructed(key) && self.class_dtor(&it).is_some() {
                 self.mark_destructed(&it);
                 if let Err(e) = self.method_invoke(it.clone(), "__destruct", CallArgs::empty()) {
                     return self.err_flow(e);

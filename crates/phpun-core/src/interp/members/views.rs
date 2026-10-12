@@ -3019,19 +3019,37 @@ impl<'a> Interp<'a> {
         }
         let alias_l = alias.trim_start_matches('\\').to_lowercase();
         let key = name.trim_start_matches('\\').to_lowercase();
+        // Zend refuses to shadow an existing name — "Cannot redeclare
+        // class A (previously declared in F:L)" + false — but only
+        // after the source resolves: a missing source keeps its own
+        // 'not found' warning.
         if let Some(c) = self.classes.get(&key).cloned() {
+            let kind = if c.decl.kind == crate::ast::ClassKind::Enum {
+                "enum"
+            } else {
+                "class"
+            };
+            if self.alias_shadowed(alias, &alias_l, kind, &c.decl.file, c.decl.line)? {
+                return Ok(false);
+            }
             self.classes.insert(alias_l.clone(), c);
             self.decl_aliases
                 .push((crate::ast::ClassKind::Class, alias_l));
             return Ok(true);
         }
         if let Some(i) = self.interfaces.get(&key).cloned() {
+            if self.alias_shadowed(alias, &alias_l, "interface", &i.file, i.line)? {
+                return Ok(false);
+            }
             self.interfaces.insert(alias_l.clone(), i);
             self.decl_aliases
                 .push((crate::ast::ClassKind::Interface, alias_l));
             return Ok(true);
         }
         if let Some(t) = self.traits.get(&key).cloned() {
+            if self.alias_shadowed(alias, &alias_l, "trait", &t.file, t.line)? {
+                return Ok(false);
+            }
             self.traits.insert(alias_l.clone(), t);
             self.decl_aliases
                 .push((crate::ast::ClassKind::Trait, alias_l));
@@ -3039,6 +3057,30 @@ impl<'a> Interp<'a> {
         }
         self.warn(&format!("Class \"{}\" not found", name))?;
         Ok(false)
+    }
+
+    /// Occupied alias name — zend refuses the shadow and returns
+    /// false. The redeclare diagnostic describes the SOURCE decl
+    /// (kind + decl site), named by the alias: class_alias reads as
+    /// "re-declare the source under a new name".
+    fn alias_shadowed(
+        &mut self,
+        alias: &str,
+        alias_l: &str,
+        kind: &str,
+        file: &str,
+        line: usize,
+    ) -> Result<bool, PhpError> {
+        if self.existing_class_site(alias_l).is_none() {
+            return Ok(false);
+        }
+        self.warn(&Self::redeclare_class_msg(
+            kind,
+            alias.trim_start_matches('\\'),
+            file,
+            line,
+        ))?;
+        Ok(true)
     }
 
     /// Does this object's class implement `iname` (transitively)?
@@ -3220,6 +3262,23 @@ impl<'a> Interp<'a> {
         false
     }
 
+    /// Every declared ancestor resolved — a method-resolution miss is
+    /// registration-stable only then: a parent can still be
+    /// mid-registration (on the linking stack) when an autoload probes
+    /// the child, so an unbound hop means re-probe, never cache.
+    pub(in crate::interp) fn class_chain_bound(&mut self, cls: &Rc<PhpClass>) -> bool {
+        let mut cur = cls.clone();
+        loop {
+            if cur.decl.parent.is_none() {
+                return true;
+            }
+            match self.parent_of(&cur) {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+    }
+
     pub fn find_method_in(
         &mut self,
         cls: &Rc<PhpClass>,
@@ -3228,7 +3287,10 @@ impl<'a> Interp<'a> {
         // Monomorphic probe: class-keyed resolution is stable (methods
         // can't be added post-registration). Two slots — the teardown
         // probes (`__destruct`) and call-site names otherwise evict
-        // each other every iteration of a method-calling loop.
+        // each other every iteration of a method-calling loop. A miss
+        // is only cached once the whole extends chain is bound: a
+        // frozen None while a parent is mid-registration would drop
+        // its methods for the lifetime of the entry.
         {
             let ic = cls.method_ic.borrow();
             for e in ic.iter().flatten() {
@@ -3246,12 +3308,14 @@ impl<'a> Interp<'a> {
             }
             cur = self.parent_of(&c);
         }
-        if let Ok(mut ic) = cls.method_ic.try_borrow_mut() {
-            // FIFO fill: keep the resident entries when both slots hit.
-            if ic[0].is_some() {
-                ic[1] = ic[0].take();
+        if out.is_some() || self.class_chain_bound(cls) {
+            if let Ok(mut ic) = cls.method_ic.try_borrow_mut() {
+                // FIFO fill: keep the resident entries when both slots hit.
+                if ic[0].is_some() {
+                    ic[1] = ic[0].take();
+                }
+                ic[0] = Some((name.to_string(), out.clone()));
             }
-            ic[0] = Some((name.to_string(), out.clone()));
         }
         out
     }

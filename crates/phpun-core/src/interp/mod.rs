@@ -2892,9 +2892,7 @@ impl<'a> Interp<'a> {
             // died during the dtor that just ran.
             if Rc::strong_count(&p) != 1
                 || self.was_destructed(Rc::as_ptr(&p) as usize)
-                || self
-                    .find_method_in(&p.borrow().class, "__destruct")
-                    .is_none()
+                || self.class_dtor(&p).is_none()
                 || !self.mark_destructed(&p)
             {
                 continue;
@@ -2980,11 +2978,7 @@ impl<'a> Interp<'a> {
                 }
                 continue;
             }
-            if self
-                .find_method_in(&o.borrow().class, "__destruct")
-                .is_some()
-                && self.mark_destructed(&o)
-            {
+            if self.class_dtor(&o).is_some() && self.mark_destructed(&o) {
                 if let Err(e) = self.shutdown_dtor_invoke(o.clone()) {
                     shutdown_code = Some(match self.err_flow(e) {
                         Flow::Exit(c) => c,
@@ -3073,10 +3067,7 @@ impl<'a> Interp<'a> {
                     if self.was_destructed(key) {
                         continue;
                     }
-                    if self
-                        .find_method_in(&o.borrow().class, "__destruct")
-                        .is_some()
-                    {
+                    if self.class_dtor(&o).is_some() {
                         self.mark_destructed(&o);
                         progressed = true;
                         if let Err(e) = self.shutdown_dtor_invoke(o.clone()) {
@@ -3174,10 +3165,7 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let o = o.clone();
-            if self
-                .find_method_in(&o.borrow().class, "__destruct")
-                .is_some()
-            {
+            if self.class_dtor(&o).is_some() {
                 self.mark_destructed(&o);
                 self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
                 self.mark_obj_died(&o);
@@ -3194,6 +3182,26 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn cell_store(&mut self, c: &Cell, v: Value) -> Result<(), PhpError> {
         let old = std::mem::replace(&mut *c.borrow_mut(), v);
         self.destruct_dying_value(&old)
+    }
+
+    /// `__destruct` on the object's class — memoized on the class
+    /// itself; the (m, dc) pair is registration-fixed, `None` a cached
+    /// miss. Every destructor probe in this file goes through here so
+    /// the polymorphic method_ic keeps serving real sites. A miss is
+    /// cached only once the parent chain is bound (parent_rc
+    /// convention): a parent can still be mid-registration when an
+    /// autoload runs inside a signature check, and a frozen None would
+    /// drop its __destruct forever.
+    fn class_dtor(&mut self, o: &Rc<RefCell<PhpObject>>) -> crate::value::MethodHit {
+        let cls = o.borrow().class.clone();
+        if let Some(hit) = cls.destructor.get() {
+            return hit.clone();
+        }
+        let hit = self.find_method_in(&cls, "__destruct");
+        if hit.is_some() || self.class_chain_bound(&cls) {
+            let _ = cls.destructor.set(hit.clone());
+        }
+        hit
     }
 
     /// Objects whose last refs live inside a dropped value run
@@ -3232,9 +3240,7 @@ impl<'a> Interp<'a> {
         // building the dedup map composites need.
         if let Value::Object(o) = v {
             if Rc::strong_count(o) == 1
-                && self
-                    .find_method_in(&o.borrow().class, "__destruct")
-                    .is_some()
+                && self.class_dtor(o).is_some()
                 && self.mark_destructed(&o.clone())
             {
                 if self.pending_exception.is_some() {
@@ -3272,11 +3278,7 @@ impl<'a> Interp<'a> {
             if Rc::strong_count(&o) != n + 1 {
                 continue;
             }
-            if self
-                .find_method_in(&o.borrow().class, "__destruct")
-                .is_some()
-                && self.mark_destructed(&o)
-            {
+            if self.class_dtor(&o).is_some() && self.mark_destructed(&o) {
                 // A fatal/throw inside the dtor aborts the script
                 // (Zend). While another exception unwinds Zend chains
                 // the dtor error as `Next ...` — not yet modelled, so
@@ -3361,10 +3363,7 @@ impl<'a> Interp<'a> {
         let mut any_dtor = false;
         for c in cells {
             if let Value::Object(o) = &*c.borrow() {
-                if self
-                    .find_method_in(&o.borrow().class, "__destruct")
-                    .is_some()
-                {
+                if self.class_dtor(o).is_some() {
                     any_dtor = true;
                     break;
                 }
@@ -3402,11 +3401,7 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let key = Rc::as_ptr(&o) as usize;
-            if !self.was_destructed(key)
-                && self
-                    .find_method_in(&o.borrow().class, "__destruct")
-                    .is_some()
-            {
+            if !self.was_destructed(key) && self.class_dtor(&o).is_some() {
                 self.mark_destructed(&o);
                 // A throw inside the dtor must not clobber the
                 // in-flight exception being unwound (bug52361) — Zend
@@ -6705,11 +6700,7 @@ impl<'a> Interp<'a> {
                 if let Some(e) = self.gen_fin_replay(&q, false) {
                     first_err = Some(e);
                 }
-            } else if self
-                .find_method_in(&o.borrow().class, "__destruct")
-                .is_some()
-                && self.mark_destructed(o)
-            {
+            } else if self.class_dtor(o).is_some() && self.mark_destructed(o) {
                 let dt = std::time::Instant::now();
                 if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
                     first_err = Some(e);

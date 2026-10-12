@@ -1605,6 +1605,7 @@ impl<'a> Interp<'a> {
                     prop_order_template: std::cell::OnceCell::new(),
                     prop_slot: std::cell::OnceCell::new(),
                     method_ic: std::cell::RefCell::new([None, None]),
+                    destructor: std::cell::OnceCell::new(),
                     short_name: std::cell::OnceCell::new(),
                     statics: std::cell::RefCell::new(std::collections::HashMap::new()),
                     statics_init: std::cell::RefCell::new(false),

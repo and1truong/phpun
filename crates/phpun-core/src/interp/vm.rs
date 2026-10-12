@@ -259,9 +259,30 @@ enum Op {
     AppendCv(u16),
     /// Direct slot + immediate: no RHS value-stack push/pop or separate dispatch.
     BinaryCvConst(&'static str, u16, Value),
+    /// `$cv op= expr` fused: BinaryCv + Store — pop rhs, read slot's
+    /// current value, op it, write-through to the slot and leave the
+    /// stored value on the stack (exactly BinaryCv;Store). Two
+    /// dispatches become one and the rhs push/pop pair vanishes.
+    BinaryCvStore(&'static str, u16),
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
+    /// `Load(a) + Load(b) + Binary(op) + JumpIfFalse(t)` fused — a
+    /// two-CV comparison heading a for-cond, one dispatch instead of four.
+    JumpCmp {
+        a: u16,
+        b: u16,
+        op: &'static str,
+        target: usize,
+    },
+    /// `IncDec(slot, delta, post) + Pop + Jump(t)` fused — the for-inc
+    /// step; the inc result is unconditionally discarded, so `post`
+    /// differences vanish and one dispatch replaces three.
+    IncJump {
+        slot: u16,
+        delta: i64,
+        target: usize,
+    },
     /// Direct literal-name call with Zend's persistent call-site cache.
     /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
     /// for diagnostics. InitCall pins the target before args run.
@@ -293,12 +314,26 @@ enum Op {
         cache: std::cell::RefCell<Option<CachedMethod>>,
         fallback: Box<Expr>,
     },
+    /// Zero-arg `$cv->name()` — InitMethod+MethodCall as one op. Only
+    /// argc==0 is fused: with arg ops between resolution and dispatch
+    /// a fallback eval would re-run their side effects.
+    MethodCallSlot {
+        obj: u16,
+        name: Rc<str>,
+        site: usize,
+        cache: std::cell::RefCell<Option<CachedMethod>>,
+        fallback: Box<Expr>,
+    },
     /// `new X(...)` — class resolves at INIT (zend's order: before arg
     /// side effects). Missing entries fall back to the canonical
     /// `Expr::New` (autoload + not-found errors verbatim).
     InitNew {
         call: usize,
         name: Rc<str>,
+        /// (class, ctor) resolution memo — registered classes are
+        /// append-only so a hit is stable; a miss stays uncached so an
+        /// autoload can still register the class later.
+        cache: std::cell::RefCell<Option<NewTarget>>,
         fallback: Box<Expr>,
     },
     NewCall {
@@ -324,12 +359,18 @@ enum Op {
 
 /// Monomorphic method-dispatch cache at a `MethodCall` site: guards on
 /// the receiver's class and reuses the class-stable resolution —
-/// `core` None means "resolved but not direct-eligible" (stub,
-/// abstract, by-ref, generator, needs-bind, uncompiled), which is
-/// class-stable too. Context checks (scope-private, visibility,
-/// pending hook) still run per call.
+/// `core` None means "canonical path for this (class, scope)" —
+/// resolution miss, not-direct-eligible decl, or a folded-in context
+/// verdict (scope-private shadow, visibility) — all (class, scope,
+/// name)-static. Only `pending_hook_prop` still runs per call.
 struct CachedMethod {
     class: Rc<PhpClass>,
+    /// Caller-scope class (None = none): the resolution verdict —
+    /// scope-private shadowing + visibility — is (class, scope)-static
+    /// per call site, so folding it into the key lets a hit skip the
+    /// per-call context checks entirely. Held by Rc so a freed scope's
+    /// address can't alias into a false hit.
+    scope: Option<Rc<PhpClass>>,
     core: Option<MSiteCore>,
 }
 
@@ -769,7 +810,11 @@ impl Compiler {
 
     fn patch(&mut self, at: usize, target: usize) {
         match &mut self.ops[at] {
-            Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => *t = target,
+            Op::Jump(t)
+            | Op::JumpIfFalse(t)
+            | Op::JumpIfTrue(t)
+            | Op::JumpCmp { target: t, .. }
+            | Op::IncJump { target: t, .. } => *t = target,
             _ => unreachable!("patch target is always a jump op"),
         }
     }
@@ -916,7 +961,36 @@ impl Compiler {
                     self.emit(Op::Pop);
                 }
                 let top = self.ops.len();
-                let jf = if !cond.is_empty() {
+                // `$i < $n` single-CV conds fuse to one JumpCmp op —
+                // the four-op Load+Load+Binary+Jz chain collapses to a
+                // dispatch that reads both slots and branches directly.
+                let jf = if cond.len() == 1
+                    && matches!(
+                        Interp::unmark_rhs(&cond[0]),
+                        Expr::Binary { op, l, r }
+                            if matches!(*op, "<" | "<=" | ">" | ">=")
+                                && matches!(Interp::unmark_rhs(l), Expr::Var(n) if n != "this" && !Interp::is_superglobal(n))
+                                && matches!(Interp::unmark_rhs(r), Expr::Var(n) if n != "this" && !Interp::is_superglobal(n))
+                    ) {
+                    let Expr::Binary { op, l, r } = Interp::unmark_rhs(&cond[0]) else {
+                        unreachable!()
+                    };
+                    let bop: &'static str = op;
+                    let Expr::Var(ln) = Interp::unmark_rhs(l) else {
+                        unreachable!()
+                    };
+                    let Expr::Var(rn) = Interp::unmark_rhs(r) else {
+                        unreachable!()
+                    };
+                    let a = self.slot(ln);
+                    let b = self.slot(rn);
+                    Some(self.emit(Op::JumpCmp {
+                        a,
+                        b,
+                        op: bop,
+                        target: usize::MAX,
+                    }))
+                } else if !cond.is_empty() {
                     for (i, e) in cond.iter().enumerate() {
                         self.expr(e)?;
                         if i + 1 < cond.len() {
@@ -930,11 +1004,41 @@ impl Compiler {
                 self.loops.push((Vec::new(), Vec::new()));
                 self.stmts(body)?;
                 let inc_at = self.ops.len();
-                for e in inc {
-                    self.expr(e)?;
-                    self.emit(Op::Pop);
+                // `$i++`/`$i--` single step fuses inc+pop+jump into one
+                // op — the pushed result is always discarded.
+                let inc_step = if inc.len() == 1 {
+                    match Interp::unmark_rhs(&inc[0]) {
+                        Expr::PostInc(t) | Expr::PreInc(t) => match Interp::unmark_rhs(t) {
+                            Expr::Var(n) if n != "this" && !Interp::is_superglobal(n) => {
+                                Some((n.clone(), 1i64))
+                            }
+                            _ => None,
+                        },
+                        Expr::PostDec(t) | Expr::PreDec(t) => match Interp::unmark_rhs(t) {
+                            Expr::Var(n) if n != "this" && !Interp::is_superglobal(n) => {
+                                Some((n.clone(), -1i64))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((n, delta)) = inc_step {
+                    let slot = self.slot(&n);
+                    self.emit(Op::IncJump {
+                        slot,
+                        delta,
+                        target: top,
+                    });
+                } else {
+                    for e in inc {
+                        self.expr(e)?;
+                        self.emit(Op::Pop);
+                    }
+                    self.emit(Op::Jump(top));
                 }
-                self.emit(Op::Jump(top));
                 let end = self.ops.len();
                 let (breaks, continues) = self.loops.pop().unwrap();
                 for b in breaks {
@@ -1191,8 +1295,12 @@ impl Compiler {
                     } else if let Some(rhs) = const_val(value) {
                         self.emit(Op::BinaryCvConst(bop, slot, rhs));
                     } else {
+                        // AssignBinary fused: rhs eval, then one op
+                        // reads lhs, applies bop and stores back —
+                        // the trailing shared Store is skipped.
                         self.expr(value)?;
-                        self.emit(Op::BinaryCv(bop, slot));
+                        self.emit(Op::BinaryCvStore(bop, slot));
+                        return Some(());
                     }
                 }
                 self.emit(Op::Store(slot));
@@ -1381,22 +1489,32 @@ impl Compiler {
                     unreachable!()
                 };
                 let obj = self.slot(vname);
-                let init = self.emit(Op::InitMethod {
-                    call: usize::MAX,
-                    obj,
-                });
-                for a in args {
-                    self.expr(Interp::unmark_arg(a))?;
-                }
-                let call = self.emit(Op::MethodCall {
-                    name: Rc::from(mname.as_str()),
-                    argc: args.len() as u16,
-                    site: *site,
-                    cache: std::cell::RefCell::new(None),
-                    fallback: Box::new(e.clone()),
-                });
-                if let Op::InitMethod { call: at, .. } = &mut self.ops[init] {
-                    *at = call;
+                if args.is_empty() {
+                    self.emit(Op::MethodCallSlot {
+                        obj,
+                        name: Rc::from(mname.as_str()),
+                        site: *site,
+                        cache: std::cell::RefCell::new(None),
+                        fallback: Box::new(e.clone()),
+                    });
+                } else {
+                    let init = self.emit(Op::InitMethod {
+                        call: usize::MAX,
+                        obj,
+                    });
+                    for a in args {
+                        self.expr(Interp::unmark_arg(a))?;
+                    }
+                    let call = self.emit(Op::MethodCall {
+                        name: Rc::from(mname.as_str()),
+                        argc: args.len() as u16,
+                        site: *site,
+                        cache: std::cell::RefCell::new(None),
+                        fallback: Box::new(e.clone()),
+                    });
+                    if let Op::InitMethod { call: at, .. } = &mut self.ops[init] {
+                        *at = call;
+                    }
                 }
             }
             Expr::New { class, args, site }
@@ -1417,6 +1535,7 @@ impl Compiler {
                 let init = self.emit(Op::InitNew {
                     call: usize::MAX,
                     name: Rc::from(cname.as_str()),
+                    cache: std::cell::RefCell::new(None),
                     fallback: Box::new(e.clone()),
                 });
                 for a in args {
@@ -2521,8 +2640,12 @@ impl<'a> Interp<'a> {
                     // fresh-prop markers reset here.
                     let outer = self.dim_throw.take();
                     if !self.in_handler {
-                        self.dim_key_conv.clear();
-                        self.dim_cv_bound.clear();
+                        if !self.dim_key_conv.is_empty() {
+                            self.dim_key_conv.clear();
+                        }
+                        if !self.dim_cv_bound.is_empty() {
+                            self.dim_cv_bound.clear();
+                        }
                     }
                     self.fresh_dyn_props.clear();
                     self.last_fresh_cell = None;
@@ -2663,6 +2786,42 @@ impl<'a> Interp<'a> {
                     let v = self.vm_binary(op, lv, rv)?;
                     vs.push(v);
                 }
+                Op::BinaryCvStore(op, sl) => {
+                    // BinaryCv + Store fused: the pushed value mirrors
+                    // Op::Store's vs.last() — the raw rhs for Arg/Uninit/V
+                    // arms, the post-vm_cell_value value for a cell store
+                    // (a re-read could see a destructor's rewrite).
+                    let rv = vs.pop().unwrap();
+                    let lv = self.vm_slot_value(comp, slots, *sl)?;
+                    let v = self.vm_binary(op, lv, rv)?;
+                    let stored = match &mut slots[*sl as usize] {
+                        Slot::Arg(i) => {
+                            let old = std::mem::replace(
+                                &mut self.cur().value_args[*i as usize],
+                                v.clone(),
+                            );
+                            self.destruct_dying_value(&old)?;
+                            v
+                        }
+                        Slot::Uninit => {
+                            slots[*sl as usize] = Slot::V(v.clone());
+                            v
+                        }
+                        Slot::V(x) => {
+                            let old = std::mem::replace(x, v.clone());
+                            self.destruct_dying_value(&old)?;
+                            v
+                        }
+                        Slot::C(c) => {
+                            let c = c.clone();
+                            let value = self.vm_cell_value(&c, v)?;
+                            self.cell_store(&c, value.clone())?;
+                            value
+                        }
+                    };
+                    vs.push(stored);
+                    self.vm_publish_global(comp, slots, *sl);
+                }
                 Op::AppendCv(sl) => {
                     let rhs = vs.pop().unwrap();
                     let fast = match (&rhs, &mut slots[*sl as usize]) {
@@ -2713,6 +2872,42 @@ impl<'a> Interp<'a> {
                         pc = *t;
                         continue;
                     }
+                }
+                Op::JumpCmp { a, b, op, target } => {
+                    // Same eval order as the unfused chain: left slot
+                    // binds first (undef warn site), then right.
+                    let lv = self.vm_slot_value(comp, slots, *a)?;
+                    let rv = self.vm_slot_value(comp, slots, *b)?;
+                    let v = self.vm_binary(op, lv, rv)?;
+                    if !v.is_truthy() {
+                        self.vm_backedge(*target, pc)?;
+                        pc = *target;
+                        continue;
+                    }
+                }
+                Op::IncJump {
+                    slot,
+                    delta,
+                    target,
+                } => {
+                    let old = self.vm_slot_value(comp, slots, *slot)?;
+                    let new = self.incdec_value(&old, *delta)?;
+                    match &mut slots[*slot as usize] {
+                        Slot::Arg(i) => {
+                            self.cur().value_args[*i as usize] = new;
+                        }
+                        Slot::Uninit => slots[*slot as usize] = Slot::V(new),
+                        Slot::V(v) => *v = new,
+                        Slot::C(c) => {
+                            let c = c.clone();
+                            let value = self.vm_cell_value(&c, new)?;
+                            self.cell_store(&c, value)?;
+                        }
+                    }
+                    self.vm_publish_global(comp, slots, *slot);
+                    self.vm_backedge(*target, pc)?;
+                    pc = *target;
+                    continue;
                 }
                 Op::Sweep => {
                     self.sweep_expr_temps(tmark)?;
@@ -2829,23 +3024,89 @@ impl<'a> Interp<'a> {
                         continue;
                     }
                 }
+                Op::MethodCallSlot {
+                    obj,
+                    name,
+                    site,
+                    cache,
+                    fallback,
+                } => {
+                    let mval = match &slots[*obj as usize] {
+                        Slot::V(v) => Some(v.clone()),
+                        Slot::C(c) => Some(c.borrow().clone()),
+                        Slot::Arg(i) => self
+                            .stack
+                            .last()
+                            .and_then(|f| f.value_args.get(*i as usize).cloned()),
+                        Slot::Uninit => None,
+                    };
+                    let hit = match mval {
+                        Some(Value::Object(o)) => self.vm_method_target(o, name, cache, *site),
+                        _ => None,
+                    };
+                    let Some((o, core)) = hit else {
+                        self.vm_materialize(comp, slots);
+                        let r = self.eval(fallback);
+                        self.vm_refresh(comp, slots);
+                        vs.push(r?);
+                        pc += 1;
+                        continue;
+                    };
+                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+                    if let Some(value) = self.vm_float_method(&core, &argv, &o) {
+                        argv.clear();
+                        if self.vm_val_pool.len() < 64 {
+                            self.vm_val_pool.push(argv);
+                        }
+                        vs.push(value);
+                        pc += 1;
+                        continue;
+                    }
+                    if comp.top_level {
+                        self.vm_materialize(comp, slots);
+                    }
+                    let result = self.vm_run_method_direct(&core, &mut argv, o, name, *site);
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
+                    let v = result?;
+                    argv.clear();
+                    if self.vm_val_pool.len() < 64 {
+                        self.vm_val_pool.push(argv);
+                    }
+                    vs.push(v);
+                }
                 Op::InitNew {
                     call: at,
                     name,
+                    cache,
                     fallback,
                 } => {
-                    let target = crate::interp::util::lkey_get(&self.classes, name)
-                        .cloned()
-                        .and_then(|cls| {
-                            let ctor = self.find_method_in(&cls, "__construct");
-                            if ctor
-                                .as_ref()
-                                .is_some_and(|(m, _)| m.decl.params.iter().any(|p| p.by_ref))
-                            {
-                                return None;
-                            }
-                            Some((cls, ctor))
-                        });
+                    let target = {
+                        let hit = cache.borrow().clone();
+                        hit.or_else(|| {
+                            crate::interp::util::lkey_get(&self.classes, name)
+                                .cloned()
+                                .and_then(|cls| {
+                                    let ctor = self.find_method_in(&cls, "__construct");
+                                    if ctor.as_ref().is_some_and(|(m, _)| {
+                                        m.decl.params.iter().any(|p| p.by_ref)
+                                    }) {
+                                        return None;
+                                    }
+                                    // A None ctor is registration-
+                                    // stable only once the extends
+                                    // chain is bound — a probe during
+                                    // mid-registration must re-run.
+                                    let cacheable = ctor.is_some() || self.class_chain_bound(&cls);
+                                    let t = (cls, ctor);
+                                    if cacheable {
+                                        *cache.borrow_mut() = Some(t.clone());
+                                    }
+                                    Some(t)
+                                })
+                        })
+                    };
                     match target {
                         Some(target) => ntargets.push(target),
                         None => {
@@ -3985,9 +4246,9 @@ impl<'a> Interp<'a> {
 
     /// Resolve a `$cv->m` site to its direct target: receiver must be
     /// an object whose resolved method is a userland, compiled,
-    /// value-callable decl. Per-call context guards (scope-private
-    /// precedence, visibility, pending hook) run on every hit; the
-    /// class-keyed pieces live in the site cache.
+    /// value-callable decl. The (class, caller-scope)-keyed verdict —
+    /// resolution + scope-private/visibility guards — lives in the
+    /// site cache; `pending_hook_prop` runs per call.
     fn vm_method_target(
         &mut self,
         o: Rc<std::cell::RefCell<PhpObject>>,
@@ -3999,15 +4260,32 @@ impl<'a> Interp<'a> {
             return None;
         }
         let cls = o.borrow().class.clone();
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone());
         let cached = {
             let b = cache.borrow();
             b.as_ref()
-                .filter(|h| Rc::ptr_eq(&h.class, &cls))
+                .filter(|h| {
+                    Rc::ptr_eq(&h.class, &cls)
+                        && match (&h.scope, &scope) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                            _ => false,
+                        }
+                })
                 .map(|h| h.core.clone())
         };
         let core = match cached {
             Some(core) => core,
             None => {
+                // Resolve the class-stable target, then fold the
+                // (class, scope)-static context verdict — scope-private
+                // shadowing and visibility — into the cached entry. A
+                // verdict of None means "canonical path for this
+                // scope", same as a resolution miss.
                 let core = self.find_method_in(&cls, name).and_then(|(m, dc)| {
                     if m.is_static
                         || m.is_abstract
@@ -4022,19 +4300,20 @@ impl<'a> Interp<'a> {
                     let comp = self.vm_compiled(&fdecl)?;
                     (!comp.needs_bind).then(|| MSiteCore { m, fdecl, comp, dc })
                 });
+                let verdict = core.filter(|c| {
+                    // Scope-private methods shadow the object's table
+                    // only inside their own scope; visibility gates
+                    // __call/vis_error — canonical semantics either way.
+                    self.scope_private_method(name).is_none() && self.method_access_ok(&c.m, &c.dc)
+                });
                 *cache.borrow_mut() = Some(CachedMethod {
                     class: cls.clone(),
-                    core: core.clone(),
+                    scope,
+                    core: verdict.clone(),
                 });
-                core
+                verdict
             }
         }?;
-        // Scope-private methods shadow the object's table only inside
-        // their own scope; visibility gates __call/vis_error — both
-        // keep canonical semantics.
-        if self.scope_private_method(name).is_some() || !self.method_access_ok(&core.m, &core.dc) {
-            return None;
-        }
         Some((o, core))
     }
 

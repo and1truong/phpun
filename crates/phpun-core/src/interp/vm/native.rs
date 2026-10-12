@@ -179,19 +179,24 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             Op::Store(_) => (1, 1),
             Op::Pop => (1, 0),
             Op::Binary(_) => (2, 1),
-            Op::BinaryCv(_, _) => (1, 1),
+            Op::BinaryCv(_, _) | Op::BinaryCvStore(_, _) => (1, 1),
             Op::Call { argc, .. } => (*argc as usize, 1),
             Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => (1, 0),
             Op::Return => (1, 0),
-            Op::Line(_) | Op::Sweep | Op::BoolLoop { .. } | Op::InitCall { .. } | Op::Jump(_) => {
-                (0, 0)
-            }
+            Op::Line(_)
+            | Op::Sweep
+            | Op::BoolLoop { .. }
+            | Op::InitCall { .. }
+            | Op::Jump(_)
+            | Op::JumpCmp { .. }
+            | Op::IncJump { .. } => (0, 0),
             _ => return None,
         };
         let next = n.checked_sub(take)? + give;
         // No edge may skip the comparison proving a bool return value.
         if boolean
             && matches!(op, Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t)
+                | Op::JumpCmp { target: t, .. } | Op::IncJump { target: t, .. }
             if matches!(c.ops.get(*t), Some(Op::Return)))
         {
             return None;
@@ -203,7 +208,10 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             return None;
         }
         match op {
-            Op::Binary(op) | Op::BinaryCv(op, _) | Op::BinaryCvConst(op, _, _)
+            Op::Binary(op)
+            | Op::BinaryCv(op, _)
+            | Op::BinaryCvConst(op, _, _)
+            | Op::BinaryCvStore(op, _)
                 if !matches!(*op, "+" | "-" | "*" | "%" | "<=>")
                     && !(matches!(*op, "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">=")
                         && (matches!(
@@ -220,10 +228,11 @@ fn depths(c: &Compiled, boolean: bool) -> Option<Vec<Option<usize>>> {
             Op::Jump(t) => {
                 set(&mut depths, &mut work, *t, next)?;
             }
-            Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => {
+            Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpCmp { target: t, .. } => {
                 set(&mut depths, &mut work, *t, next)?;
                 set(&mut depths, &mut work, pc + 1, next)?;
             }
+            Op::IncJump { target: t, .. } => set(&mut depths, &mut work, *t, next)?,
             _ => set(&mut depths, &mut work, pc + 1, next)?,
         }
     }
@@ -421,6 +430,16 @@ impl Emitter {
                     self.binary(op, &mut fail);
                     self.store(value(n));
                 }
+                Op::BinaryCvStore(op, slot) => {
+                    if *slot as usize >= c.nslots {
+                        return None;
+                    }
+                    self.local(*slot, &mut fail);
+                    self.load(value(n - 1), true);
+                    self.binary(op, &mut fail);
+                    self.store(i32::from(*slot) * 16);
+                    self.store(value(n - 1));
+                }
                 Op::IncDec { slot, delta, post } => {
                     if *slot as usize >= c.nslots {
                         return None;
@@ -449,6 +468,37 @@ impl Emitter {
                         })),
                         *t,
                     ));
+                }
+                Op::JumpCmp { a, b, op, target } => {
+                    if *a as usize >= c.nslots || *b as usize >= c.nslots {
+                        return None;
+                    }
+                    // Same two-step as local(): b's exists-check first,
+                    // then load its value into RDX for binary(op).
+                    self.local(*a, &mut fail);
+                    self.emit(&[0x48, 0x83, 0xbc, 0x24]);
+                    self.word(i32::from(*b) * 16 + 8);
+                    self.emit(&[0]);
+                    fail.push(self.branch(Some(0x84)));
+                    self.load(i32::from(*b) * 16, true);
+                    self.binary(op, &mut fail);
+                    self.emit(&[0x48, 0x85, 0xc0]);
+                    jumps.push((self.branch(Some(0x84)), *target));
+                }
+                Op::IncJump {
+                    slot,
+                    delta,
+                    target,
+                } => {
+                    if *slot as usize >= c.nslots {
+                        return None;
+                    }
+                    self.local(*slot, &mut fail);
+                    self.emit(&[0x48, 0xba]);
+                    self.emit(&delta.to_le_bytes());
+                    self.binary("+", &mut fail);
+                    self.store(i32::from(*slot) * 16);
+                    jumps.push((self.branch(None), *target));
                 }
                 Op::Call { argc, .. } => {
                     self.emit(&[0x4c, 0x89, 0xe7, 0x48, 0x8d, 0xb4, 0x24]);
