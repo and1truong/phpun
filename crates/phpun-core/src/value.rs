@@ -2657,7 +2657,7 @@ pub struct PhpObject {
     pub slots: Vec<Option<Cell>>,
     /// Dynamic instance properties only — declared cells live in
     /// `slots`. Use `prop_get`/`prop_insert`/… which route by key.
-    pub props: HashMap<String, Cell>,
+    pub props: FxMap<String, Cell>,
     /// Property order for var_dump/foreach output: declared keys in
     /// `flat_props` order, then dynamic inserts; `unset()` tombstones.
     /// Class-fixed names are shared; each mutator uses Rc::make_mut.
@@ -2668,7 +2668,7 @@ pub struct PhpObject {
     pub internal: Option<ObjectInternal>,
     /// Typed props that were `unset()` — reads route to `__get` like
     /// undefined props instead of the uninitialized-typed Error.
-    pub unset_props: std::collections::HashSet<String>,
+    pub unset_props: FxSet<String>,
 }
 
 impl PhpObject {

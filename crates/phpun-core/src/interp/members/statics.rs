@@ -657,7 +657,7 @@ impl<'a> Interp<'a> {
             return match parsed {
                 Some(n) => {
                     let oc = called_class.unwrap_or_else(|| cls.clone());
-                    let mut props = HashMap::new();
+                    let mut props = crate::value::FxMap::default();
                     let mut order = Vec::new();
                     for (k, v) in [
                         ("\0dt\0ts", Value::Int(n.ts)),
@@ -676,7 +676,7 @@ impl<'a> Interp<'a> {
                         prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
-                        unset_props: std::collections::HashSet::new(),
+                        unset_props: crate::value::FxSet::default(),
                     })))
                 }
                 None => Ok(Value::Bool(false)),
@@ -713,7 +713,7 @@ impl<'a> Interp<'a> {
             return match src {
                 Some(so) => {
                     let oc = called_class.unwrap_or_else(|| cls.clone());
-                    let mut props = HashMap::new();
+                    let mut props = crate::value::FxMap::default();
                     let mut order = Vec::new();
                     {
                         let sb = so.borrow();
@@ -739,7 +739,7 @@ impl<'a> Interp<'a> {
                         prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
-                        unset_props: std::collections::HashSet::new(),
+                        unset_props: crate::value::FxSet::default(),
                     })))
                 }
                 None => Ok(Value::Bool(false)),

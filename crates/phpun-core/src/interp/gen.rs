@@ -312,11 +312,11 @@ impl<'a> Interp<'a> {
         self.alloc_obj(PhpObject {
             class: cls,
             slots: Vec::new(),
-            props: HashMap::new(),
+            props: crate::value::FxMap::default(),
             prop_order: Rc::new(Vec::new()),
             id: 0,
             internal: Some(ObjectInternal::Generator(state)),
-            unset_props: std::collections::HashSet::new(),
+            unset_props: crate::value::FxSet::default(),
         })
     }
 

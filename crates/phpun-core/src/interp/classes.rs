@@ -3097,7 +3097,7 @@ impl<'a> Interp<'a> {
         if let Some(v) = self.enum_cases.get(&key) {
             return Ok(v.clone());
         }
-        let mut props = std::collections::HashMap::new();
+        let mut props = crate::value::FxMap::default();
         props.insert("name".to_string(), Value::str(case));
         let is_unit = matches!(cd.value, Expr::Null);
         if !is_unit {
@@ -3689,11 +3689,11 @@ impl<'a> Interp<'a> {
         let rc = self.alloc_obj(PhpObject {
             class: cls,
             slots: Vec::new(),
-            props: HashMap::new(),
+            props: crate::value::FxMap::default(),
             prop_order: Rc::new(vec![]),
             id: 0,
             internal: Some(ObjectInternal::WeakRef(Rc::downgrade(&target))),
-            unset_props: std::collections::HashSet::new(),
+            unset_props: crate::value::FxSet::default(),
         });
         self.weakrefs.insert(target_id, Rc::downgrade(&rc));
         Ok(Value::Object(rc))
@@ -3918,11 +3918,11 @@ impl<'a> Interp<'a> {
                         statics_init: RefCell::new(true),
                     }),
                     slots: Vec::new(),
-                    props: HashMap::new(),
+                    props: crate::value::FxMap::default(),
                     prop_order: Rc::new(vec![]),
                     id: 0,
                     internal: None,
-                    unset_props: std::collections::HashSet::new(),
+                    unset_props: crate::value::FxSet::default(),
                 })))
             }
         };
@@ -3992,11 +3992,11 @@ impl<'a> Interp<'a> {
         let v = Value::Object(self.alloc_obj(PhpObject {
             class: cls,
             slots,
-            props: HashMap::new(),
+            props: crate::value::FxMap::default(),
             prop_order,
             id: 0,
             internal,
-            unset_props: std::collections::HashSet::new(),
+            unset_props: crate::value::FxSet::default(),
         }));
         // zend's throwable dump view needs engine state materialized
         // into props (file/line/string/trace) before any ctor runs.

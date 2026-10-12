@@ -924,12 +924,12 @@ pub struct Interp<'a> {
     gc_collecting: bool,
     /// Values already rooted (Zend's "already purple" bit): binds and
     /// surviving decrefs each count a zval once — cleared on collect.
-    pub(crate) gc_purpled: HashSet<usize>,
+    pub(crate) gc_purpled: FxSet<usize>,
     /// In-flight slot decrefs from `gc_note_dying` walks: cell ptr →
     /// count. A dying container still holds its cells while a collect
     /// fires mid-walk — Zend's destructor has already decremented the
     /// member refcounts, so the root test subtracts these holds.
-    gc_dying: HashMap<usize, usize>,
+    gc_dying: FxMap<usize, usize>,
     /// `gc_status()` counters: collect runs so far and roots collected
     /// across them (Zend reports both verbatim), plus wall-clock
     /// seconds spent collecting / running dtors / engine uptime.
@@ -1402,7 +1402,7 @@ struct GcScan {
     nodes: FxMap<usize, Value>,
     /// In-flight slot decrefs (`gc_note_dying` walks) — a snapshot of
     /// `Interp::gc_dying` taken at pass start.
-    dying: HashMap<usize, usize>,
+    dying: FxMap<usize, usize>,
     /// Containers reached through internal-machinery prop cells only
     /// (`\0Cls\0prop` on GC_PROPLESS_CLASSES): engine-modeled storage,
     /// not zvals — dead ones don't count toward the collect total.
@@ -1966,8 +1966,8 @@ impl<'a> Interp<'a> {
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             native_regions_bytes: Rc::new(std::cell::Cell::new(0)),
             gc_collecting: false,
-            gc_purpled: HashSet::new(),
-            gc_dying: HashMap::new(),
+            gc_purpled: FxSet::default(),
+            gc_dying: FxMap::default(),
             gc_runs: 0,
             gc_collected: 0,
             gc_collector_time: 0.0,
@@ -3234,7 +3234,7 @@ impl<'a> Interp<'a> {
             }
             return Ok(());
         }
-        let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
+        let mut held: FxMap<usize, (usize, Rc<RefCell<PhpObject>>)> = FxMap::default();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
             held.entry(Rc::as_ptr(o) as usize)
                 .or_insert_with(|| (0, o.clone()))
@@ -3352,11 +3352,11 @@ impl<'a> Interp<'a> {
         // cell (`=&` alias still owned by props/statics/another var)
         // keeps its content — the frame's handle dropping is not a
         // zval decref (gh10168: call1's $tmp survives in $box->value).
-        let mut cell_refs: HashMap<usize, usize> = HashMap::new();
+        let mut cell_refs: FxMap<usize, usize> = FxMap::default();
         for c in cells {
             *cell_refs.entry(Rc::as_ptr(c) as usize).or_default() += 1;
         }
-        let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
+        let mut held: FxMap<usize, (usize, Rc<RefCell<PhpObject>>)> = FxMap::default();
         for c in cells {
             let seen = cell_refs[&(Rc::as_ptr(c) as usize)];
             // +1 = the owner's map slot being torn down after us.

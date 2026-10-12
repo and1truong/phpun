@@ -5207,7 +5207,7 @@ impl<'a> Interp<'a> {
     /// the `clone $o` operator and `clone($o, [...])`.
     pub(crate) fn clone_object(&mut self, o: &Rc<RefCell<PhpObject>>) -> Result<Value, PhpError> {
         let ob = o.borrow();
-        let mut props = HashMap::new();
+        let mut props = crate::value::FxMap::default();
         // References survive clone — the clone's prop
         // shares the same zval and keeps the typed gate
         // (typed_properties_081).
@@ -10683,7 +10683,7 @@ impl<'a> Interp<'a> {
             CastKind::Object => match &v {
                 Value::Object(_) => v,
                 _ => {
-                    let mut props = HashMap::new();
+                    let mut props = crate::value::FxMap::default();
                     let mut order = Vec::new();
                     match &v {
                         Value::Array(a) => {
@@ -10715,7 +10715,7 @@ impl<'a> Interp<'a> {
                         prop_order: Rc::new(order),
                         id: 0,
                         internal: None,
-                        unset_props: std::collections::HashSet::new(),
+                        unset_props: crate::value::FxSet::default(),
                     }))
                 }
             },

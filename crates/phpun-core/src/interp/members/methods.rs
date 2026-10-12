@@ -3455,7 +3455,7 @@ impl<'a> Interp<'a> {
         let Some(dc) = self.classes.get("dateinterval").cloned() else {
             return Value::Null;
         };
-        let mut props = HashMap::new();
+        let mut props = crate::value::FxMap::default();
         let mut order = Vec::new();
         let (mut mo, mut dy, mut sc) = (0i64, 0i64, 0i64);
         for (k, v) in &fields {
@@ -3488,7 +3488,7 @@ impl<'a> Interp<'a> {
             prop_order: Rc::new(order),
             id: 0,
             internal: None,
-            unset_props: std::collections::HashSet::new(),
+            unset_props: crate::value::FxSet::default(),
         }))
     }
 
