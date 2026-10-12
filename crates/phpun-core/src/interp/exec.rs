@@ -1242,6 +1242,28 @@ impl<'a> Interp<'a> {
         self.exec_foreach_with(arr, key, val, &mut |s| s.exec_loop_body(body))
     }
 
+    /// Value-foreach snapshot: `.iter()` skips tombstoned buckets and
+    /// IS_REFERENCE elements keep their real cell (zend reads the live
+    /// bucket, so writes through a held alias are observed) while
+    /// others get an isolated copy — shared by `exec_foreach_with` and
+    /// the inline `Op::FeInit` snap path.
+    pub(in crate::interp) fn fe_snapshot(
+        &self,
+        rc: &Rc<std::cell::RefCell<crate::value::PhpArray>>,
+    ) -> Vec<(ArrKey, Cell)> {
+        rc.borrow()
+            .iter()
+            .map(|(k, c)| {
+                let cc = if self.is_ref_cell(c) {
+                    c.clone()
+                } else {
+                    cell(c.borrow().clone())
+                };
+                (k.clone(), cc)
+            })
+            .collect()
+    }
+
     pub(in crate::interp) fn exec_foreach_with(
         &mut self,
         arr: &Expr,
@@ -1293,6 +1315,22 @@ impl<'a> Interp<'a> {
                 Err(e) => return self.err_flow(e),
             }
         };
+        self.exec_foreach_val(src, arr, key, val, body, iter_site, stmt_line)
+    }
+
+    /// The match-on-source half of `exec_foreach_with`, split so the
+    /// `Op::FeInit` replay can feed an already-evaluated `src`.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::interp) fn exec_foreach_val(
+        &mut self,
+        src: Value,
+        arr: &Expr,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &mut dyn FnMut(&mut Self) -> Flow,
+        iter_site: usize,
+        stmt_line: usize,
+    ) -> Flow {
         match src {
             Value::Array(rc) => {
                 // `foreach ($arr as [&$p, $q])` iterates by reference
@@ -1417,23 +1455,7 @@ impl<'a> Interp<'a> {
                 let snapshot: Vec<(ArrKey, Cell)> = if by_ref {
                     rc.borrow().iter().cloned().collect()
                 } else {
-                    // .iter() skips tombstoned buckets — a value-foreach
-                    // never sees shifted/unset elements. IS_REFERENCE
-                    // elements stay LIVE: zend reads the real bucket,
-                    // so writes through a held alias are observed and a
-                    // `&$v`-bound var writes back into the array
-                    // (probe12c/p12e vs oracle).
-                    rc.borrow()
-                        .iter()
-                        .map(|(k, c)| {
-                            let cc = if self.is_ref_cell(c) {
-                                c.clone()
-                            } else {
-                                cell(c.borrow().clone())
-                            };
-                            (k.clone(), cc)
-                        })
-                        .collect()
+                    self.fe_snapshot(&rc)
                 };
                 for (idx, (k, c)) in snapshot.into_iter().enumerate() {
                     self.cur_line = idx;
@@ -1807,6 +1829,33 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
+        }
+    }
+
+    /// `Op::FeInit` non-array replay: the compiled expr already
+    /// evaluated the source — run the canonical foreach over that
+    /// value (a re-eval would replay its diagnostics).
+    pub(in crate::interp) fn fe_replay(&mut self, src: Value, s: &Stmt) -> Flow {
+        if let Stmt::Foreach {
+            arr,
+            key,
+            val,
+            body,
+            ..
+        } = s
+        {
+            let line = self.cur_line;
+            self.exec_foreach_val(
+                src,
+                arr,
+                key,
+                val,
+                &mut |i| i.exec_loop_body(body),
+                line,
+                line,
+            )
+        } else {
+            Flow::Normal
         }
     }
 
