@@ -4306,12 +4306,16 @@ impl<'a> Interp<'a> {
             .rposition(|p| p.default.is_none() && !p.variadic)
             .map(|i| i + 1)
             .unwrap_or(0);
-        if argv.len() < required
-            || decl
-                .params
-                .iter()
-                .any(|p| p.hooks.is_some() || self.hooked_prop(obj, &p.name).is_some())
-        {
+        // The per-param hooked_prop probe walks the private-prop chain
+        // — skip it entirely when no prop in the class hierarchy can
+        // carry hooks (memoized, decl-stable once bound).
+        let param_hooked = decl.params.iter().any(|p| p.hooks.is_some())
+            || (self.class_has_hooked_prop(&obj.borrow().class)
+                && decl
+                    .params
+                    .iter()
+                    .any(|p| self.hooked_prop(obj, &p.name).is_some()));
+        if argv.len() < required || param_hooked {
             return None;
         }
         for (i, p) in decl.params.iter().enumerate() {
