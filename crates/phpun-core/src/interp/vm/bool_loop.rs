@@ -72,6 +72,8 @@ pub(super) fn eligible(ops: &[Op]) -> bool {
             | Op::Jump(_)
             | Op::JumpIfFalse(_)
             | Op::JumpIfTrue(_)
+            | Op::JumpCmp { .. }
+            | Op::IncJump { .. }
             | Op::IncDec { .. }
             | Op::Line(_)
             | Op::Sweep
@@ -129,7 +131,11 @@ impl Interp<'_> {
                 Op::Load(i) | Op::BinaryCv(_, i) | Op::BinaryCvConst(_, i, _) => {
                     used[*i as usize] = true
                 }
-                Op::Store(i) | Op::IncDec { slot: i, .. } => {
+                Op::JumpCmp { a, b, .. } => {
+                    used[*a as usize] = true;
+                    used[*b as usize] = true;
+                }
+                Op::Store(i) | Op::IncDec { slot: i, .. } | Op::IncJump { slot: i, .. } => {
                     used[*i as usize] = true;
                     written[*i as usize] = true;
                 }
@@ -304,6 +310,24 @@ impl Interp<'_> {
                             pc = *target;
                             continue;
                         }
+                    }
+                    Op::JumpCmp { a, b, op, target } => {
+                        let lv = locals[*a as usize]?;
+                        let rv = locals[*b as usize]?;
+                        if !binary(op, lv, rv)?.truth() {
+                            pc = *target;
+                            continue;
+                        }
+                    }
+                    Op::IncJump {
+                        slot,
+                        delta,
+                        target,
+                    } => {
+                        let old = locals[*slot as usize]?;
+                        locals[*slot as usize] = Some(Scalar::Int(old.int()?.checked_add(*delta)?));
+                        pc = *target;
+                        continue;
                     }
                     Op::Line(v) => line = *v,
                     Op::Sweep | Op::BoolLoop { .. } => {}

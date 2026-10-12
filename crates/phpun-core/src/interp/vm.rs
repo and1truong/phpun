@@ -262,6 +262,22 @@ enum Op {
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
+    /// `Load(a) + Load(b) + Binary(op) + JumpIfFalse(t)` fused — a
+    /// two-CV comparison heading a for-cond, one dispatch instead of four.
+    JumpCmp {
+        a: u16,
+        b: u16,
+        op: &'static str,
+        target: usize,
+    },
+    /// `IncDec(slot, delta, post) + Pop + Jump(t)` fused — the for-inc
+    /// step; the inc result is unconditionally discarded, so `post`
+    /// differences vanish and one dispatch replaces three.
+    IncJump {
+        slot: u16,
+        delta: i64,
+        target: usize,
+    },
     /// Direct literal-name call with Zend's persistent call-site cache.
     /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
     /// for diagnostics. InitCall pins the target before args run.
@@ -769,7 +785,11 @@ impl Compiler {
 
     fn patch(&mut self, at: usize, target: usize) {
         match &mut self.ops[at] {
-            Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => *t = target,
+            Op::Jump(t)
+            | Op::JumpIfFalse(t)
+            | Op::JumpIfTrue(t)
+            | Op::JumpCmp { target: t, .. }
+            | Op::IncJump { target: t, .. } => *t = target,
             _ => unreachable!("patch target is always a jump op"),
         }
     }
@@ -916,7 +936,36 @@ impl Compiler {
                     self.emit(Op::Pop);
                 }
                 let top = self.ops.len();
-                let jf = if !cond.is_empty() {
+                // `$i < $n` single-CV conds fuse to one JumpCmp op —
+                // the four-op Load+Load+Binary+Jz chain collapses to a
+                // dispatch that reads both slots and branches directly.
+                let jf = if cond.len() == 1
+                    && matches!(
+                        Interp::unmark_rhs(&cond[0]),
+                        Expr::Binary { op, l, r }
+                            if matches!(*op, "<" | "<=" | ">" | ">=")
+                                && matches!(Interp::unmark_rhs(l), Expr::Var(n) if n != "this" && !Interp::is_superglobal(n))
+                                && matches!(Interp::unmark_rhs(r), Expr::Var(n) if n != "this" && !Interp::is_superglobal(n))
+                    ) {
+                    let Expr::Binary { op, l, r } = Interp::unmark_rhs(&cond[0]) else {
+                        unreachable!()
+                    };
+                    let bop: &'static str = op;
+                    let Expr::Var(ln) = Interp::unmark_rhs(l) else {
+                        unreachable!()
+                    };
+                    let Expr::Var(rn) = Interp::unmark_rhs(r) else {
+                        unreachable!()
+                    };
+                    let a = self.slot(ln);
+                    let b = self.slot(rn);
+                    Some(self.emit(Op::JumpCmp {
+                        a,
+                        b,
+                        op: bop,
+                        target: usize::MAX,
+                    }))
+                } else if !cond.is_empty() {
                     for (i, e) in cond.iter().enumerate() {
                         self.expr(e)?;
                         if i + 1 < cond.len() {
@@ -930,11 +979,41 @@ impl Compiler {
                 self.loops.push((Vec::new(), Vec::new()));
                 self.stmts(body)?;
                 let inc_at = self.ops.len();
-                for e in inc {
-                    self.expr(e)?;
-                    self.emit(Op::Pop);
+                // `$i++`/`$i--` single step fuses inc+pop+jump into one
+                // op — the pushed result is always discarded.
+                let inc_step = if inc.len() == 1 {
+                    match Interp::unmark_rhs(&inc[0]) {
+                        Expr::PostInc(t) | Expr::PreInc(t) => match Interp::unmark_rhs(t) {
+                            Expr::Var(n) if n != "this" && !Interp::is_superglobal(n) => {
+                                Some((n.clone(), 1i64))
+                            }
+                            _ => None,
+                        },
+                        Expr::PostDec(t) | Expr::PreDec(t) => match Interp::unmark_rhs(t) {
+                            Expr::Var(n) if n != "this" && !Interp::is_superglobal(n) => {
+                                Some((n.clone(), -1i64))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((n, delta)) = inc_step {
+                    let slot = self.slot(&n);
+                    self.emit(Op::IncJump {
+                        slot,
+                        delta,
+                        target: top,
+                    });
+                } else {
+                    for e in inc {
+                        self.expr(e)?;
+                        self.emit(Op::Pop);
+                    }
+                    self.emit(Op::Jump(top));
                 }
-                self.emit(Op::Jump(top));
                 let end = self.ops.len();
                 let (breaks, continues) = self.loops.pop().unwrap();
                 for b in breaks {
@@ -2521,8 +2600,12 @@ impl<'a> Interp<'a> {
                     // fresh-prop markers reset here.
                     let outer = self.dim_throw.take();
                     if !self.in_handler {
-                        self.dim_key_conv.clear();
-                        self.dim_cv_bound.clear();
+                        if !self.dim_key_conv.is_empty() {
+                            self.dim_key_conv.clear();
+                        }
+                        if !self.dim_cv_bound.is_empty() {
+                            self.dim_cv_bound.clear();
+                        }
                     }
                     self.fresh_dyn_props.clear();
                     self.last_fresh_cell = None;
@@ -2713,6 +2796,42 @@ impl<'a> Interp<'a> {
                         pc = *t;
                         continue;
                     }
+                }
+                Op::JumpCmp { a, b, op, target } => {
+                    // Same eval order as the unfused chain: left slot
+                    // binds first (undef warn site), then right.
+                    let lv = self.vm_slot_value(comp, slots, *a)?;
+                    let rv = self.vm_slot_value(comp, slots, *b)?;
+                    let v = self.vm_binary(op, lv, rv)?;
+                    if !v.is_truthy() {
+                        self.vm_backedge(*target, pc)?;
+                        pc = *target;
+                        continue;
+                    }
+                }
+                Op::IncJump {
+                    slot,
+                    delta,
+                    target,
+                } => {
+                    let old = self.vm_slot_value(comp, slots, *slot)?;
+                    let new = self.incdec_value(&old, *delta)?;
+                    match &mut slots[*slot as usize] {
+                        Slot::Arg(i) => {
+                            self.cur().value_args[*i as usize] = new;
+                        }
+                        Slot::Uninit => slots[*slot as usize] = Slot::V(new),
+                        Slot::V(v) => *v = new,
+                        Slot::C(c) => {
+                            let c = c.clone();
+                            let value = self.vm_cell_value(&c, new)?;
+                            self.cell_store(&c, value)?;
+                        }
+                    }
+                    self.vm_publish_global(comp, slots, *slot);
+                    self.vm_backedge(*target, pc)?;
+                    pc = *target;
+                    continue;
                 }
                 Op::Sweep => {
                     self.sweep_expr_temps(tmark)?;

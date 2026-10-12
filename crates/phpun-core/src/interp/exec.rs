@@ -225,9 +225,15 @@ impl<'a> Interp<'a> {
         // write pass's re-lookup would read post-handler values).
         self.last_prop_ov = None;
         if !self.in_handler {
-            self.dim_key_conv.clear();
-            self.dim_cv_bound.clear();
-            self.dim_undef_cells.clear();
+            if !self.dim_key_conv.is_empty() {
+                self.dim_key_conv.clear();
+            }
+            if !self.dim_cv_bound.is_empty() {
+                self.dim_cv_bound.clear();
+            }
+            if !self.dim_undef_cells.is_empty() {
+                self.dim_undef_cells.clear();
+            }
         }
         None
     }
