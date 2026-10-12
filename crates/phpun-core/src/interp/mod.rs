@@ -7065,37 +7065,37 @@ impl<'a> Interp<'a> {
                         // mutate a prop and stale the flat verdicts.
                         let quiet = self.gc_purpled.is_empty()
                             && b.entries.iter().all(|(_, c)| {
-                            if Rc::strong_count(c) > 1 {
-                                return false;
-                            }
-                            match &*c.borrow() {
-                                Value::Null
-                                | Value::Bool(_)
-                                | Value::Int(_)
-                                | Value::Float(_)
-                                | Value::Str(_) => true,
-                                Value::Object(o) => {
-                                    let ob = o.borrow();
-                                    ob.internal.is_none()
-                                        && ob
-                                            .slots
-                                            .iter()
-                                            .flatten()
-                                            .chain(ob.props.values())
-                                            .all(|c| {
-                                                matches!(
-                                                    &*c.borrow(),
-                                                    Value::Null
-                                                        | Value::Bool(_)
-                                                        | Value::Int(_)
-                                                        | Value::Float(_)
-                                                        | Value::Str(_)
-                                                )
-                                            })
+                                if Rc::strong_count(c) > 1 {
+                                    return false;
                                 }
-                                _ => false,
-                            }
-                        });
+                                match &*c.borrow() {
+                                    Value::Null
+                                    | Value::Bool(_)
+                                    | Value::Int(_)
+                                    | Value::Float(_)
+                                    | Value::Str(_) => true,
+                                    Value::Object(o) => {
+                                        let ob = o.borrow();
+                                        ob.internal.is_none()
+                                            && ob
+                                                .slots
+                                                .iter()
+                                                .flatten()
+                                                .chain(ob.props.values())
+                                                .all(|c| {
+                                                    matches!(
+                                                        &*c.borrow(),
+                                                        Value::Null
+                                                            | Value::Bool(_)
+                                                            | Value::Int(_)
+                                                            | Value::Float(_)
+                                                            | Value::Str(_)
+                                                    )
+                                                })
+                                    }
+                                    _ => false,
+                                }
+                            });
                         // Every element scalar or an unshared flat object:
                         // the canonical slot's two clones leave each object
                         // with >1 owner, so every step already reduces to
