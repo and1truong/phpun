@@ -3354,10 +3354,23 @@ impl<'a> Interp<'a> {
     /// generator frame's stashed CVs decref the same way when its
     /// execute_data is freed.
     pub(in crate::interp) fn destruct_cells(&mut self, cells: &[Cell]) -> Result<(), PhpError> {
-        if !cells
-            .iter()
-            .any(|c| matches!(&*c.borrow(), Value::Object(_)))
-        {
+        // Everything past this point orders/dedups __destruct calls —
+        // when no cell holds an object whose class declares one the
+        // maps below are bookkeeping for nothing (an IC-cached probe
+        // per object beats two N-sized map builds + walks).
+        let mut any_dtor = false;
+        for c in cells {
+            if let Value::Object(o) = &*c.borrow() {
+                if self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+                {
+                    any_dtor = true;
+                    break;
+                }
+            }
+        }
+        if !any_dtor {
             return Ok(());
         }
         // Only a cell DYING with this batch decrefs its zval: a shared
