@@ -2315,7 +2315,7 @@ pub struct PhpClass {
 /// `None` = cached miss.
 pub type MethodHit = Option<(Rc<crate::ast::MethodDecl>, Rc<PhpClass>)>;
 /// 1-entry `(looked-up name, hit)` memo slot on `PhpClass`.
-pub type MethodIc = RefCell<Option<(String, MethodHit)>>;
+pub type MethodIc = RefCell<[Option<(String, MethodHit)>; 2]>;
 
 /// One entry of the flattened declared-prop layout: the storage key
 /// (mangled `\0Cls\0name` for private slots, else the plain name)
