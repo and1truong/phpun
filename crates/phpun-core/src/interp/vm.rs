@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::calls::builtin_byref;
+use super::exec::FeItem;
 use super::expr::{DimArg, DimDetach, DimPre};
 use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, MethodDecl, Param, Stmt};
@@ -2546,7 +2547,7 @@ impl<'a> Interp<'a> {
         // pair, exec-local so recursion into this Compiled can't
         // collide. Consuming the into_iter per element mirrors the
         // canonical loop's per-iteration cell drop (dtor timing).
-        let mut fe_states: Vec<Option<std::vec::IntoIter<(crate::value::ArrKey, Cell)>>> =
+        let mut fe_states: Vec<Option<std::vec::IntoIter<(crate::value::ArrKey, FeItem)>>> =
             Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
@@ -2581,7 +2582,7 @@ impl<'a> Interp<'a> {
                         if fe_states.len() <= *idx as usize {
                             fe_states.resize_with(*idx as usize + 1, || None);
                         }
-                        fe_states[*idx as usize] = Some(self.fe_snapshot(rc).into_iter());
+                        fe_states[*idx as usize] = Some(self.fe_items(rc).into_iter());
                         pc = *fetch;
                     } else {
                         // Traversable/scalar sources replay the
@@ -2632,7 +2633,10 @@ impl<'a> Interp<'a> {
                         let kv = crate::interp::util::key_value(&k);
                         self.fe_store_slot(comp, slots, *kslot, kv)?;
                     }
-                    let v = c.borrow().clone();
+                    let v = match c {
+                        FeItem::Val(v) => v,
+                        FeItem::Cell(c) => c.borrow().clone(),
+                    };
                     self.fe_store_slot(comp, slots, *vslot, v)?;
                 }
                 Op::Foreach {
