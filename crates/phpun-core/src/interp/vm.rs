@@ -3002,8 +3002,16 @@ impl<'a> Interp<'a> {
             slots.resize_with(comp.nslots, || Slot::Uninit);
         }
         for (name, idx) in &comp.names {
-            if matches!(slots[*idx as usize], Slot::C(_)) {
-                continue;
+            if let Slot::C(bound) = &slots[*idx as usize] {
+                // Between iterations, user code (Iterator::valid/next,
+                // destructors) can replace vars[name]'s cell — e.g.
+                // unset($GLOBALS['v']) tombstones the bridged cell and
+                // the next access seeds a fresh one. Rebind only when
+                // vars no longer holds this exact cell; a C slot whose
+                // cell is still live keeps its cache.
+                if matches!(self.cur().vars.get(name), Some(c) if Rc::ptr_eq(c, bound)) {
+                    continue;
+                }
             }
             slots[*idx as usize] = match self.cur().vars.get(name) {
                 Some(c) => Slot::C(c.clone()),
