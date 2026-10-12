@@ -90,6 +90,7 @@ pub(crate) struct Compiled {
     value_abi: bool,
     /// Bounded, read-only f64 expression leaf; runtime IC/owner guards remain.
     float_leaf: bool,
+    ctor_leaf: bool,
 }
 
 pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
@@ -543,6 +544,17 @@ impl Compiled {
                 ) || matches!(op, Op::Call { lname, argc: 1, .. } if lname.as_ref() == "sqrt")
             })
             && c.ops.iter().any(|op| matches!(op, Op::Return));
+        // ponytail: a ctor whose every param promotes into a prop and
+        // whose body cannot observe the frame publishes straight from
+        // the bound values — no frame, trace or destruct scan. Kept
+        // narrow: hookable, partially-promoted or non-trivial bodies
+        // keep the canonical call.
+        let ctor_leaf = value_abi
+            && decl.name.eq_ignore_ascii_case("__construct")
+            && decl.params.iter().all(|p| p.promoted)
+            && c.ops
+                .iter()
+                .all(|op| matches!(op, Op::Line(_) | Op::Sweep | Op::Return));
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -560,6 +572,7 @@ impl Compiled {
             param_fast,
             value_abi,
             float_leaf,
+            ctor_leaf,
         }))
     }
 
@@ -602,6 +615,7 @@ impl Compiled {
             param_fast: Vec::new(),
             value_abi: false,
             float_leaf: false,
+            ctor_leaf: false,
         }))
     }
 }
@@ -3627,6 +3641,124 @@ impl<'a> Interp<'a> {
     /// InitNew — runs new_instance's post-resolution sequence verbatim,
     /// then routes the ctor through the same direct/canonical split a
     /// `->m()` call takes (ctorless classes just drop the args).
+    /// A proven leaf ctor — every param promotes into a prop and the
+    /// body cannot observe the frame — binds like the value-ABI arm
+    /// (param_fast proofs plus the float-ty int widening) and publishes
+    /// through promoted_prop_write with no frame, trace or destruct
+    /// scan at all. Any binding shape the proven gates cannot settle
+    /// bails to the canonical call untouched, like a rebind miss.
+    fn vm_ctor_leaf(
+        &mut self,
+        core: &MSiteCore,
+        argv: &mut Vec<Value>,
+        obj: &Rc<std::cell::RefCell<PhpObject>>,
+    ) -> Option<Result<Value, PhpError>> {
+        // Private-promoted decls resolve through the live scope —
+        // scope_private_prop reads the top frame, so lend the caller
+        // frame (or the globals pseudo-frame at top level) the ctor's
+        // scope for the whole leaf like the pushed ctor frame would.
+        let depth = self.stack.len();
+        let saved_scope = {
+            let f = self.cur();
+            (
+                f.decl_class.replace(core.dc.clone()),
+                f.scope_class.replace(core.dc.clone()),
+            )
+        };
+        let r = self.vm_ctor_leaf_inner(core, argv, obj);
+        // Unwind can drop the borrowed frame; restore only if it lives.
+        let f = if self.stack.len() >= depth && depth > 0 {
+            Some(&mut *self.stack[depth - 1])
+        } else if depth == 0 {
+            Some(&mut self.globals)
+        } else {
+            None
+        };
+        if let Some(f) = f {
+            f.decl_class = saved_scope.0;
+            f.scope_class = saved_scope.1;
+        }
+        r
+    }
+
+    fn vm_ctor_leaf_inner(
+        &mut self,
+        core: &MSiteCore,
+        argv: &mut Vec<Value>,
+        obj: &Rc<std::cell::RefCell<PhpObject>>,
+    ) -> Option<Result<Value, PhpError>> {
+        let decl = &core.fdecl;
+        let comp = &core.comp;
+        let required = decl
+            .params
+            .iter()
+            .rposition(|p| p.default.is_none() && !p.variadic)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if argv.len() < required
+            || decl
+                .params
+                .iter()
+                .any(|p| p.hooks.is_some() || self.hooked_prop(obj, &p.name).is_some())
+        {
+            return None;
+        }
+        for (i, p) in decl.params.iter().enumerate() {
+            let float_ty = p.ty.as_ref().is_some_and(|ty| {
+                ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                    && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"))
+            });
+            match argv.get_mut(i) {
+                Some(v) => {
+                    if p.ty.is_none() || comp.param_fast[i].is_some_and(|g| g(v)) {
+                        continue;
+                    }
+                    // `float $f` accepts an exact-int arg like the abi
+                    // slow gate — deprecation attributes to the decl.
+                    if float_ty {
+                        if let Value::Int(n) = *v {
+                            let (old, cv) = (v.clone(), Value::Float(n as f64));
+                            let pl = self.cur_line;
+                            self.cur_line = decl.line;
+                            self.deprecate_lossy_int(p.ty.as_ref().unwrap(), &old, &cv);
+                            self.cur_line = pl;
+                            *v = cv;
+                            continue;
+                        }
+                    }
+                    return None;
+                }
+                None => {
+                    // Missing args bind their const default; a float-ty
+                    // int default widens like the value-ABI bind.
+                    let mut dv = comp.defaults[i].clone().unwrap_or(Value::Null);
+                    if float_ty {
+                        if let Value::Int(n) = dv {
+                            dv = Value::Float(n as f64);
+                        }
+                    }
+                    argv.push(dv);
+                }
+            }
+        }
+        // Same accounting as the float leaf: the frame span that was
+        // never taken still repays into the live arena segment.
+        let want = super::VM_FRAME_SLOTS + argv.len() as u64;
+        if let Some(top) = self.vm_stack.last_mut() {
+            let key = Rc::as_ptr(&top.tok) as usize;
+            top.used += want * 16;
+            Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
+        }
+        self.last_call_by_ref = false;
+        for (i, p) in decl.params.iter().enumerate() {
+            if let Err(e) = self.promoted_prop_write(obj, Some(&core.dc), &p.name, argv[i].clone())
+            {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(Value::Null))
+    }
+
     fn vm_new_run(
         &mut self,
         cls: &Rc<PhpClass>,
@@ -3674,7 +3806,15 @@ impl<'a> Interp<'a> {
                 // visibility and __call routing keep canonical errors.
                 match self.vm_method_target(o.clone(), "__construct", cache, site) {
                     Some((o2, core)) => {
-                        self.vm_run_method_direct(&core, argv, o2, "__construct", site)
+                        if core.comp.ctor_leaf {
+                            if let Some(r) = self.vm_ctor_leaf(&core, argv, &o2) {
+                                r
+                            } else {
+                                self.vm_run_method_direct(&core, argv, o2, "__construct", site)
+                            }
+                        } else {
+                            self.vm_run_method_direct(&core, argv, o2, "__construct", site)
+                        }
                     }
                     None => {
                         let mut args = super::CallArgs::empty();

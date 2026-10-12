@@ -24,7 +24,13 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
     ) -> Option<(usize, Rc<PhpClass>)> {
-        let frame = self.stack.last()?;
+        // Same frame cur() would serve: the globals pseudo-frame owns
+        // top-level scope when no call frame is live.
+        let frame = self
+            .stack
+            .last()
+            .map(|f| f.as_ref())
+            .unwrap_or(&self.globals);
         let scope = frame.decl_class.as_ref().or(frame.scope_class.as_ref())?;
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
