@@ -121,7 +121,6 @@ impl<'a> Interp<'a> {
         site: PromoteSite,
         v: Value,
     ) -> Result<(), PhpError> {
-        let p = dc.decl.props.iter().find(|p| p.name == pname);
         if let PromoteSite::Direct(i) = site {
             let mut o = obj.borrow_mut();
             if let Some(s) = o.slots.get_mut(i) {
@@ -138,6 +137,7 @@ impl<'a> Interp<'a> {
                 return Ok(());
             }
         }
+        let p = dc.decl.props.iter().find(|p| p.name == pname);
         if matches!(site, PromoteSite::StoreProp) || p.is_none() {
             return self
                 .store_prop(Value::Object(obj.clone()), pname, v)

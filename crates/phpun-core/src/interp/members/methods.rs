@@ -4095,6 +4095,7 @@ impl<'a> Interp<'a> {
                         decl: td.clone(),
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
+                        consts_ready: std::cell::Cell::new(false),
                         flat_props: std::cell::OnceCell::new(),
                         prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),

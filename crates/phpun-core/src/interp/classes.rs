@@ -409,6 +409,7 @@ impl<'a> Interp<'a> {
                         decl: Rc::new(d),
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
+                        consts_ready: std::cell::Cell::new(false),
                         flat_props: std::cell::OnceCell::new(),
                         prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
@@ -3049,7 +3050,9 @@ impl<'a> Interp<'a> {
         &mut self,
         cls: &Rc<PhpClass>,
     ) -> Result<(), PhpError> {
-        if !self.consts_linked.insert(Rc::as_ptr(cls) as usize) {
+        // `consts_ready` marks before the eval like the old ptr-set —
+        // a mid-eval error still leaves the class flagged linked.
+        if cls.consts_ready.replace(true) {
             return Ok(());
         }
         let mut chain = vec![cls.clone()];
@@ -3058,7 +3061,7 @@ impl<'a> Interp<'a> {
             let Some(pc) = lkey_get(&self.classes, p).cloned() else {
                 break;
             };
-            if !self.consts_linked.insert(Rc::as_ptr(&pc) as usize) {
+            if pc.consts_ready.replace(true) {
                 break;
             }
             pn = pc.decl.parent.clone();
@@ -3780,7 +3783,7 @@ impl<'a> Interp<'a> {
                 ));
             }
         }
-        let obj = self.instantiate(&lname, &[])?;
+        let obj = self.instantiate_cls(&cls, &[])?;
         // __construct (native for builtins via method_invoke's
         // interception); the ctor may be inherited (property_hooks/foreach).
         if let Some((m, dc)) = ctor {
@@ -3883,7 +3886,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Build the object shell: init props along the whole parent chain.
-    pub fn instantiate(&mut self, lname: &str, _args: &[Value]) -> Result<Value, PhpError> {
+    pub fn instantiate(&mut self, lname: &str, args: &[Value]) -> Result<Value, PhpError> {
         let cls = lkey_get(&self.classes, lname).cloned();
         let cls = match cls {
             Some(c) => c,
@@ -3909,6 +3912,7 @@ impl<'a> Interp<'a> {
                         }),
                         parent_rc: RefCell::new(None),
                         throwable: std::cell::Cell::new(None),
+                        consts_ready: std::cell::Cell::new(false),
                         flat_props: std::cell::OnceCell::new(),
                         prop_order_template: std::cell::OnceCell::new(),
                         prop_slot: std::cell::OnceCell::new(),
@@ -3927,10 +3931,21 @@ impl<'a> Interp<'a> {
                 })))
             }
         };
+        self.instantiate_cls(&cls, args)
+    }
+
+    /// `instantiate` with the class entry already in hand — callers
+    /// holding the resolved `Rc<PhpClass>` (vm_new_run, new_instance)
+    /// skip the class-table probe per `new`.
+    pub(in crate::interp) fn instantiate_cls(
+        &mut self,
+        cls: &Rc<PhpClass>,
+        _args: &[Value],
+    ) -> Result<Value, PhpError> {
         // Declared props come from the class's flattened layout —
         // the chain walk, redecl-position and hooked-backing rules
         // are class-fixed, computed once in flat_props_of.
-        let flat = self.flat_props_of(&cls);
+        let flat = self.flat_props_of(cls);
         let mut slots: smallvec::SmallVec<[Option<Cell>; 8]> =
             smallvec::smallvec![None; flat.len()];
         let prop_order = cls
@@ -3974,7 +3989,7 @@ impl<'a> Interp<'a> {
             }
             slots[fi] = Some(cell(default));
         }
-        let internal = if self.is_throwable_cls(&cls) {
+        let internal = if self.is_throwable_cls(cls) {
             // A throwable's file/line attribute to the executing code
             // unit — inside a call frame that's the frame's own file
             // (an error handler declared in the caller's file reports
@@ -4000,7 +4015,7 @@ impl<'a> Interp<'a> {
             None
         };
         let v = Value::Object(self.alloc_obj(PhpObject {
-            class: cls,
+            class: cls.clone(),
             slots,
             props: crate::value::FxMap::default(),
             prop_order,

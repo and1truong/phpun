@@ -2291,6 +2291,11 @@ pub struct PhpClass {
     /// construction asks it for the internal Exception payload on
     /// every `new`.
     pub throwable: std::cell::Cell<Option<bool>>,
+    /// Class-const init ran (link_const_inits): mirrors the old
+    /// `consts_linked` ptr-set — marked before the eval like zend's
+    /// in-progress flag, so a mid-eval error still counts as linked.
+    /// Every `new` reads this instead of hashing the class ptr.
+    pub consts_ready: std::cell::Cell<bool>,
     /// Chain-flattened declared props (non-static, backed) in final
     /// prop_order — built once on first `new`: the seen/backed/order
     /// machinery is class-fixed so it needn't rerun per object.
