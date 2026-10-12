@@ -5,6 +5,12 @@ use super::expr::CondFold;
 use super::util::*;
 use super::*;
 
+/// One element of the inline-foreach snapshot — see `fe_items`.
+pub(in crate::interp) enum FeItem {
+    Val(Value),
+    Cell(Cell),
+}
+
 impl<'a> Interp<'a> {
     pub fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
         self.exec_block_from(stmts, 0)
@@ -1260,6 +1266,28 @@ impl<'a> Interp<'a> {
                     cell(c.borrow().clone())
                 };
                 (k.clone(), cc)
+            })
+            .collect()
+    }
+
+    /// Inline-foreach snapshot. A fresh cell per element only detaches
+    /// the loop var from the source — storing the cloned value flat
+    /// does the same without an allocation, and an aliasing write still
+    /// materializes a cell lazily in fe_store_slot. Ref cells keep
+    /// their shared cell (canonical clone) either way.
+    pub(in crate::interp) fn fe_items(
+        &self,
+        rc: &Rc<std::cell::RefCell<crate::value::PhpArray>>,
+    ) -> Vec<(ArrKey, FeItem)> {
+        rc.borrow()
+            .iter()
+            .map(|(k, c)| {
+                let it = if self.is_ref_cell(c) {
+                    FeItem::Cell(c.clone())
+                } else {
+                    FeItem::Val(c.borrow().clone())
+                };
+                (k.clone(), it)
             })
             .collect()
     }

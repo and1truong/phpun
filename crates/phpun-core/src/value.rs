@@ -1253,6 +1253,17 @@ impl Value {
         }
     }
 
+    /// Payloads that can never run `__destruct` on decref nor hold a
+    /// graph target — the shared early-out for every displaced-zval
+    /// destructor pass (a dropped string decrefs bytes, nothing else).
+    #[inline]
+    pub(crate) fn is_dtor_free(&self) -> bool {
+        matches!(
+            self,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+        )
+    }
+
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Null => false,
@@ -2291,6 +2302,11 @@ pub struct PhpClass {
     /// construction asks it for the internal Exception payload on
     /// every `new`.
     pub throwable: std::cell::Cell<Option<bool>>,
+    /// Class-const init ran (link_const_inits): mirrors the old
+    /// `consts_linked` ptr-set — marked before the eval like zend's
+    /// in-progress flag, so a mid-eval error still counts as linked.
+    /// Every `new` reads this instead of hashing the class ptr.
+    pub consts_ready: std::cell::Cell<bool>,
     /// Chain-flattened declared props (non-static, backed) in final
     /// prop_order — built once on first `new`: the seen/backed/order
     /// machinery is class-fixed so it needn't rerun per object.
@@ -2568,8 +2584,15 @@ fn mem_charge(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) 
 /// machinery; clears the crossing record when usage is under it
 /// again (ini_set raised the ceiling or frees dropped usage).
 pub fn mem_set_arena_lim(lim: i64) {
-    ARENA_LIM.store(lim, std::sync::atomic::Ordering::Relaxed);
-    if lim < 0 || MEM_BASE_BYTES + mem_live_raw() <= lim {
+    // The boundary calls this every statement with an almost-always
+    // unchanged limit — read-guard both writes so the steady path is
+    // two loads instead of two stores plus a full live-byte read.
+    if ARENA_LIM.load(std::sync::atomic::Ordering::Relaxed) != lim {
+        ARENA_LIM.store(lim, std::sync::atomic::Ordering::Relaxed);
+    }
+    if ARENA_TRIP.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && (lim < 0 || MEM_BASE_BYTES + mem_live_raw() <= lim)
+    {
         ARENA_TRIP.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }

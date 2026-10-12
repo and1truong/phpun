@@ -7,11 +7,14 @@
 pub(in crate::interp) mod native;
 
 mod bool_loop;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod region_obj;
 
 use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::calls::builtin_byref;
+use super::exec::FeItem;
 use super::expr::{DimArg, DimDetach, DimPre};
 use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, MethodDecl, Param, Stmt};
@@ -91,15 +94,30 @@ pub(crate) struct Compiled {
     /// Bounded, read-only f64 expression leaf; runtime IC/owner guards remain.
     float_leaf: bool,
     ctor_leaf: bool,
+    /// Positional argc floor (params before the first trailing default
+    /// or variadic) — decl-static, precomputed so calls skip the
+    /// per-call rposition scan.
+    required: usize,
+    /// Per-param `float-but-not-int` proof for the leaf arg gate —
+    /// the union-type string scan is decl-static too.
+    param_float: Vec<bool>,
     /// ctor_leaf prop-write memo — (obj class ptr, caller scope ptr)
     /// → per-param PromoteSite. The resolution is class-static, so it
     /// recomputes only on a fresh key (polymorphic `new static`).
     promote_ic: std::cell::RefCell<PromoteIc>,
 }
 
-/// Promote-site memo table — see `Compiled::promote_ic`.
-type PromoteIc =
-    crate::value::FxMap<(usize, usize), Vec<Option<crate::interp::members::PromoteSite>>>;
+/// ctor_leaf write plan for a (obj class, caller scope) pair: `Bail`
+/// pins the leaf-ineligible verdict (a param hooked somewhere in the
+/// chain needs the canonical path), `Sites` the resolved per-param
+/// sites. Entries are inserted only when the verdict is bound-stable.
+enum PromotePlan {
+    Bail,
+    Sites(Vec<crate::interp::members::PromoteSite>),
+}
+
+/// Promote-plan memo table — see `Compiled::promote_ic`.
+type PromoteIc = crate::value::FxMap<(usize, usize), Rc<PromotePlan>>;
 
 pub(crate) static PROF: [std::sync::atomic::AtomicU64; 7] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -308,6 +326,10 @@ enum Op {
         /// u16::MAX when the loop has no `$k =>`.
         kslot: u16,
         end: usize,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        native: std::cell::OnceCell<Option<(native::Program, Vec<Option<usize>>)>>,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        region_fails: std::cell::Cell<u64>,
     },
     /// Direct literal-name call with Zend's persistent call-site cache.
     /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
@@ -363,7 +385,6 @@ enum Op {
         fallback: Box<Expr>,
     },
     NewCall {
-        lname: Rc<str>,
         argc: u16,
         site: usize,
         cache: std::cell::RefCell<Option<CachedMethod>>,
@@ -408,10 +429,29 @@ struct AppendSnap {
     outer: Option<(Value, PhpError, bool, bool)>,
 }
 
+/// `new X` instantiability verdict — class-static (name/kind/abstract
+/// are decl fields that never change), computed once at InitNew
+/// resolution so vm_new_run replays it instead of re-checking per `new`.
+#[derive(Clone, Copy)]
+enum NewCheck {
+    Ok,
+    Closure,
+    WeakRef,
+    Trait,
+    Interface,
+    Enum,
+    Abstract,
+}
+
 /// Class-stable pieces of a direct method target — everything except
 /// the receiver itself and per-call context guards.
-/// `Op::InitNew` resolution product: class + its found ctor.
-type NewTarget = (Rc<PhpClass>, Option<(Rc<MethodDecl>, Rc<PhpClass>)>);
+/// `Op::InitNew` resolution product: class + its found ctor + the
+/// instantiability verdict.
+type NewTarget = (
+    Rc<PhpClass>,
+    Option<(Rc<MethodDecl>, Rc<PhpClass>)>,
+    NewCheck,
+);
 
 #[derive(Clone)]
 struct MSiteCore {
@@ -657,6 +697,22 @@ impl Compiled {
             value_abi,
             float_leaf,
             ctor_leaf,
+            required: decl
+                .params
+                .iter()
+                .rposition(|p| p.default.is_none() && !p.variadic)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            param_float: decl
+                .params
+                .iter()
+                .map(|p| {
+                    p.ty.as_ref().is_some_and(|ty| {
+                        ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                            && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                    })
+                })
+                .collect(),
             promote_ic: std::cell::RefCell::new(crate::value::FxMap::default()),
         }))
     }
@@ -702,6 +758,8 @@ impl Compiled {
             value_abi: false,
             float_leaf: false,
             ctor_leaf: false,
+            required: 0,
+            param_float: Vec::new(),
             promote_ic: std::cell::RefCell::new(crate::value::FxMap::default()),
         }))
     }
@@ -951,6 +1009,10 @@ impl Compiler {
                     vslot,
                     kslot,
                     end: usize::MAX,
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    native: std::cell::OnceCell::new(),
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    region_fails: std::cell::Cell::new(0),
                 });
                 self.loops.push((Vec::new(), Vec::new()));
                 self.stmts(body)?;
@@ -1677,7 +1739,6 @@ impl Compiler {
                     self.expr(Interp::unmark_arg(a))?;
                 }
                 let call = self.emit(Op::NewCall {
-                    lname: Rc::from(cname.to_lowercase().as_str()),
                     argc: args.len() as u16,
                     site: *site,
                     cache: std::cell::RefCell::new(None),
@@ -2053,7 +2114,13 @@ impl<'a> Interp<'a> {
                     decl.params
                         .iter()
                         .filter(|p| p.promoted)
-                        .any(|p| p.hooks.is_some() || self.hooked_prop(o, &p.name).is_some())
+                        .any(|p| p.hooks.is_some())
+                        || (self.class_has_hooked_prop(&o.borrow().class)
+                            && decl
+                                .params
+                                .iter()
+                                .filter(|p| p.promoted)
+                                .any(|p| self.hooked_prop(o, &p.name).is_some()))
                 });
                 if hooked {
                     self.vm_materialize(comp, &mut slots);
@@ -2451,22 +2518,20 @@ impl<'a> Interp<'a> {
             }
             drop(arr);
         }
-        let nc = {
+        // Fresh cell bound with the value already inside: canonical's
+        // Null-cell + typed_slot_store + replace is dead work here —
+        // a brand-new cell has no typed-slot owners (prune clears a
+        // recycled address), nothing observes the bind between the two
+        // steps, and the displaced Null has no dtor.
+        {
             let mut arr = rc.borrow_mut();
             let k = ArrKey::Int(arr.next);
-            let nc = cell(Value::Null);
-            arr.bind_cell(k, nc.clone());
+            let nc = cell(v.clone());
+            self.prune_typed_slot(Rc::as_ptr(&nc) as usize);
+            arr.bind_cell(k, nc);
             let req = Self::ht_req(arr.entries.len(), arr.packed);
             drop(arr);
             self.mem_realloc(&rc, req);
-            nc
-        };
-        let v = self.typed_slot_store(&nc, v)?;
-        // B1 — a live upstream borrow drops the write invisibly.
-        if let Ok(mut nb) = nc.try_borrow_mut() {
-            let old = std::mem::replace(&mut *nb, v.clone());
-            drop(nb);
-            self.destruct_dying_value(&old)?;
         }
         Ok(v)
     }
@@ -2546,7 +2611,7 @@ impl<'a> Interp<'a> {
         // pair, exec-local so recursion into this Compiled can't
         // collide. Consuming the into_iter per element mirrors the
         // canonical loop's per-iteration cell drop (dtor timing).
-        let mut fe_states: Vec<Option<std::vec::IntoIter<(crate::value::ArrKey, Cell)>>> =
+        let mut fe_states: Vec<Option<std::vec::IntoIter<(crate::value::ArrKey, FeItem)>>> =
             Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
@@ -2581,7 +2646,7 @@ impl<'a> Interp<'a> {
                         if fe_states.len() <= *idx as usize {
                             fe_states.resize_with(*idx as usize + 1, || None);
                         }
-                        fe_states[*idx as usize] = Some(self.fe_snapshot(rc).into_iter());
+                        fe_states[*idx as usize] = Some(self.fe_items(rc).into_iter());
                         pc = *fetch;
                     } else {
                         // Traversable/scalar sources replay the
@@ -2619,7 +2684,35 @@ impl<'a> Interp<'a> {
                     vslot,
                     kslot,
                     end,
+                    ..
                 } => {
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    if let Op::FeNext {
+                        native,
+                        region_fails,
+                        ..
+                    } = &comp.ops[pc]
+                    {
+                        if vs.is_empty() {
+                            if let Some((resume, flow, vals)) = self.vm_obj_region(
+                                comp,
+                                slots,
+                                tmark,
+                                &mut fe_states,
+                                native,
+                                region_fails,
+                                pc,
+                                *end,
+                            )? {
+                                vs.extend(vals);
+                                if let Some(flow) = flow {
+                                    return Ok(flow);
+                                }
+                                pc = resume;
+                                continue;
+                            }
+                        }
+                    }
                     let next = fe_states
                         .get_mut(*idx as usize)
                         .and_then(|s| s.as_mut())
@@ -2632,7 +2725,10 @@ impl<'a> Interp<'a> {
                         let kv = crate::interp::util::key_value(&k);
                         self.fe_store_slot(comp, slots, *kslot, kv)?;
                     }
-                    let v = c.borrow().clone();
+                    let v = match c {
+                        FeItem::Val(v) => v,
+                        FeItem::Cell(c) => c.borrow().clone(),
+                    };
                     self.fe_store_slot(comp, slots, *vslot, v)?;
                 }
                 Op::Foreach {
@@ -3044,10 +3140,18 @@ impl<'a> Interp<'a> {
                     // decref (hold2's ED ordering).
                     self.last_ret_cell = None;
                     if let Some(v) = vs.pop() {
-                        if matches!(v, Value::Object(_) | Value::Callable(_)) {
-                            // Discarded object temp: same decref pass
-                            // exec's statement end runs.
-                            self.destruct_cells(&[cell(v)])?;
+                        match v {
+                            // Discarded object temp: a lone object needs
+                            // only the last-ref teardown — the cell wrap
+                            // destruct_cells requires is bookkeeping for
+                            // shared owners this fresh wrapper can't have.
+                            Value::Object(o) if Rc::strong_count(&o) == 1 => {
+                                self.destruct_last_ref_obj(&o)?;
+                            }
+                            Value::Object(_) | Value::Callable(_) => {
+                                self.destruct_cells(&[cell(v)])?;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -3189,7 +3293,11 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 Op::Sweep => {
-                    self.sweep_expr_temps(tmark)?;
+                    // The sweep's own early-out costs a call anyway —
+                    // skip it here when this statement made no temps.
+                    if self.expr_temps.len() != tmark {
+                        self.sweep_expr_temps(tmark)?;
+                    }
                     tmark = self.expr_temps.len();
                 }
                 Op::IncDec { slot, delta, post } => {
@@ -3378,7 +3486,8 @@ impl<'a> Interp<'a> {
                                     // chain is bound — a probe during
                                     // mid-registration must re-run.
                                     let cacheable = ctor.is_some() || self.class_chain_bound(&cls);
-                                    let t = (cls, ctor);
+                                    let check = Self::new_check(&cls);
+                                    let t = (cls, ctor, check);
                                     if cacheable {
                                         *cache.borrow_mut() = Some(t.clone());
                                     }
@@ -3400,22 +3509,17 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                Op::NewCall {
-                    lname,
-                    argc,
-                    site,
-                    cache,
-                } => {
+                Op::NewCall { argc, site, cache } => {
                     let n = *argc as usize;
                     self.send_line = Some(*site);
-                    let (cls, ctor) = ntargets.pop().expect("InitNew resolved this new");
+                    let (cls, ctor, check) = ntargets.pop().expect("InitNew resolved this new");
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
                     // The slot sync moves inside vm_new_run: a leaf ctor
                     // never observes caller vars, so its whole call skips
                     // the materialize/refresh a real callee needs.
                     let sync = comp.top_level.then_some((comp, &mut *slots));
-                    let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site, sync);
+                    let result = self.vm_new_run(&cls, ctor, check, &mut argv, cache, *site, sync);
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -4298,25 +4402,67 @@ impl<'a> Interp<'a> {
     ) -> Option<Result<Value, PhpError>> {
         let decl = &core.fdecl;
         let comp = &core.comp;
-        let required = decl
-            .params
-            .iter()
-            .rposition(|p| p.default.is_none() && !p.variadic)
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        if argv.len() < required
-            || decl
-                .params
-                .iter()
-                .any(|p| p.hooks.is_some() || self.hooked_prop(obj, &p.name).is_some())
-        {
+        if argv.len() < comp.required {
             return None;
         }
+        // Prop-site plan memo: the hook probe plus the per-param
+        // resolve_direct/hook/flat scans are class-static per
+        // (obj class, caller scope) — one map hit and an Rc clone per
+        // `new`, the resolution running only on a fresh key.
+        let ocls = obj.borrow().class.clone();
+        let scope_key = {
+            let f = self.cur();
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|c| Rc::as_ptr(c) as usize)
+                .unwrap_or(0)
+        };
+        let ic_key = (Rc::as_ptr(&ocls) as usize, scope_key);
+        let plan = comp.promote_ic.borrow().get(&ic_key).cloned();
+        let mut resolved = Vec::new();
+        let sites: &[crate::interp::members::PromoteSite] = match plan.as_deref() {
+            Some(PromotePlan::Bail) => return None,
+            Some(PromotePlan::Sites(s)) => s.as_slice(),
+            None => {
+                // The per-param hooked_prop probe walks the private-prop
+                // chain — skip it entirely when no prop in the class
+                // hierarchy can carry hooks (memoized, decl-stable once
+                // bound).
+                let param_hooked = decl.params.iter().any(|p| p.hooks.is_some())
+                    || (self.class_has_hooked_prop(&ocls)
+                        && decl
+                            .params
+                            .iter()
+                            .any(|p| self.hooked_prop(obj, &p.name).is_some()));
+                // Only a bound-stable verdict may freeze: decl param
+                // hooks are decl-static; `cls_hooked` records a verdict
+                // iff the chain was bound when probed. An unbound probe
+                // re-runs next `new` like the uncached path.
+                let bound = decl.params.iter().any(|p| p.hooks.is_some())
+                    || self.cls_hooked.contains_key(&(Rc::as_ptr(&ocls) as usize));
+                if param_hooked {
+                    if bound {
+                        comp.promote_ic
+                            .borrow_mut()
+                            .insert(ic_key, Rc::new(PromotePlan::Bail));
+                    }
+                    return None;
+                }
+                resolved.reserve(decl.params.len());
+                for p in decl.params.iter() {
+                    resolved.push(self.promote_site(obj, &core.dc, &p.name));
+                }
+                if bound {
+                    comp.promote_ic
+                        .borrow_mut()
+                        .insert(ic_key, Rc::new(PromotePlan::Sites(resolved.clone())));
+                }
+                resolved.as_slice()
+            }
+        };
         for (i, p) in decl.params.iter().enumerate() {
-            let float_ty = p.ty.as_ref().is_some_and(|ty| {
-                ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
-                    && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"))
-            });
+            let float_ty = comp.param_float[i];
             match argv.get_mut(i) {
                 Some(v) => {
                     if p.ty.is_none() || comp.param_fast[i].is_some_and(|g| g(v)) {
@@ -4359,47 +4505,41 @@ impl<'a> Interp<'a> {
             Self::vm_stack_apply(&mut self.vm_stack, key, want, 0);
         }
         self.last_call_by_ref = false;
-        // Prop-site memo: resolve_direct/hook/flat scans are
-        // class-static per (obj class, caller scope) — pay them once,
-        // then a Vec index per param. The borrow drops before each
-        // write: store_prop can re-enter (magic __set → new).
-        let scope_key = {
-            let f = self.cur();
-            f.decl_class
-                .as_ref()
-                .or(f.scope_class.as_ref())
-                .map(|c| Rc::as_ptr(c) as usize)
-                .unwrap_or(0)
-        };
-        let ic_key = (Rc::as_ptr(&obj.borrow().class) as usize, scope_key);
         for (i, p) in decl.params.iter().enumerate() {
-            let site = {
-                let mut ic = comp.promote_ic.borrow_mut();
-                let sites = ic
-                    .entry(ic_key)
-                    .or_insert_with(|| vec![None; decl.params.len()]);
-                match sites.get_mut(i).and_then(|e| *e) {
-                    Some(s) => s,
-                    None => {
-                        let s = self.promote_site(obj, &core.dc, &p.name);
-                        sites[i] = Some(s);
-                        s
-                    }
-                }
-            };
-            if let Err(e) = self.promoted_write(obj, &core.dc, &p.name, site, argv[i].clone()) {
+            // The plan borrow ended with the lookup: store_prop can
+            // re-enter (magic __set → new).
+            if let Err(e) = self.promoted_write(obj, &core.dc, &p.name, sites[i], argv[i].clone()) {
                 return Some(Err(e));
             }
         }
         Some(Ok(Value::Null))
     }
 
+    /// The class-static instantiability checks new_instance runs on
+    /// every `new` — folded into the InitNew resolution so a cached
+    /// `new` replays a verdict instead.
+    fn new_check(cls: &Rc<PhpClass>) -> NewCheck {
+        if cls.name().eq_ignore_ascii_case("closure") {
+            return NewCheck::Closure;
+        }
+        if cls.name().eq_ignore_ascii_case("weakreference") {
+            return NewCheck::WeakRef;
+        }
+        match cls.decl.kind {
+            crate::ast::ClassKind::Trait => NewCheck::Trait,
+            crate::ast::ClassKind::Interface => NewCheck::Interface,
+            crate::ast::ClassKind::Enum => NewCheck::Enum,
+            _ if cls.decl.is_abstract => NewCheck::Abstract,
+            _ => NewCheck::Ok,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn vm_new_run(
         &mut self,
         cls: &Rc<PhpClass>,
-        lname: &Rc<str>,
         ctor: Option<(Rc<MethodDecl>, Rc<PhpClass>)>,
+        check: NewCheck,
         argv: &mut Vec<Value>,
         cache: &std::cell::RefCell<Option<CachedMethod>>,
         site: usize,
@@ -4420,40 +4560,36 @@ impl<'a> Interp<'a> {
                 return $e;
             }};
         }
-        if cls.name().eq_ignore_ascii_case("closure") {
-            fail_synced!(self.fail(PhpError::uncaught(
+        match check {
+            NewCheck::Ok => {}
+            NewCheck::Closure => fail_synced!(self.fail(PhpError::uncaught(
                 "Error",
                 "Instantiation of class Closure is not allowed",
                 0,
-            )));
-        }
-        if cls.name().eq_ignore_ascii_case("weakreference") {
-            fail_synced!(self.fail(PhpError::uncaught(
+            ))),
+            NewCheck::WeakRef => fail_synced!(self.fail(PhpError::uncaught(
                 "Error",
                 "Direct instantiation of WeakReference is not allowed, use WeakReference::create instead",
                 0,
-            )));
-        }
-        let kerr = |what: &str| {
-            PhpError::uncaught(
-                "Error",
-                format!("Cannot instantiate {} {}", what, cls.name()),
-                0,
-            )
-        };
-        match cls.decl.kind {
-            crate::ast::ClassKind::Trait => fail_synced!(self.fail(kerr("trait"))),
-            crate::ast::ClassKind::Interface => fail_synced!(self.fail(kerr("interface"))),
-            crate::ast::ClassKind::Enum => fail_synced!(self.fail(kerr("enum"))),
-            _ => {}
-        }
-        if cls.decl.is_abstract {
-            fail_synced!(self.fail(kerr("abstract class")));
+            ))),
+            _ => {
+                let what = match check {
+                    NewCheck::Trait => "trait",
+                    NewCheck::Interface => "interface",
+                    NewCheck::Enum => "enum",
+                    _ => "abstract class",
+                };
+                fail_synced!(self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Cannot instantiate {} {}", what, cls.name()),
+                    0,
+                )));
+            }
         }
         if let Err(e) = self.link_const_inits(cls) {
             fail_synced!(Err(e));
         }
-        let obj = match self.instantiate(lname, &[]) {
+        let obj = match self.instantiate_cls(cls, &[]) {
             Ok(v) => v,
             Err(e) => fail_synced!(Err(e)),
         };
@@ -4614,12 +4750,7 @@ impl<'a> Interp<'a> {
         let decl = &core.fdecl;
         let comp = &core.comp;
         let scope = core.dc.clone();
-        let required = decl
-            .params
-            .iter()
-            .rposition(|p| p.default.is_none() && !p.variadic)
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let required = comp.required;
         if argv.len() < required {
             let mut args = super::CallArgs::empty();
             args.cells = argv.drain(..).map(cell).collect();
@@ -4907,6 +5038,132 @@ mod tests {
     use super::Interp;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     use std::rc::Rc;
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn object_regions_execute_and_resume_without_replaying_side_effects() {
+        let mut it = Interp::new("object-regions.php");
+        let result = it.run_source(include_str!("../../tests/fixtures/vm_object_regions.php"));
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.err_buf, "");
+        assert_eq!(
+            it.out,
+            include_bytes!("../../tests/fixtures/vm_object_regions.expect")
+        );
+        for name in [
+            "object_region_sum",
+            "object_region_scalars",
+            "object_region_overflow",
+            "object_region_overflow_stack",
+            "object_region_nested",
+        ] {
+            let decl = it.functions[name].clone();
+            let compiled = it.vm_compiled(&decl).unwrap();
+            assert!(
+                compiled.ops.iter().any(|op| matches!(op,
+                    super::Op::FeNext { native, .. }
+                        if native.get().and_then(Option::as_ref)
+                            .is_some_and(|(p, _)| p.executions.get() > 0)
+                )),
+                "{name} never completed a native region"
+            );
+        }
+        let decl = it.functions["object_region_overflow"].clone();
+        let compiled = it.vm_compiled(&decl).unwrap();
+        assert!(
+            compiled.ops.iter().any(|op| matches!(op,
+                super::Op::FeNext { region_fails, .. } if region_fails.get() > 0
+            )),
+            "integer overflow must resume at the failing arithmetic op"
+        );
+        for name in [
+            "object_region_alias",
+            "object_region_args",
+            "object_region_ctor",
+            "object_region_escape",
+        ] {
+            let decl = it.functions[name].clone();
+            let compiled = it.vm_compiled(&decl).unwrap();
+            assert!(
+                compiled.ops.iter().all(|op| !matches!(op,
+                    super::Op::FeNext { native, .. }
+                        if native.get().and_then(Option::as_ref)
+                            .is_some_and(|(p, _)| p.executions.get() > 0)
+                )),
+                "{name} must stay canonical"
+            );
+        }
+        let decl = it.functions["object_region_ref"].clone();
+        let compiled = it.vm_compiled(&decl).unwrap();
+        assert!(!compiled
+            .ops
+            .iter()
+            .any(|op| matches!(op, super::Op::FeNext { .. })));
+        let decl = it.functions["object_region_generator"].clone();
+        assert!(it.vm_compiled(&decl).is_none());
+
+        // A GC pause must neither consume a snapshot item nor permanently
+        // disable the region. The canonical fetch will service the overflow.
+        let decl = it.functions["object_region_sum"].clone();
+        let compiled = it.vm_compiled(&decl).unwrap();
+        let (start, end, idx) = compiled
+            .ops
+            .iter()
+            .enumerate()
+            .find_map(|(pc, op)| match op {
+                super::Op::FeNext { end, idx, .. } => Some((pc, *end, *idx)),
+                _ => None,
+            })
+            .unwrap();
+        let mut slots: Vec<_> = (0..compiled.nslots).map(|_| super::Slot::Uninit).collect();
+        let mut states: Vec<_> = (0..=idx).map(|_| None).collect();
+        states[idx as usize] = Some(
+            vec![(
+                crate::value::ArrKey::Int(0),
+                super::FeItem::Val(super::Value::Int(7)),
+            )]
+            .into_iter(),
+        );
+        let points = Rc::new(std::cell::RefCell::new(crate::value::PhpArray::new()));
+        it.globals_arr = None;
+        it.gc_pending = 9_996;
+        it.gc_purpled.insert(Rc::as_ptr(&points) as usize);
+        let native = std::cell::OnceCell::new();
+        let fails = std::cell::Cell::new(0);
+        let tmark = it.expr_temps.len();
+        assert!(it
+            .vm_obj_region(
+                &compiled,
+                &mut slots,
+                tmark,
+                &mut states,
+                &native,
+                &fails,
+                start,
+                end,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(states[idx as usize].as_ref().unwrap().len(), 1);
+        assert_eq!(fails.get(), 0);
+        it.gc_pending = 0;
+        it.gc_purpled.clear();
+        assert!(it
+            .vm_obj_region(
+                &compiled,
+                &mut slots,
+                tmark,
+                &mut states,
+                &native,
+                &fails,
+                start,
+                end,
+            )
+            .unwrap()
+            .is_some());
+        assert_eq!(states[idx as usize].as_ref().unwrap().len(), 0);
+        assert_eq!(fails.get(), 1, "the non-object method receiver must deopt");
+    }
 
     #[test]
     fn scalar_dimension_slots_preserve_mutation_refs_views_and_fallbacks() {

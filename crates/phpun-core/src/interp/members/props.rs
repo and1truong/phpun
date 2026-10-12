@@ -121,7 +121,6 @@ impl<'a> Interp<'a> {
         site: PromoteSite,
         v: Value,
     ) -> Result<(), PhpError> {
-        let p = dc.decl.props.iter().find(|p| p.name == pname);
         if let PromoteSite::Direct(i) = site {
             let mut o = obj.borrow_mut();
             if let Some(s) = o.slots.get_mut(i) {
@@ -138,6 +137,7 @@ impl<'a> Interp<'a> {
                 return Ok(());
             }
         }
+        let p = dc.decl.props.iter().find(|p| p.name == pname);
         if matches!(site, PromoteSite::StoreProp) || p.is_none() {
             return self
                 .store_prop(Value::Object(obj.clone()), pname, v)
@@ -184,6 +184,30 @@ impl<'a> Interp<'a> {
                 .store_prop(Value::Object(obj.clone()), pname, v)
                 .map(|_| ()),
         }
+    }
+
+    /// Whether any prop on the class or its ancestors carries hooks —
+    /// decl-level metadata, memoized per class once the parent chain is
+    /// bound. `hooked_prop` can only return Some when this is true.
+    pub(in crate::interp) fn class_has_hooked_prop(&mut self, cls: &Rc<PhpClass>) -> bool {
+        let key = Rc::as_ptr(cls) as usize;
+        if let Some(&has) = self.cls_hooked.get(&key) {
+            return has;
+        }
+        let bound = self.class_chain_bound(cls);
+        let mut cur = Some(cls.clone());
+        let mut has = false;
+        while let Some(c) = cur {
+            if c.decl.props.iter().any(|p| p.hooks.is_some()) {
+                has = true;
+                break;
+            }
+            cur = self.parent_of(&c);
+        }
+        if bound {
+            self.cls_hooked.insert(key, has);
+        }
+        has
     }
 
     pub(in crate::interp) fn hooked_prop(
