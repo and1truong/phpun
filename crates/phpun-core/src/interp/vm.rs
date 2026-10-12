@@ -351,6 +351,12 @@ enum Op {
 /// pending hook) still run per call.
 struct CachedMethod {
     class: Rc<PhpClass>,
+    /// Caller-scope class (None = none): the resolution verdict —
+    /// scope-private shadowing + visibility — is (class, scope)-static
+    /// per call site, so folding it into the key lets a hit skip the
+    /// per-call context checks entirely. Held by Rc so a freed scope's
+    /// address can't alias into a false hit.
+    scope: Option<Rc<PhpClass>>,
     core: Option<MSiteCore>,
 }
 
@@ -4163,15 +4169,32 @@ impl<'a> Interp<'a> {
             return None;
         }
         let cls = o.borrow().class.clone();
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone());
         let cached = {
             let b = cache.borrow();
             b.as_ref()
-                .filter(|h| Rc::ptr_eq(&h.class, &cls))
+                .filter(|h| {
+                    Rc::ptr_eq(&h.class, &cls)
+                        && match (&h.scope, &scope) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                            _ => false,
+                        }
+                })
                 .map(|h| h.core.clone())
         };
         let core = match cached {
             Some(core) => core,
             None => {
+                // Resolve the class-stable target, then fold the
+                // (class, scope)-static context verdict — scope-private
+                // shadowing and visibility — into the cached entry. A
+                // verdict of None means "canonical path for this
+                // scope", same as a resolution miss.
                 let core = self.find_method_in(&cls, name).and_then(|(m, dc)| {
                     if m.is_static
                         || m.is_abstract
@@ -4186,19 +4209,20 @@ impl<'a> Interp<'a> {
                     let comp = self.vm_compiled(&fdecl)?;
                     (!comp.needs_bind).then(|| MSiteCore { m, fdecl, comp, dc })
                 });
+                let verdict = core.filter(|c| {
+                    // Scope-private methods shadow the object's table
+                    // only inside their own scope; visibility gates
+                    // __call/vis_error — canonical semantics either way.
+                    self.scope_private_method(name).is_none() && self.method_access_ok(&c.m, &c.dc)
+                });
                 *cache.borrow_mut() = Some(CachedMethod {
                     class: cls.clone(),
-                    core: core.clone(),
+                    scope,
+                    core: verdict.clone(),
                 });
-                core
+                verdict
             }
         }?;
-        // Scope-private methods shadow the object's table only inside
-        // their own scope; visibility gates __call/vis_error — both
-        // keep canonical semantics.
-        if self.scope_private_method(name).is_some() || !self.method_access_ok(&core.m, &core.dc) {
-            return None;
-        }
         Some((o, core))
     }
 
