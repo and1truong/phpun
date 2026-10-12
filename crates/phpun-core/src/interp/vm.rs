@@ -2237,9 +2237,25 @@ impl<'a> Interp<'a> {
                     self.vm_materialize(comp, slots);
                     let previous_depth =
                         std::mem::replace(&mut self.loop_depth, base_depth + depth);
+                    // Plain `as $k => $v` targets write through the same
+                    // vars cells every pass — and a compiled body can't
+                    // rebind names (unset/global/`=&` all bail it) — so
+                    // seeded C-slots stay valid across iterations; hoist
+                    // the slot vec + name seeding out of the loop.
+                    let fast_body = matches!(val, crate::ast::ForeachTarget::Var(_))
+                        && !matches!(key, Some(crate::ast::ForeachKey::ByRef));
+                    let mut bslots = if fast_body {
+                        self.vm_slot_pool.pop().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let flow = self.exec_foreach_with(arr, key, val, &mut |s| {
                         s.loop_depth += 1;
-                        let result = s.vm_scope_exec(body, true);
+                        let result = if fast_body {
+                            s.vm_body_exec(body, &mut bslots)
+                        } else {
+                            s.vm_scope_exec(body, true)
+                        };
                         let flow = match result {
                             Ok(flow) => flow,
                             Err(error) => s.err_flow(error),
@@ -2248,6 +2264,12 @@ impl<'a> Interp<'a> {
                         flow
                     });
                     self.loop_depth = previous_depth;
+                    if !bslots.is_empty() {
+                        bslots.clear();
+                        if self.vm_slot_pool.len() < 64 {
+                            self.vm_slot_pool.push(bslots);
+                        }
+                    }
                     self.vm_refresh(comp, slots);
                     if !matches!(flow, Flow::Normal) {
                         return Ok(flow);
@@ -2839,13 +2861,11 @@ impl<'a> Interp<'a> {
                     let (cls, ctor) = ntargets.pop().expect("InitNew resolved this new");
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
-                    if comp.top_level {
-                        self.vm_materialize(comp, slots);
-                    }
-                    let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site);
-                    if comp.top_level {
-                        self.vm_refresh(comp, slots);
-                    }
+                    // The slot sync moves inside vm_new_run: a leaf ctor
+                    // never observes caller vars, so its whole call skips
+                    // the materialize/refresh a real callee needs.
+                    let sync = comp.top_level.then_some((comp, &mut *slots));
+                    let result = self.vm_new_run(&cls, lname, ctor, &mut argv, cache, *site, sync);
                     let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -2958,6 +2978,35 @@ impl<'a> Interp<'a> {
     /// exec_block's stmt-level failures.
     pub(in crate::interp) fn vm_bound_exec(&mut self, comp: &Compiled) -> Result<Flow, PhpError> {
         self.vm_scope_exec(comp, comp.top_level)
+    }
+
+    /// Loop-body exec with caller-owned slots: seeded once, then only
+    /// non-C entries reseed (a compiled body cannot rebind its names,
+    /// so C cells never go stale) — and the keep_vars tail only pushes
+    /// still-V names into vars, promoting them to C for next pass.
+    fn vm_body_exec(&mut self, comp: &Compiled, slots: &mut Vec<Slot>) -> Result<Flow, PhpError> {
+        if slots.len() != comp.nslots {
+            slots.clear();
+            slots.resize_with(comp.nslots, || Slot::Uninit);
+        }
+        for (name, idx) in &comp.names {
+            if matches!(slots[*idx as usize], Slot::C(_)) {
+                continue;
+            }
+            slots[*idx as usize] = match self.cur().vars.get(name) {
+                Some(c) => Slot::C(c.clone()),
+                None => Slot::Uninit,
+            };
+        }
+        let r = self.vm_exec(comp, slots, self.expr_temps.len());
+        for (name, idx) in &comp.names {
+            if let Slot::V(v) = &mut slots[*idx as usize] {
+                let c = cell(std::mem::replace(v, Value::Null));
+                self.cur().vars.insert(name.clone(), c.clone());
+                slots[*idx as usize] = Slot::C(c);
+            }
+        }
+        r
     }
 
     fn vm_scope_exec(&mut self, comp: &Compiled, keep_vars: bool) -> Result<Flow, PhpError> {
@@ -3759,6 +3808,7 @@ impl<'a> Interp<'a> {
         Some(Ok(Value::Null))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn vm_new_run(
         &mut self,
         cls: &Rc<PhpClass>,
@@ -3767,20 +3817,36 @@ impl<'a> Interp<'a> {
         argv: &mut Vec<Value>,
         cache: &std::cell::RefCell<Option<CachedMethod>>,
         site: usize,
+        sync: Option<(&Compiled, &mut [Slot])>,
     ) -> Result<Value, PhpError> {
+        // `sync` materializes lazily — paid only where a callee or an
+        // error could observe caller vars, never for a leaf publish.
+        let mut sync = sync;
+        let mut synced = false;
+        // Error exits that skipped the fast sync still owe the caller a
+        // reconciled slot view — handlers downstream read globals.
+        macro_rules! fail_synced {
+            ($e:expr) => {{
+                if let Some((c, s)) = sync.as_mut() {
+                    self.vm_materialize(c, s);
+                    self.vm_refresh(c, s);
+                }
+                return $e;
+            }};
+        }
         if cls.name().eq_ignore_ascii_case("closure") {
-            return self.fail(PhpError::uncaught(
+            fail_synced!(self.fail(PhpError::uncaught(
                 "Error",
                 "Instantiation of class Closure is not allowed",
                 0,
-            ));
+            )));
         }
         if cls.name().eq_ignore_ascii_case("weakreference") {
-            return self.fail(PhpError::uncaught(
+            fail_synced!(self.fail(PhpError::uncaught(
                 "Error",
                 "Direct instantiation of WeakReference is not allowed, use WeakReference::create instead",
                 0,
-            ));
+            )));
         }
         let kerr = |what: &str| {
             PhpError::uncaught(
@@ -3790,16 +3856,21 @@ impl<'a> Interp<'a> {
             )
         };
         match cls.decl.kind {
-            crate::ast::ClassKind::Trait => return self.fail(kerr("trait")),
-            crate::ast::ClassKind::Interface => return self.fail(kerr("interface")),
-            crate::ast::ClassKind::Enum => return self.fail(kerr("enum")),
+            crate::ast::ClassKind::Trait => fail_synced!(self.fail(kerr("trait"))),
+            crate::ast::ClassKind::Interface => fail_synced!(self.fail(kerr("interface"))),
+            crate::ast::ClassKind::Enum => fail_synced!(self.fail(kerr("enum"))),
             _ => {}
         }
         if cls.decl.is_abstract {
-            return self.fail(kerr("abstract class"));
+            fail_synced!(self.fail(kerr("abstract class")));
         }
-        self.link_const_inits(cls)?;
-        let obj = self.instantiate(lname, &[])?;
+        if let Err(e) = self.link_const_inits(cls) {
+            fail_synced!(Err(e));
+        }
+        let obj = match self.instantiate(lname, &[]) {
+            Ok(v) => v,
+            Err(e) => fail_synced!(Err(e)),
+        };
         if let Value::Object(o) = &obj {
             let r = if let Some((m, dc)) = ctor {
                 // Same guards a `$o->m()` hit runs — private-ctor
@@ -3810,13 +3881,25 @@ impl<'a> Interp<'a> {
                             if let Some(r) = self.vm_ctor_leaf(&core, argv, &o2) {
                                 r
                             } else {
+                                if let Some((c, s)) = sync.as_mut() {
+                                    self.vm_materialize(c, s);
+                                    synced = true;
+                                }
                                 self.vm_run_method_direct(&core, argv, o2, "__construct", site)
                             }
                         } else {
+                            if let Some((c, s)) = sync.as_mut() {
+                                self.vm_materialize(c, s);
+                                synced = true;
+                            }
                             self.vm_run_method_direct(&core, argv, o2, "__construct", site)
                         }
                     }
                     None => {
+                        if let Some((c, s)) = sync.as_mut() {
+                            self.vm_materialize(c, s);
+                            synced = true;
+                        }
                         let mut args = super::CallArgs::empty();
                         args.cells = argv.drain(..).map(cell).collect();
                         self.method_invoke_vis(o.clone(), "__construct", args, Some((m, dc)))
@@ -3827,11 +3910,26 @@ impl<'a> Interp<'a> {
                 Ok(Value::Null)
             };
             if let Err(e) = r {
+                if let Some((c, s)) = sync.as_mut() {
+                    self.vm_materialize(c, s);
+                    synced = true;
+                }
                 // A ctor that throws leaves a half-built object;
                 // zend never runs its __destruct (bug29368_1/_3).
                 self.mark_destructed(o);
+                if synced {
+                    if let Some((c, s)) = sync.as_mut() {
+                        self.vm_refresh(c, s);
+                    }
+                }
                 return Err(e);
             }
+            if synced {
+                if let Some((c, s)) = sync.as_mut() {
+                    self.vm_refresh(c, s);
+                }
+            }
+            r?;
         }
         if let Value::Object(o) = &obj {
             self.expr_temps.push(o.clone());

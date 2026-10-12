@@ -3216,6 +3216,24 @@ impl<'a> Interp<'a> {
         if matches!(v, Value::Object(o) if Rc::strong_count(o) > 1) {
             return Ok(());
         }
+        // A lone dying object is the common case — check it without
+        // building the dedup map composites need.
+        if let Value::Object(o) = v {
+            if Rc::strong_count(o) == 1
+                && self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+                && self.mark_destructed(&o.clone())
+            {
+                if self.pending_exception.is_some() {
+                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                } else {
+                    self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+                }
+                self.mark_obj_died(o);
+            }
+            return Ok(());
+        }
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
             held.entry(Rc::as_ptr(o) as usize)
@@ -7056,6 +7074,23 @@ impl<'a> Interp<'a> {
                 if Rc::strong_count(o) - 1 > 1 {
                     self.gc_note_purple(Rc::as_ptr(o) as usize);
                 } else {
+                    // Scalar-prop objects hold no graph target — the
+                    // array arm's packed/scalar early-out, same rule.
+                    {
+                        let b = o.borrow();
+                        if b.slots.iter().flatten().chain(b.props.values()).all(|c| {
+                            matches!(
+                                &*c.borrow(),
+                                Value::Null
+                                    | Value::Bool(_)
+                                    | Value::Int(_)
+                                    | Value::Float(_)
+                                    | Value::Str(_)
+                            )
+                        }) {
+                            return;
+                        }
+                    }
                     let dying = {
                         let b = o.borrow();
                         self.gc_dying_acquire(
