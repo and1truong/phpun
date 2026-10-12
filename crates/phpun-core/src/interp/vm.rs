@@ -610,7 +610,12 @@ impl Compiled {
         let canonical_binding = c.ops.iter().any(|op| {
             matches!(
                 op,
-                Op::Canonical(_) | Op::DimCv { .. } | Op::CanonicalStmt { .. } | Op::Foreach { .. }
+                Op::Canonical(_)
+                    | Op::DimCv { .. }
+                    | Op::CanonicalStmt { .. }
+                    | Op::Foreach { .. }
+                    | Op::FeInit { .. }
+                    | Op::FeNext { .. }
             )
         });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
