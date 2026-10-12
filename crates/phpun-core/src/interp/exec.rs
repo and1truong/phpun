@@ -1242,6 +1242,28 @@ impl<'a> Interp<'a> {
         self.exec_foreach_with(arr, key, val, &mut |s| s.exec_loop_body(body))
     }
 
+    /// Value-foreach snapshot: `.iter()` skips tombstoned buckets and
+    /// IS_REFERENCE elements keep their real cell (zend reads the live
+    /// bucket, so writes through a held alias are observed) while
+    /// others get an isolated copy — shared by `exec_foreach_with` and
+    /// the inline `Op::FeInit` snap path.
+    pub(in crate::interp) fn fe_snapshot(
+        &self,
+        rc: &Rc<std::cell::RefCell<crate::value::PhpArray>>,
+    ) -> Vec<(ArrKey, Cell)> {
+        rc.borrow()
+            .iter()
+            .map(|(k, c)| {
+                let cc = if self.is_ref_cell(c) {
+                    c.clone()
+                } else {
+                    cell(c.borrow().clone())
+                };
+                (k.clone(), cc)
+            })
+            .collect()
+    }
+
     pub(in crate::interp) fn exec_foreach_with(
         &mut self,
         arr: &Expr,
@@ -1417,23 +1439,7 @@ impl<'a> Interp<'a> {
                 let snapshot: Vec<(ArrKey, Cell)> = if by_ref {
                     rc.borrow().iter().cloned().collect()
                 } else {
-                    // .iter() skips tombstoned buckets — a value-foreach
-                    // never sees shifted/unset elements. IS_REFERENCE
-                    // elements stay LIVE: zend reads the real bucket,
-                    // so writes through a held alias are observed and a
-                    // `&$v`-bound var writes back into the array
-                    // (probe12c/p12e vs oracle).
-                    rc.borrow()
-                        .iter()
-                        .map(|(k, c)| {
-                            let cc = if self.is_ref_cell(c) {
-                                c.clone()
-                            } else {
-                                cell(c.borrow().clone())
-                            };
-                            (k.clone(), cc)
-                        })
-                        .collect()
+                    self.fe_snapshot(&rc)
                 };
                 for (idx, (k, c)) in snapshot.into_iter().enumerate() {
                     self.cur_line = idx;

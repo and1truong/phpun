@@ -283,6 +283,36 @@ enum Op {
         delta: i64,
         target: usize,
     },
+    /// `foreach ($arr as $k => $v)` inlined into the surrounding
+    /// Compiled: FeInit binds the source once — a cursor over the live
+    /// table when it cannot be written (sole owner and no body
+    /// assignment), else the value-foreach snapshot — and FeNext
+    /// advances the cursor, writing the target slots; the body ops
+    /// run inline like zend's FE_FETCH_R pair. Non-array sources
+    /// replay the canonical statement verbatim.
+    FeInit {
+        /// slot in the exec-local cursor vec — per-execution state so
+        /// reentrant runs of this Compiled can't collide.
+        idx: u16,
+        /// compile verdict: the source var is written inside the body,
+        /// so iteration must ride a snapshot of the bound table.
+        needs_snap: bool,
+        fallback: Box<Stmt>,
+        depth: u32,
+        /// op index of the FeNext — the bound path jumps here.
+        fetch: usize,
+        /// op index past the loop — the fallback replay lands here.
+        end: usize,
+        breaks: Vec<usize>,
+        continues: Vec<usize>,
+    },
+    FeNext {
+        idx: u16,
+        vslot: u16,
+        /// u16::MAX when the loop has no `$k =>`.
+        kslot: u16,
+        end: usize,
+    },
     /// Direct literal-name call with Zend's persistent call-site cache.
     /// `lname` is lowercase and marker-stripped; `raw` keeps spelling
     /// for diagnostics. InitCall pins the target before args run.
@@ -382,6 +412,26 @@ struct AppendSnap {
     outer: Option<(Value, PhpError, bool, bool)>,
 }
 
+/// Live iteration state for an inline foreach — lives in the
+/// exec-local vec the FeInit/FeNext pair indexes, so recursion into
+/// the same Compiled gets its own.
+enum FeCursor {
+    Unused,
+    /// Sole-owned unwritten table — cursor over the live entries,
+    /// `n` frozen at bind (tomb-skip tolerates pre-existing holes).
+    Cursor {
+        arr: Rc<std::cell::RefCell<PhpArray>>,
+        i: usize,
+        n: usize,
+    },
+    /// Snapshot of (key, cell) pairs — the canonical value-foreach
+    /// isolation for shared or body-written tables.
+    Snap {
+        items: Vec<(crate::value::ArrKey, Cell)>,
+        i: usize,
+    },
+}
+
 /// Class-stable pieces of a direct method target — everything except
 /// the receiver itself and per-call context guards.
 /// `Op::InitNew` resolution product: class + its found ctor.
@@ -433,6 +483,9 @@ struct Compiler {
     assigned: std::collections::HashSet<String>,
     fallback: &'static str,
     top_level: bool,
+    /// Inline-foreach cursor slots issued so far — FeInit/FeNext pairs
+    /// index the exec-local state vec by this counter.
+    fe_count: u16,
 }
 
 impl Compiled {
@@ -530,6 +583,7 @@ impl Compiled {
             assigned,
             fallback: "other",
             top_level,
+            fe_count: 0,
         };
         for (i, p) in decl.params.iter().enumerate() {
             c.slots.insert(p.name.clone(), i as u16);
@@ -638,6 +692,7 @@ impl Compiled {
             assigned: assigned.clone(),
             fallback: "other",
             top_level,
+            fe_count: 0,
         };
         c.stmts(body)?;
         // ponytail: nonlocal break/continue, scope and unwind statements
@@ -814,7 +869,8 @@ impl Compiler {
             | Op::JumpIfFalse(t)
             | Op::JumpIfTrue(t)
             | Op::JumpCmp { target: t, .. }
-            | Op::IncJump { target: t, .. } => *t = target,
+            | Op::IncJump { target: t, .. }
+            | Op::FeNext { end: t, .. } => *t = target,
             _ => unreachable!("patch target is always a jump op"),
         }
     }
@@ -844,6 +900,112 @@ impl Compiler {
             body,
         } = s
         {
+            // Inline value-foreach: FeInit binds the source once,
+            // FeNext fetches into slots, and the body ops run inline —
+            // zend's FE_RESET/FE_FETCH_R shape — so a compiled loop
+            // no longer round-trips through exec_foreach_with and a
+            // sub-Compiled per element. By-ref/list/destructuring
+            // targets keep the canonical Op::Foreach below.
+            if matches!(
+                val,
+                crate::ast::ForeachTarget::Var(n)
+                    if n != "this" && !Interp::is_superglobal(n)
+            ) && match key {
+                None => true,
+                Some(crate::ast::ForeachKey::Var(n)) => {
+                    n != "this" && !Interp::is_superglobal(n)
+                }
+                _ => false,
+            // The fallback replays the source expr — only side-effect-
+            // free sources may be bound twice: a Var read, or an
+            // ArrayLit (which can never reach the replay anyway).
+            } && matches!(
+                Interp::unmark_rhs(arr),
+                Expr::Var(_) | Expr::ArrayLit(_)
+            ) {
+                self.expr(arr)?;
+                let idx = self.fe_count;
+                self.fe_count += 1;
+                // A body write to the source var must ride a snapshot
+                // (zend separates on write); an unwritten sole-owned
+                // table gets a plain cursor.
+                let needs_snap = match Interp::unmark_rhs(arr) {
+                    Expr::Var(n) => {
+                        let mut w = std::collections::HashSet::new();
+                        collect_assigned(body, &mut w);
+                        w.contains(n)
+                    }
+                    _ => false,
+                };
+                let at = self.emit(Op::FeInit {
+                    idx,
+                    needs_snap,
+                    fallback: Box::new(Stmt::Foreach {
+                        arr: arr.clone(),
+                        key: key.clone(),
+                        val: val.clone(),
+                        body: body.to_vec(),
+                    }),
+                    depth: self.loops.len() as u32,
+                    fetch: usize::MAX,
+                    end: usize::MAX,
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
+                // Escape Jumps for the replay's break/continue flows —
+                // one per enclosing loop level, same as CanonicalStmt.
+                let mut breaks = Vec::new();
+                let mut continues = Vec::new();
+                for index in (0..self.loops.len()).rev() {
+                    let jump = self.emit(Op::Jump(usize::MAX));
+                    self.loops[index].0.push(jump);
+                    breaks.push(jump);
+                    let jump = self.emit(Op::Jump(usize::MAX));
+                    self.loops[index].1.push(jump);
+                    continues.push(jump);
+                }
+                let top = self.ops.len();
+                let crate::ast::ForeachTarget::Var(vn) = val else {
+                    unreachable!()
+                };
+                let vslot = self.slot(vn);
+                let kslot = match key {
+                    Some(crate::ast::ForeachKey::Var(n)) => self.slot(n),
+                    _ => u16::MAX,
+                };
+                let fetch = self.emit(Op::FeNext {
+                    idx,
+                    vslot,
+                    kslot,
+                    end: usize::MAX,
+                });
+                self.loops.push((Vec::new(), Vec::new()));
+                self.stmts(body)?;
+                self.emit(Op::Jump(top));
+                let end = self.ops.len();
+                let (bs, cs) = self.loops.pop().unwrap();
+                for b in bs {
+                    self.patch(b, end);
+                }
+                for c in cs {
+                    self.patch(c, top);
+                }
+                self.patch(fetch, end);
+                if let Op::FeInit {
+                    fetch: f,
+                    end: e,
+                    breaks: b,
+                    continues: c,
+                    ..
+                } = &mut self.ops[at]
+                {
+                    *f = top;
+                    *e = end;
+                    *b = breaks;
+                    *c = continues;
+                }
+                return Some(());
+            }
             if let Some(body) = Compiled::compile_loop(body, &self.assigned, self.top_level) {
                 self.emit(Op::Foreach {
                     arr: Box::new(arr.clone()),
@@ -2203,6 +2365,37 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Slot write for the inline foreach fetch — the `Op::Store`
+    /// four-arm contract minus the value-stack carry (a fetch pushes
+    /// nothing).
+    fn fe_store_slot(
+        &mut self,
+        comp: &Compiled,
+        slots: &mut [Slot],
+        s: u16,
+        v: Value,
+    ) -> Result<(), PhpError> {
+        match &mut slots[s as usize] {
+            Slot::Arg(i) => {
+                let old =
+                    std::mem::replace(&mut self.cur().value_args[*i as usize], v);
+                self.destruct_dying_value(&old)?;
+            }
+            Slot::Uninit => slots[s as usize] = Slot::V(v),
+            Slot::V(old) => {
+                let old = std::mem::replace(old, v);
+                self.destruct_dying_value(&old)?;
+            }
+            Slot::C(c) => {
+                let c = c.clone();
+                let value = self.vm_cell_value(&c, v)?;
+                self.cell_store(&c, value)?;
+            }
+        }
+        self.vm_publish_global(comp, slots, s);
+        Ok(())
+    }
+
     fn vm_publish_global(&mut self, comp: &Compiled, slots: &mut [Slot], index: u16) {
         if comp.top_level {
             if let Slot::V(value) = &mut slots[index as usize] {
@@ -2337,6 +2530,9 @@ impl<'a> Interp<'a> {
         let mut mtargets: Vec<Option<(Rc<std::cell::RefCell<PhpObject>>, MSiteCore)>> = Vec::new();
         let mut ntargets: Vec<NewTarget> = Vec::new();
         let mut app_snaps: Vec<AppendSnap> = Vec::new();
+        // Inline-foreach cursors — indexed by the FeInit/FeNext pair,
+        // exec-local so recursion into this Compiled can't collide.
+        let mut fe_states: Vec<FeCursor> = Vec::new();
         let mut pc = 0usize;
         let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
@@ -2356,6 +2552,114 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Op::Const(v) => vs.push(v.clone()),
+                Op::FeInit {
+                    idx,
+                    needs_snap,
+                    fallback,
+                    depth,
+                    fetch,
+                    end,
+                    breaks,
+                    continues,
+                } => {
+                    let src = vs.pop().unwrap_or(Value::Null);
+                    if let Value::Array(rc) = &src {
+                        if fe_states.len() <= *idx as usize {
+                            fe_states.resize_with(*idx as usize + 1, || FeCursor::Unused);
+                        }
+                        fe_states[*idx as usize] = if *needs_snap
+                            || Rc::strong_count(rc) > 1
+                            || rc.borrow().is_ref
+                        {
+                            FeCursor::Snap {
+                                items: self.fe_snapshot(rc),
+                                i: 0,
+                            }
+                        } else {
+                            FeCursor::Cursor {
+                                arr: rc.clone(),
+                                i: 0,
+                                n: rc.borrow().entries.len(),
+                            }
+                        };
+                        pc = *fetch;
+                    } else {
+                        // Traversable/scalar sources replay the
+                        // canonical statement — zend's FE_RESET splits
+                        // iterable kinds the same way.
+                        self.vm_materialize(comp, slots);
+                        let previous_depth =
+                            std::mem::replace(&mut self.loop_depth, base_depth + depth);
+                        let flow = self.exec_at(fallback, None);
+                        self.loop_depth = previous_depth;
+                        self.vm_refresh(comp, slots);
+                        pc = match flow {
+                            Flow::Normal => *end,
+                            Flow::Break(level) => {
+                                match breaks.get(level.saturating_sub(1) as usize) {
+                                    Some(target) => *target,
+                                    None => return Ok(Flow::Break(level)),
+                                }
+                            }
+                            Flow::Continue(level) => {
+                                match continues.get(level.saturating_sub(1) as usize) {
+                                    Some(target) => *target,
+                                    None => return Ok(Flow::Continue(level)),
+                                }
+                            }
+                            other => return Ok(other),
+                        };
+                    }
+                    continue;
+                }
+                Op::FeNext {
+                    idx,
+                    vslot,
+                    kslot,
+                    end,
+                } => {
+                    let next = match fe_states.get_mut(*idx as usize) {
+                        Some(FeCursor::Cursor { arr, i, n }) => {
+                            let mut found = None;
+                            while *i < *n {
+                                let e = {
+                                    let a = arr.borrow();
+                                    a.entries
+                                        .get(*i)
+                                        .map(|(k, c)| (k.clone(), c.clone()))
+                                };
+                                *i += 1;
+                                match e {
+                                    Some((k, c))
+                                        if !matches!(k, crate::value::ArrKey::Tomb) =>
+                                    {
+                                        found = Some((k, c));
+                                        break;
+                                    }
+                                    Some(_) => continue,
+                                    None => break,
+                                }
+                            }
+                            found
+                        }
+                        Some(FeCursor::Snap { items, i }) => {
+                            let e = items.get(*i).cloned();
+                            *i += 1;
+                            e
+                        }
+                        _ => None,
+                    };
+                    let Some((k, c)) = next else {
+                        pc = *end;
+                        continue;
+                    };
+                    if *kslot != u16::MAX {
+                        let kv = crate::interp::util::key_value(&k);
+                        self.fe_store_slot(comp, slots, *kslot, kv)?;
+                    }
+                    let v = c.borrow().clone();
+                    self.fe_store_slot(comp, slots, *vslot, v)?;
+                }
                 Op::Foreach {
                     arr,
                     key,
