@@ -3184,20 +3184,29 @@ impl<'a> Interp<'a> {
         self.destruct_dying_value(&old)
     }
 
-    /// Objects whose last refs live inside a dropped value run
-    /// __destruct — `unset($closure)` decrefs the closure's bound
-    /// $this and captures (Zend refcount semantics — closure_005).
     /// `__destruct` on the object's class — memoized on the class
     /// itself; the (m, dc) pair is registration-fixed, `None` a cached
     /// miss. Every destructor probe in this file goes through here so
-    /// the polymorphic method_ic keeps serving real sites.
+    /// the polymorphic method_ic keeps serving real sites. A miss is
+    /// cached only once the parent chain is bound (parent_rc
+    /// convention): a parent can still be mid-registration when an
+    /// autoload runs inside a signature check, and a frozen None would
+    /// drop its __destruct forever.
     fn class_dtor(&mut self, o: &Rc<RefCell<PhpObject>>) -> crate::value::MethodHit {
         let cls = o.borrow().class.clone();
-        cls.destructor
-            .get_or_init(|| self.find_method_in(&cls, "__destruct"))
-            .clone()
+        if let Some(hit) = cls.destructor.get() {
+            return hit.clone();
+        }
+        let hit = self.find_method_in(&cls, "__destruct");
+        if hit.is_some() || cls.decl.parent.is_none() || cls.parent_rc.borrow().is_some() {
+            let _ = cls.destructor.set(hit.clone());
+        }
+        hit
     }
 
+    /// Objects whose last refs live inside a dropped value run
+    /// __destruct — `unset($closure)` decrefs the closure's bound
+    /// $this and captures (Zend refcount semantics — closure_005).
     pub(in crate::interp) fn destruct_dying_value(&mut self, v: &Value) -> Result<(), PhpError> {
         if matches!(
             v,
