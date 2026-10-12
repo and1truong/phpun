@@ -36,14 +36,7 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
     ) -> Option<(usize, Rc<PhpClass>)> {
-        // Same frame cur() would serve: the globals pseudo-frame owns
-        // top-level scope when no call frame is live.
-        let frame = self
-            .stack
-            .last()
-            .map(|f| f.as_ref())
-            .unwrap_or(&self.globals);
-        let scope = frame.decl_class.as_ref().or(frame.scope_class.as_ref())?;
+        let scope = self.caller_scope()?;
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
             if c.name() == scope.name() {
@@ -627,12 +620,7 @@ impl<'a> Interp<'a> {
         pn: &str,
         vis: crate::ast::Visibility,
     ) -> bool {
-        let scope = self.stack.last().and_then(|f| {
-            f.decl_class
-                .as_ref()
-                .or(f.scope_class.as_ref())
-                .map(|s| s.decl.name.clone())
-        });
+        let scope = self.caller_scope().map(|s| s.decl.name.clone());
         match (vis, scope) {
             (crate::ast::Visibility::Public, _) => true,
             (crate::ast::Visibility::Private, Some(s)) => s == dcls.name(),
@@ -2231,12 +2219,7 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
     ) -> Option<String> {
-        let dc = self.stack.last().and_then(|f| {
-            f.decl_class
-                .as_ref()
-                .or(f.scope_class.as_ref())
-                .map(|c| c.name().to_string())
-        });
+        let dc = self.caller_scope().map(|c| c.name().to_string());
         if let Some(dc) = dc {
             let k = format!("\0{}\0{}", dc, pn);
             if o.borrow().prop_has(&k) {
@@ -2523,12 +2506,7 @@ impl<'a> Interp<'a> {
             crate::ast::Visibility::Protected => "protected",
             crate::ast::Visibility::Public => return None,
         };
-        let scope = self.stack.last().and_then(|f| {
-            f.decl_class
-                .as_ref()
-                .or(f.scope_class.as_ref())
-                .map(|s| s.decl.name.clone())
-        });
+        let scope = self.caller_scope().map(|s| s.decl.name.clone());
         let dn = dcls.name().to_string();
         let allows = match (pd.visibility, scope.as_deref()) {
             (crate::ast::Visibility::Private, Some(s)) => s == dn,
@@ -2560,12 +2538,7 @@ impl<'a> Interp<'a> {
     /// (foreach over objects iterates only visible props).
     pub fn prop_visible(&mut self, cls: &Rc<PhpClass>, name: &str) -> bool {
         let (vis, dcls) = self.prop_visibility(cls, name);
-        let scope = self.stack.last().and_then(|f| {
-            f.decl_class
-                .as_ref()
-                .or(f.scope_class.as_ref())
-                .map(|s| s.decl.name.clone())
-        });
+        let scope = self.caller_scope().map(|s| s.decl.name.clone());
         match (vis, scope) {
             (crate::ast::Visibility::Public, _) => true,
             (crate::ast::Visibility::Private, Some(s)) => s == dcls,
