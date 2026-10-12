@@ -455,7 +455,9 @@ pub struct Interp<'a> {
     /// Enum case singletons keyed `"cls\0case"` — `E::Foo === E::Foo`.
     enum_cases: std::collections::HashMap<String, Value>,
     /// Classes whose const initializers were already link-evaluated.
-    consts_linked: std::collections::HashSet<String>,
+    /// Class already const-linked — keyed by Rc ptr (classes are
+    /// unique per interp; avoids a lowercase alloc per `new`).
+    consts_linked: FxSet<usize>,
     /// Top-level parentless classes registered by hoisting (early
     /// binding): name → (compile unit, AST decl ptr), so only the SAME
     /// decl site in the SAME unit no-ops on execution — a different
@@ -1849,7 +1851,7 @@ impl<'a> Interp<'a> {
             interfaces: HashMap::new(),
             decl_order: Vec::new(),
             enum_cases: std::collections::HashMap::new(),
-            consts_linked: std::collections::HashSet::new(),
+            consts_linked: FxSet::default(),
             decl_aliases: Vec::new(),
             early_bound_classes: HashMap::new(),
             early_bound_funcs: HashMap::new(),

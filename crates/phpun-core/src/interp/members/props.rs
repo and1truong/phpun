@@ -139,7 +139,9 @@ impl<'a> Interp<'a> {
                     }
                     None => *s = Some(super::cell(v)),
                 }
-                o.unset_props.remove(&dc.flat_props.get().unwrap()[i].key);
+                if !o.unset_props.is_empty() {
+                    o.unset_props.remove(&dc.flat_props.get().unwrap()[i].key);
+                }
                 return Ok(());
             }
         }
@@ -166,7 +168,9 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        o.unset_props.remove(&key);
+        if !o.unset_props.is_empty() {
+            o.unset_props.remove(&key);
+        }
         Ok(())
     }
 

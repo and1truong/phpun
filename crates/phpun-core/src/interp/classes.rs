@@ -3048,8 +3048,7 @@ impl<'a> Interp<'a> {
         &mut self,
         cls: &Rc<PhpClass>,
     ) -> Result<(), PhpError> {
-        let lname = cls.decl.name.to_lowercase();
-        if !self.consts_linked.insert(lname) {
+        if !self.consts_linked.insert(Rc::as_ptr(cls) as usize) {
             return Ok(());
         }
         let mut chain = vec![cls.clone()];
@@ -3058,7 +3057,7 @@ impl<'a> Interp<'a> {
             let Some(pc) = lkey_get(&self.classes, p).cloned() else {
                 break;
             };
-            if !self.consts_linked.insert(pc.decl.name.to_lowercase()) {
+            if !self.consts_linked.insert(Rc::as_ptr(&pc) as usize) {
                 break;
             }
             pn = pc.decl.parent.clone();
