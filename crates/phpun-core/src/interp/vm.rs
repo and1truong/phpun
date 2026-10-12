@@ -345,10 +345,10 @@ enum Op {
 
 /// Monomorphic method-dispatch cache at a `MethodCall` site: guards on
 /// the receiver's class and reuses the class-stable resolution —
-/// `core` None means "resolved but not direct-eligible" (stub,
-/// abstract, by-ref, generator, needs-bind, uncompiled), which is
-/// class-stable too. Context checks (scope-private, visibility,
-/// pending hook) still run per call.
+/// `core` None means "canonical path for this (class, scope)" —
+/// resolution miss, not-direct-eligible decl, or a folded-in context
+/// verdict (scope-private shadow, visibility) — all (class, scope,
+/// name)-static. Only `pending_hook_prop` still runs per call.
 struct CachedMethod {
     class: Rc<PhpClass>,
     /// Caller-scope class (None = none): the resolution verdict —
@@ -4155,9 +4155,9 @@ impl<'a> Interp<'a> {
 
     /// Resolve a `$cv->m` site to its direct target: receiver must be
     /// an object whose resolved method is a userland, compiled,
-    /// value-callable decl. Per-call context guards (scope-private
-    /// precedence, visibility, pending hook) run on every hit; the
-    /// class-keyed pieces live in the site cache.
+    /// value-callable decl. The (class, caller-scope)-keyed verdict —
+    /// resolution + scope-private/visibility guards — lives in the
+    /// site cache; `pending_hook_prop` runs per call.
     fn vm_method_target(
         &mut self,
         o: Rc<std::cell::RefCell<PhpObject>>,
