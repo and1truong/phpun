@@ -3022,8 +3022,15 @@ impl<'a> Interp<'a> {
                                     }) {
                                         return None;
                                     }
+                                    // A None ctor is registration-
+                                    // stable only once the extends
+                                    // chain is bound — a probe during
+                                    // mid-registration must re-run.
+                                    let cacheable = ctor.is_some() || self.class_chain_bound(&cls);
                                     let t = (cls, ctor);
-                                    *cache.borrow_mut() = Some(t.clone());
+                                    if cacheable {
+                                        *cache.borrow_mut() = Some(t.clone());
+                                    }
                                     Some(t)
                                 })
                         })

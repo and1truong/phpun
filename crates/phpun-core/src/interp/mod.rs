@@ -3198,7 +3198,7 @@ impl<'a> Interp<'a> {
             return hit.clone();
         }
         let hit = self.find_method_in(&cls, "__destruct");
-        if hit.is_some() || cls.decl.parent.is_none() || cls.parent_rc.borrow().is_some() {
+        if hit.is_some() || self.class_chain_bound(&cls) {
             let _ = cls.destructor.set(hit.clone());
         }
         hit
