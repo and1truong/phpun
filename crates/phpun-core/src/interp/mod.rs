@@ -7270,6 +7270,15 @@ impl<'a> Interp<'a> {
         if self.gc_pending < 10_000 || self.gc_collecting || !self.ini_on("zend.enable_gc") {
             return;
         }
+        // An empty buffer means no displaced cyclic-capable node ever
+        // purpled — every live object's graph edges are owned, so the
+        // mark pass would collect nothing. Drain the hysteresis
+        // counter exactly like collect_impl does on a drained run;
+        // gc_runs stays untouched either way (`buffered || total>0`).
+        if self.gc_purpled.is_empty() {
+            self.gc_pending = 0;
+            return;
+        }
         self.gc_collecting = true;
         let _ = self.gc_cycle_collect_impl(true);
         // The pass drained the buffer (`gc_purpled` cleared): the
